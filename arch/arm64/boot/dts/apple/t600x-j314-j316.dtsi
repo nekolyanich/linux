@@ -31,6 +31,12 @@
 		disp0_piodma = &disp0_piodma;
 		serial0 = &serial0;
 		sio = &sio;
+		usb4-0-acio = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-1-acio = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-2-acio = &usb4_2_acio;
+		usb4-2-nhi = &usb4_2_nhi;
 		wifi0 = &wifi0;
 	};
 
@@ -471,9 +477,18 @@
 		};
 
 		port@1 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <1>;
-			dwc3_0_ss: endpoint {
+
+			dwc3_0_ss: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&atcphy0_usb3>;
+			};
+
+			dwc3_0_usb4: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb4_0_acio_usb3>;
 			};
 		};
 	};
@@ -492,9 +507,18 @@
 		};
 
 		port@1 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <1>;
-			dwc3_1_ss: endpoint {
+
+			dwc3_1_ss: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&atcphy1_usb3>;
+			};
+
+			dwc3_1_usb4: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb4_1_acio_usb3>;
 			};
 		};
 	};
@@ -513,9 +537,18 @@
 		};
 
 		port@1 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <1>;
-			dwc3_2_ss: endpoint {
+
+			dwc3_2_ss: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&atcphy2_usb3>;
+			};
+
+			dwc3_2_usb4: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb4_2_acio_usb3>;
 			};
 		};
 	};
@@ -678,6 +711,125 @@
 		};
 	};
 };
+
+&typec0 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec0_con_tbt: endpoint {
+				remote-endpoint = <&usb4_0_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec1_con_tbt: endpoint {
+				remote-endpoint = <&usb4_1_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec2_con_tbt: endpoint {
+				remote-endpoint = <&usb4_2_acio_tbt>;
+			};
+		};
+	};
+};
+
+/* USB4 */
+&usb4_0_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_0_acio_tbt: endpoint {
+				remote-endpoint = <&typec0_con_tbt>;
+			};
+		};
+
+		/* 2: USB4 lane 1 adapter */
+		/* 3: PCIe */
+		port@4 {
+			reg = <4>;
+			usb4_0_acio_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_usb4>;
+			};
+		};
+
+		/* 5: DP0 */
+		/* 6: DP1 */
+	};
+};
+
+&usb4_1_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_1_acio_tbt: endpoint {
+				remote-endpoint = <&typec1_con_tbt>;
+			};
+		};
+
+		/* 2: USB4 lane 1 adapter */
+		/* 3: PCIe */
+		port@4 {
+			reg = <4>;
+			usb4_1_acio_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_usb4>;
+			};
+		};
+
+		/* 5: DP0 */
+		/* 6: DP1 */
+	};
+};
+
+&usb4_2_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_2_acio_tbt: endpoint {
+				remote-endpoint = <&typec2_con_tbt>;
+			};
+		};
+
+		/* 2: USB4 lane 1 adapter */
+		/* 3: PCIe */
+		port@4 {
+			reg = <4>;
+			usb4_2_acio_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_usb4>;
+			};
+		};
+
+		/* 5: DP0 */
+		/* 6: DP1 */
+	};
+};
+
+/* ATC3 is used for DP-to-HDMI only and has no USB4 host router */
+/delete-node/ &usb4_3_acio;
+/delete-node/ &usb4_3_mbox;
 
 #include "spi1-nvram.dtsi"
 

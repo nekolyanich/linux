@@ -3016,6 +3016,7 @@ static int tb_scan_finalize_switch(struct device *dev, void *data)
 static int tb_start(struct tb *tb, bool reset)
 {
 	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_port *port;
 	bool discover = true;
 	int ret;
 
@@ -3047,6 +3048,14 @@ static int tb_start(struct tb *tb, bool reset)
 	if (ret) {
 		tb_switch_put(tb->root_switch);
 		return dev_err_probe(tb->nhi->dev, ret, "failed to add host router\n");
+	}
+
+	/* Make all host router downstream ports accessible to the CM. */
+	tb_switch_for_each_port(tb->root_switch, port) {
+		if (!tb_port_is_null(port))
+			continue;
+		if (tb_port_unlock(port))
+			tb_port_warn(port, "failed to unlock port\n");
 	}
 
 	/*

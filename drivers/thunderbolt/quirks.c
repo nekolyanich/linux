@@ -69,6 +69,8 @@ struct tb_quirk {
 static const struct tb_quirk tb_quirks[] = {
 	/* Apple Silicon host routers do not support USB3 bandwidth allocation */
 	{ 0x05ac, 0x2000, 0x0000, 0x0000, quirk_no_usb3_bw_alloc },
+	/* M2 Pro (t6020) host router reports device id 0x2005 */
+	{ 0x05ac, 0x2005, 0x0000, 0x0000, quirk_no_usb3_bw_alloc },
 
 	/* Dell WD19TB supports self-authentication on unplug */
 	{ 0x0000, 0x0000, 0x00d4, 0xb070, quirk_force_power_link },

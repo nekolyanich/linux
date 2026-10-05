@@ -685,6 +685,10 @@ static int tb_switch_tmu_enable_bidirectional(struct tb_switch *sw)
 	if (ret)
 		goto out;
 
+	ret = tb_switch_set_tmu_mode_params(sw, TB_SWITCH_TMU_MODE_HIFI_BI);
+	if (ret)
+		goto out;
+
 	ret = tb_port_tmu_time_sync_enable(up);
 	if (ret)
 		goto out;

@@ -1505,6 +1505,11 @@ static int tb_dp_init_video_credits(struct tb_path_hop *hop)
 	struct tb_port *port = hop->in_port;
 	struct tb_switch *sw = port->sw;
 
+	if (tb_port_is_dpin(port) && (sw->quirks & QUIRK_DP_IN_NFC_BUFFERS)) {
+		hop->nfc_credits = APPLE_DP_IN_NFC_BUFFERS;
+		return 0;
+	}
+
 	if (tb_port_use_credit_allocation(port)) {
 		unsigned int nfc_credits;
 		size_t max_dp_streams;

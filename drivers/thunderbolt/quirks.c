@@ -46,6 +46,18 @@ static void quirk_usb3_maximum_bandwidth(struct tb_switch *sw)
 	}
 }
 
+static void quirk_apple_t6020_host(struct tb_switch *sw)
+{
+	/*
+	 * Unlike the USB4 spec, which only lets lane adapters take NFC
+	 * buffers, macOS programs ADP_CS_4 NFC buffers on the DP IN adapter
+	 * before activating the DP video path, and without them no video
+	 * enters the tunnel. (USB3 bandwidth allocation is off for every
+	 * Apple host router through the NHI quirk, apple.c.)
+	 */
+	sw->quirks |= QUIRK_DP_IN_NFC_BUFFERS;
+}
+
 static void quirk_block_rpm_in_redrive(struct tb_switch *sw)
 {
 	sw->quirks |= QUIRK_KEEP_POWER_IN_DP_REDRIVE;
@@ -61,6 +73,9 @@ struct tb_quirk {
 };
 
 static const struct tb_quirk tb_quirks[] = {
+	/* M2 Pro (t6020) host router reports device id 0x2005 */
+	{ 0x05ac, 0x2005, 0x0000, 0x0000, quirk_apple_t6020_host },
+
 	/* Dell WD19TB supports self-authentication on unplug */
 	{ 0x0000, 0x0000, 0x00d4, 0xb070, quirk_force_power_link },
 	{ 0x0000, 0x0000, 0x00d4, 0xb071, quirk_force_power_link },

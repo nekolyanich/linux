@@ -1144,6 +1144,20 @@ static void tb_dp_dprx_stop(struct tb_tunnel *tunnel)
 	}
 }
 
+static void tb_dp_nhi_dp_in_enable(struct tb_port *in, bool enable)
+{
+	struct tb_nhi *nhi = in->sw->tb->nhi;
+	int ret;
+
+	if (tb_route(in->sw) || !nhi->ops || !nhi->ops->dp_in_enable)
+		return;
+
+	ret = nhi->ops->dp_in_enable(nhi, in, enable);
+	if (ret)
+		tb_port_warn(in, "failed to %s DP IN stream source: %d\n",
+			     enable ? "enable" : "disable", ret);
+}
+
 static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 {
 	int ret;
@@ -1181,6 +1195,9 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		if (ret)
 			return ret;
 	}
+
+	/* the stream source is told only once both adapters are enabled */
+	tb_dp_nhi_dp_in_enable(tunnel->src_port, active);
 
 	return active ? tb_dp_dprx_start(tunnel) : 0;
 }

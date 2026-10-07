@@ -66,10 +66,14 @@ extern const struct dev_pm_ops nhi_pm_ops;
  *		    and enable the ring with the given flags. If not set
  *		    the standard USB4 NHI registers are used.
  * @add_links: NHI specific hook to add device links to tunneled native ports
+ * @dp_in_enable: NHI specific hook called once a DP tunnel from a host router
+ *		  DP IN adapter is enabled, or before it is disabled
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  * @reset_interface: Resets the host interface
  */
+struct tb_port;
+
 struct tb_nhi_ops {
 	int (*init)(struct tb_nhi *nhi);
 	int (*suspend_noirq)(struct tb_nhi *nhi, bool wakeup);
@@ -87,6 +91,7 @@ struct tb_nhi_ops {
 	void (*ring_interrupt_mask)(struct tb_ring *ring, bool mask);
 	void (*ring_configure)(struct tb_ring *ring, u32 flags, u32 e2e_flags);
 	bool (*add_links)(struct tb_nhi *nhi);
+	int (*dp_in_enable)(struct tb_nhi *nhi, struct tb_port *in, bool enable);
 	bool (*is_present)(struct tb_nhi *nhi);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 	void (*reset_interface)(struct tb_nhi *nhi);

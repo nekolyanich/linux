@@ -158,6 +158,8 @@
 #define ACIOPHY_CROSSBAR_DP_SINGLE_PMA_NONE 0x0000
 #define ACIOPHY_CROSSBAR_DP_SINGLE_PMA_UNK100 0x100
 #define ACIOPHY_CROSSBAR_DP_SINGLE_PMA_UNK008 0x008
+/* set by macOS in USB4 mode on t6020 (CROSSBAR = 0x21); likely routes DP IN */
+#define ACIOPHY_CROSSBAR_DP_SINGLE_PMA_USB4_DPIN 0x001
 #define ACIOPHY_CROSSBAR_DP_BOTH_PMA BIT(17)
 
 #define ACIOPHY_LANE_MODE_T8103 0x48
@@ -794,7 +796,7 @@ static const struct {
 	[APPLE_ATCPHY_MODE_USB4] = {
 		.normal = {
 			.crossbar = ACIOPHY_CROSSBAR_PROTOCOL_USB4,
-			.crossbar_dp_single_pma = ACIOPHY_CROSSBAR_DP_SINGLE_PMA_NONE,
+			.crossbar_dp_single_pma = ACIOPHY_CROSSBAR_DP_SINGLE_PMA_USB4_DPIN,
 			.crossbar_dp_both_pma = false,
 			.lane_mode = {ACIOPHY_LANE_MODE_USB4, ACIOPHY_LANE_MODE_USB4},
 			.dp_lane = {false, false},
@@ -802,7 +804,7 @@ static const struct {
 		},
 		.swapped = {
 			.crossbar = ACIOPHY_CROSSBAR_PROTOCOL_USB4_SWAPPED,
-			.crossbar_dp_single_pma = ACIOPHY_CROSSBAR_DP_SINGLE_PMA_NONE,
+			.crossbar_dp_single_pma = ACIOPHY_CROSSBAR_DP_SINGLE_PMA_USB4_DPIN,
 			.crossbar_dp_both_pma = false,
 			.lane_mode = {ACIOPHY_LANE_MODE_USB4, ACIOPHY_LANE_MODE_USB4},
 			.dp_lane = {false, false},

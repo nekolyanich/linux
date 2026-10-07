@@ -22,6 +22,7 @@
 #include <linux/usb/role.h>
 #include <linux/workqueue.h>
 #include <linux/firmware.h>
+#include <linux/soc/apple/dp-switch.h>
 
 #include "tps6598x.h"
 #include "trace.h"
@@ -871,6 +872,9 @@ static void cd321x_update_work(struct work_struct *work)
 	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed)) {
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
+	if (cd321x->dp_switch_atc >= 0 && (!dp_hpd || dp_hpd_changed))
+		apple_dp_switch_hotplug(cd321x->dp_switch_die, cd321x->dp_switch_atc,
+					APPLE_DP_SWITCH_DPPHY, false);
 
 	/*
 	 * Also deactivate any altmodes and switch to SAFE_STATE if there was an
@@ -936,6 +940,9 @@ static void cd321x_update_work(struct work_struct *work)
 
 	if (cd321x->connector_fwnode && dp_hpd)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
+	if (cd321x->dp_switch_atc >= 0 && dp_hpd)
+		apple_dp_switch_hotplug(cd321x->dp_switch_die, cd321x->dp_switch_atc,
+					APPLE_DP_SWITCH_DPPHY, true);
 
 	power_supply_changed(tps->psy);
 }
@@ -1385,6 +1392,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	struct fwnode_handle *connector_fwnode = NULL;
+	u32 atc;
 	int ret;
 
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
@@ -1407,6 +1415,12 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
 	if (!IS_ERR_OR_NULL(connector_fwnode))
 		cd321x->connector_fwnode = connector_fwnode;
+
+	/* DP alt mode sinks go to the Apple display switch, if described */
+	cd321x->dp_switch_atc = -1;
+	if (!fwnode_property_read_u32(fwnode, "apple,dp-switch-atc", &atc))
+		cd321x->dp_switch_atc = atc;
+	fwnode_property_read_u32(fwnode, "apple,dp-switch-die", &cd321x->dp_switch_die);
 
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;

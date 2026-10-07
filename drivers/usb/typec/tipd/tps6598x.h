@@ -381,6 +381,9 @@ struct cd321x {
 	struct usb_pd_identity cur_partner_identity;
 
 	struct fwnode_handle *connector_fwnode;
+	/* this port's ATC for the Apple display switch, -1 if none */
+	int dp_switch_atc;
+	u32 dp_switch_die;
 };
 
 struct sn201202x {

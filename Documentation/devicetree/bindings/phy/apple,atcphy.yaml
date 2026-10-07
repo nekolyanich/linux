@@ -135,6 +135,12 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: USB4/Thunderbolt ("Converged IO") tunables for lane 1.
 
+  apple,tunable-cio-top:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      USB4/Thunderbolt ("Converged IO") tunables for the common PHY block,
+      applied after the lane tunables when entering USB4/Thunderbolt mode.
+
   apple,tunable-lane0-dp:
     $ref: "#/$defs/apple,tunable"
     description: >

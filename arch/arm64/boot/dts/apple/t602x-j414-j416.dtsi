@@ -34,9 +34,84 @@
 	apple,always-on;
 };
 
+/*
+ * Display switch: the Type-C ports' DP PHYs (DP alt mode) and their host
+ * routers' DP IN adapters (DP tunnelled over USB4), handed out to a DCP when
+ * a sink shows up there, as macOS does.
+ */
+&typec0 {
+	apple,dp-switch-atc = <0>;
+};
+
+&typec1 {
+	/delete-property/ displayport;
+	apple,dp-switch-atc = <1>;
+};
+
+&typec2 {
+	apple,dp-switch-atc = <2>;
+};
+
+&usb4_0_nhi {
+	apple,dpin-adapters = <5 6>;
+	apple,dp-switch-atc = <0>;
+};
+
+&usb4_1_nhi {
+	apple,dpin-adapters = <5 6>;
+	apple,dp-switch-atc = <1>;
+};
+
+&usb4_2_nhi {
+	apple,dpin-adapters = <5 6>;
+	apple,dp-switch-atc = <2>;
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&atcphy1_xbar {
+	status = "okay";
+};
+
+&atcphy2_xbar {
+	status = "okay";
+};
+
+&dcpext1 {
+	/delete-property/ apple,dptx-phy;
+	apple,dp-switch;
+	/* dispext1 */
+	mux-index = <2>;
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		<&atcphy2 PHY_TYPE_DP>;
+	phy-names = "atc0", "atc1", "atc2";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy0_xbar 1>, <&atcphy0_xbar 2>,
+		<&atcphy1_xbar 0>, <&atcphy1_xbar 1>, <&atcphy1_xbar 2>,
+		<&atcphy2_xbar 0>, <&atcphy2_xbar 1>, <&atcphy2_xbar 2>;
+	mux-control-names = "atc0-dpphy", "atc0-dpin0", "atc0-dpin1",
+		"atc1-dpphy", "atc1-dpin0", "atc1-dpin1",
+		"atc2-dpphy", "atc2-dpin0", "atc2-dpin1";
+};
+
 &dcpext0 {
 	/*  HDMI HPD gpio, used as interrupt*/
 	hdmi-hpd-gpios = <&pinctrl_aop 25 GPIO_ACTIVE_HIGH>;
+
+	/* with HDMI empty it also serves the display switch, as dispext0 */
+	apple,dp-switch;
+	phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+		<&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "atc0", "atc1", "atc2";
+	mux-controls = <&atcphy3_xbar 0>,
+		<&atcphy0_xbar 0>, <&atcphy0_xbar 1>, <&atcphy0_xbar 2>,
+		<&atcphy1_xbar 0>, <&atcphy1_xbar 1>, <&atcphy1_xbar 2>,
+		<&atcphy2_xbar 0>, <&atcphy2_xbar 1>, <&atcphy2_xbar 2>;
+	mux-control-names = "dp-xbar",
+		"atc0-dpphy", "atc0-dpin0", "atc0-dpin1",
+		"atc1-dpphy", "atc1-dpin0", "atc1-dpin1",
+		"atc2-dpphy", "atc2-dpin0", "atc2-dpin1";
 };
 
 &hpm0 {

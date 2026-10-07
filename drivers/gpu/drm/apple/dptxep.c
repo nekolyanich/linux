@@ -3,6 +3,8 @@
 
 #include <linux/bitfield.h>
 #include <linux/completion.h>
+#include <linux/mux/apple-display-crossbar.h>
+#include <linux/phy/apple-atc.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
 
@@ -79,11 +81,13 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) |
 		     DCPDPTX_REMOTE_PORT_CONNECTED;
+	/* macOS passes 0x101 for a tunnelled DP IN (target core = dfp port) */
+	u32 unk_field = service->ep->dcp->dptx_tunneled ? 0x101 : 0x100;
 
 	trace_dptxport_validate_connection(dptx, core, atc, die);
 
 	cmd.target = cpu_to_le32(target);
-	cmd.unk = cpu_to_le32(0x100);
+	cmd.unk = cpu_to_le32(unk_field);
 	ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp,
 			       sizeof(resp), 40);
 	if (ret)
@@ -91,7 +95,7 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 
 	if (le32_to_cpu(resp.target) != target)
 		return -EINVAL;
-	if (le32_to_cpu(resp.unk) != 0x100)
+	if ((le32_to_cpu(resp.unk) & 0xffff) != unk_field)
 		return -EINVAL;
 
 	return 0;
@@ -102,7 +106,8 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	u32 unk_field = 0x0; // seen as 0x100 under some conditions
+	// seen as 0x100 under some conditions, 0x101 for tunnelled DP IN
+	u32 unk_field = service->ep->dcp->dptx_tunneled ? 0x101 : 0x0;
 	int ret;
 	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
@@ -120,7 +125,7 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 
 	if (le32_to_cpu(resp.target) != target)
 		return -EINVAL;
-	if (le32_to_cpu(resp.unk) != unk_field)
+	if ((le32_to_cpu(resp.unk) & 0xffff) != unk_field)
 		dev_notice(service->ep->dcp->dev, "unexpected unk field in reply: 0x%x (0x%x)\n",
 			  le32_to_cpu(resp.unk), unk_field);
 
@@ -166,6 +171,20 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
+	if (service->ep->dcp->dptx_tunneled) {
+		/*
+		 * macOS answers a tunnelled DP IN with data[16]=0, data[20]=3,
+		 * data[24]=3.
+		 */
+		u8 *r = reply_;
+
+		memset(r + 16, 0, min_t(size_t, reply_size - 16, 16));
+		if (reply_size >= 28) {
+			r[20] = 3;
+			r[24] = 3;
+		}
+		return 0;
+	}
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
 	reply->max_drive_settings[1] = cpu_to_le32(0x3);
 
@@ -251,13 +270,14 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 	struct dptxport_apcall_lane_count *reply = reply_;
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
-	union phy_configure_opts phy_ops;
+	union phy_configure_opts phy_ops = {};
 	int ret;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
-	ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &phy_ops);
+	/* tunnelled DP IN has no local phy: the USB4 DP adapter does x4 */
+	ret = dptx->atcphy ? phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &phy_ops) : 0;
 	if (ret < 0) {
 		dev_err(dcp->dev, "phy_validate failed: %d\n", ret);
 		reply->retcode = cpu_to_le32(1);
@@ -379,6 +399,7 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	const struct dptxport_apcall_link_rate *request = data;
 	struct dptxport_apcall_link_rate *reply = reply_;
+	struct apple_dcp *dcp = service->ep->dcp;
 	u32 link_rate, phy_link_rate;
 	bool phy_set_rate = false;
 	int ret;
@@ -390,6 +411,22 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 
 	link_rate = le32_to_cpu(request->link_rate);
 	trace_dptxport_call_set_link_rate(dptx, link_rate);
+
+	/*
+	 * A tunnelled DP IN gets its pixel clock and the crossbar FIFO/clock
+	 * route only once DCP sets the link rate, after the AUX phase, as in
+	 * macOS. The clock comes first: the crossbar output needs it running.
+	 */
+	if (dcp->dptx_tunneled) {
+		if (dcp->tunnel_phy) {
+			ret = apple_atc_dp_tunnel_rate(dcp->tunnel_phy, link_rate);
+			if (ret)
+				dev_warn(dcp->dev, "link rate %#x: tunnel clock failed: %d\n",
+					 link_rate, ret);
+		}
+		if (dcp->xbar_selected && link_rate)
+			apple_dpxbar_finish(dcp->xbar);
+	}
 
 	switch (link_rate) {
 	case LINK_RATE_RBR:
@@ -452,7 +489,11 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(0);
+	/*
+	 * dp2hdmi HPD comes from a GPIO on the AP side. For a DP IN tunnelled
+	 * over USB4 macOS answers 1.
+	 */
+	reply->supported = cpu_to_le32(service->ep->dcp->dptx_tunneled ? 1 : 0);
 	return 0;
 }
 
@@ -553,6 +594,14 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEACTIVATE:
 		return dptxport_call_deactivate(service, data, data_size,
 						reply, reply_size);
+	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+		/*
+		 * macOS echoes this one verbatim: the first word is a field (DCP
+		 * sends 1), not a retcode, and zeroing it leaves the sink without
+		 * modes (tunnelled DP IN to a Dell U2725QE).
+		 */
+		memcpy(reply, data, min(reply_size, data_size));
+		return 0;
 	default:
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",

@@ -254,6 +254,8 @@ struct apple_dcp {
 
 	/* these fields are output port specific */
 	struct phy *phy;
+	/* ATC PHY of the port a tunnelled DP IN sits on (pixel clock only) */
+	struct phy *tunnel_phy;
 	struct mux_control *xbar;
 	struct typec_mux *typec_mux;
 
@@ -265,6 +267,12 @@ struct apple_dcp {
 
 	u32 dptx_phy;
 	u32 dptx_die;
+	/* DP IN of a USB4 router: no local phy, the stream is tunnelled */
+	bool dptx_tunneled;
+	u32 dptx_core;
+	/* tunnelled: the crossbar output is selected after connectTo */
+	u32 xbar_index;
+	bool xbar_selected;
 	int hdmi_hpd_irq;
 };
 

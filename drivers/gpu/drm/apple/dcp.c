@@ -357,11 +357,30 @@ int dcp_get_connector_type(struct platform_device *pdev)
 
 #define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
 
+static void dcp_dptx_xbar_select(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->dptx_tunneled || !dcp->xbar || dcp->xbar_selected)
+		return;
+
+	ret = mux_control_select(dcp->xbar, dcp->xbar_index);
+	if (ret)
+		dev_warn(dcp->dev, "dp-xbar select failed: %d\n", ret);
+	else
+		dcp->xbar_selected = true;
+}
+
+static bool dcp_has_dptx(struct apple_dcp *dcp)
+{
+	return dcp->phy || dcp->dptx_tunneled;
+}
+
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	int ret = 0;
 
-	if (!dcp->phy) {
+	if (!dcp_has_dptx(dcp)) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
 	}
@@ -379,9 +398,32 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
-	dptxport_connect(dcp->dptxport[port].service, 0, dcp->dptx_phy, dcp->dptx_die);
+	if (dcp->dptx_tunneled) {
+		/* macOS validates the tunnelled target before connecting to it */
+		ret = dptxport_validate_connection(dcp->dptxport[port].service,
+						   dcp->dptx_core, dcp->dptx_phy,
+						   dcp->dptx_die);
+		if (ret)
+			dev_warn(dcp->dev, "dptx validate_connection failed: %d\n", ret);
+	}
+	dptxport_connect(dcp->dptxport[port].service, dcp->dptx_core,
+			 dcp->dptx_phy, dcp->dptx_die);
+	/*
+	 * macOS routes dispext into the DP IN only after connectTo; DCP then
+	 * activates the port and sees HPD.
+	 */
+	dcp_dptx_xbar_select(dcp);
 	dptxport_request_display(dcp->dptxport[port].service);
 	dcp->dptxport[port].connected = true;
+	/*
+	 * A tunnelled DP IN gets HPD right after DCP's ACTIVATE, before any
+	 * link config, as in macOS, rather than after waiting for it.
+	 */
+	if (dcp->dptx_tunneled) {
+		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (ret)
+			dev_warn(dcp->dev, "tunnelled DP IN: HPD failed: %d\n", ret);
+	}
 
 	mutex_unlock(&dcp->hpd_mutex);
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
@@ -395,7 +437,8 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
+	    !dcp->dptx_tunneled)
 		dptxport_set_hpd(dcp->dptxport[port].service, true);
 
 	if (dcp->avep)
@@ -424,6 +467,10 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	if (dcp->dptxport[port].enabled && dcp->dptxport[port].connected) {
 		dptxport_release_display(dcp->dptxport[port].service);
 		dcp->dptxport[port].connected = false;
+	}
+	if (dcp->xbar_selected) {
+		mux_control_deselect(dcp->xbar);
+		dcp->xbar_selected = false;
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 
@@ -519,7 +566,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+	if (dcp_has_dptx(dcp) && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
@@ -553,7 +600,7 @@ int dcp_start(struct platform_device *pdev)
 				dcp_dptx_connect(dcp, 0);
 #endif
 		}
-	} else if (dcp->phy) {
+	} else if (dcp_has_dptx(dcp)) {
 		dev_warn(dcp->dev, "OS firmware incompatible with dptxport EP\n");
 	}
 	ret = iomfb_start_rtkit(dcp);
@@ -992,9 +1039,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 					   &dcp->dptx_phy);
 	of_property_read_u32(dev->of_node, "apple,dptx-die",
 					   &dcp->dptx_die);
+	of_property_read_u32(dev->of_node, "apple,dptx-core",
+					   &dcp->dptx_core);
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
-		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
-			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
+		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u core: %u%s\n",
+			 dcp->index, dcp->dptx_phy, dcp->dptx_die, dcp->dptx_core,
+			 dcp->dptx_tunneled ? " (tunnelled)" : "");
 	mutex_init(&dcp->hpd_mutex);
 
 	if (!show_notch)
@@ -1187,6 +1237,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+	/* a tunnelled DP IN's pixel clock comes from its port's ATC PHY */
+	dcp->tunnel_phy = devm_phy_optional_get(dev, "tunnel-phy");
+	if (IS_ERR(dcp->tunnel_phy))
+		return dev_err_probe(dev, PTR_ERR(dcp->tunnel_phy),
+				     "Failed to get tunnel-phy\n");
 
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
@@ -1212,6 +1267,17 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		if (surf_en)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
+	}
+
+	dcp->dptx_tunneled = of_property_read_bool(dev->of_node,
+						   "apple,dptx-tunneled");
+	/* selected after connectTo, see dcp_dptx_connect() */
+	if (dcp->dptx_tunneled &&
+	    !of_property_read_u32(dev->of_node, "mux-index", &dcp->xbar_index)) {
+		dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
+		if (IS_ERR(dcp->xbar))
+			return dev_err_probe(dev, PTR_ERR(dcp->xbar),
+					     "Failed to get dp-xbar\n");
 	}
 
 	if (dcp->phy) {

@@ -11,8 +11,10 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mux/apple-display-crossbar.h>
 #include <linux/mux/driver.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -39,6 +41,24 @@
 #define T602X_REG_804_STAT 0x804 // status of 0x004
 #define T602X_REG_810_STAT 0x810 // status of 0x014
 #define T602X_REG_81C_STAT 0x81c // status of 0x024
+
+/*
+ * 0x030 holds the dispext selection in the same layout as CROSSBAR_MUX_CTRL
+ * below: two 4-bit fields per output (dpphy 23:20/11:8, dpin0 15:12/3:0,
+ * dpin1 19:16/7:4). The per-output enable bits in 0x01c, 0x024, 0x028 and
+ * 0x034 follow ATC_DPPHY/ATC_DPIN0/ATC_DPIN1. Both observed in macOS
+ * routing dispext1 to atc1-dpin0 on t6020.
+ */
+
+/*
+ * atcN-dpinM: the glue in front of the USB4 router's DP IN adapter. Names
+ * are guesses from a single macOS trace.
+ */
+#define DPIN_CTRL 0x00
+#define DPIN_MODE 0x04
+#define DPIN_CFG 0x08
+#define DPIN_EN 0x0c
+#define DPIN_EN_STAT 0x10
 
 /*
  * T8013, T600x, T8112 dp crossbar registers.
@@ -95,7 +115,9 @@ struct apple_dpxbar_hw {
 struct apple_dpxbar {
 	struct device *dev;
 	void __iomem *regs;
+	void __iomem *dpin[2];
 	int selected_dispext[MUX_MAX];
+	bool route_pending[MUX_MAX];
 	spinlock_t lock;
 };
 
@@ -118,16 +140,107 @@ static inline void dpxbar_clear32(struct apple_dpxbar *xbar, u32 reg, u32 clear)
 	dpxbar_mask32(xbar, reg, clear, 0);
 }
 
-static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
+static const struct {
+	unsigned int sel_shift[2];
+	u32 atc_bit;
+} apple_dpxbar_t602x_out[MUX_MAX] = {
+	[MUX_DPPHY] = { { 20, 8 }, ATC_DPPHY },
+	[MUX_DPIN0] = { { 12, 0 }, ATC_DPIN0 },
+	[MUX_DPIN1] = { { 16, 4 }, ATC_DPIN1 },
+};
+
+static void apple_dpxbar_dpin_wait(struct apple_dpxbar *dpxbar,
+				   void __iomem *dpin, u32 want)
+{
+	u32 val;
+	int ret;
+
+	ret = readl_poll_timeout_atomic(dpin + DPIN_EN_STAT, val,
+					(val & 1) == want, 1, 50000);
+	if (ret)
+		dev_warn(dpxbar->dev, "dpin enable status stuck at %#x (want %u)\n",
+			 val, want);
+}
+
+/*
+ * macOS only selects the dispext (0x30) and disables dpin when DCP connects;
+ * the FIFO/clock route follows after DCP's link setup (SET_LINK_RATE), i.e.
+ * AUX runs with dpin disabled. dpin outputs are therefore routed in two
+ * steps: apple_dpxbar_set_t602x() selects, the consumer finishes the route
+ * with apple_dpxbar_finish().
+ */
+/* Called with dpxbar->lock held */
+static void apple_dpxbar_t602x_route(struct apple_dpxbar *dpxbar, unsigned int index)
+{
+	int state = dpxbar->selected_dispext[index];
+	u32 dispext_bit = 1 << state;
+	u32 dispext_bit_en = 1 << (2 * state);
+	u32 atc_bit = apple_dpxbar_t602x_out[index].atc_bit;
+
+	dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
+	dpxbar_clear32(dpxbar, T602X_REG_014, 0x4);
+
+	dpxbar_clear32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
+
+	dpxbar_set32(dpxbar, T602X_FIFO_WR_UNK_EN, dispext_bit);
+	dpxbar_set32(dpxbar, T602X_REG_018, dispext_bit_en);
+
+	dpxbar_set32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit);
+	dpxbar_set32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, dispext_bit);
+	dpxbar_set32(dpxbar, T602X_REG_00C, dispext_bit);
+
+	dpxbar_set32(dpxbar, T602X_REG_01C, atc_bit);
+	dpxbar_set32(dpxbar, T602X_REG_034, atc_bit);
+
+	dpxbar_set32(dpxbar, T602X_FIFO_RD_UNK_EN, dispext_bit);
+
+	/*
+	 * macOS never re-enables dpin after the route: EN stays 0 and the
+	 * hardware picks up the video by itself.
+	 */
+	dpxbar->route_pending[index] = false;
+}
+
+int apple_dpxbar_finish(struct mux_control *mux)
 {
 	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
 	unsigned int index = mux_control_get_index(mux);
 	unsigned long flags;
+	bool done = false;
+
+	if (index >= MUX_MAX)
+		return -EINVAL;
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	if (dpxbar->route_pending[index] && dpxbar->selected_dispext[index] >= 0) {
+		apple_dpxbar_t602x_route(dpxbar, index);
+		done = true;
+	}
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	if (done)
+		dev_dbg(dpxbar->dev, "%s: route finished\n",
+			apple_dpxbar_names[index]);
+	return done ? 0 : -EALREADY;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_finish);
+
+static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	void __iomem *dpin = NULL;
+	unsigned long flags;
 	unsigned int mux_state;
 	unsigned int dispext_bit;
 	unsigned int dispext_bit_en;
+	u32 atc_bit;
 	bool enable;
 	int ret = 0;
+
+	if (index >= MUX_MAX)
+		return -EINVAL;
+	atc_bit = apple_dpxbar_t602x_out[index].atc_bit;
+	if (index == MUX_DPIN0 || index == MUX_DPIN1)
+		dpin = dpxbar->dpin[index - MUX_DPIN0];
 
 	if (state == MUX_IDLE_DISCONNECT) {
 		/*
@@ -166,54 +279,58 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 
 		dpxbar_clear32(dpxbar, T602X_FIFO_RD_UNK_EN, prev_dispext_bit);
 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, prev_dispext_bit);
-		dpxbar_clear32(dpxbar, T602X_REG_00C, prev_dispext_bit_en);
+		dpxbar_clear32(dpxbar, T602X_REG_00C, prev_dispext_bit);
 
-		dpxbar_clear32(dpxbar, T602X_REG_01C, 0x100);
+		dpxbar_clear32(dpxbar, T602X_REG_01C, atc_bit);
 
 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_UNK_EN, prev_dispext_bit);
 		dpxbar_clear32(dpxbar, T602X_REG_018, prev_dispext_bit_en);
 
-		dpxbar_clear32(dpxbar, T602X_FIFO_RD_N_CLK_EN, 0x100);
+		dpxbar_clear32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit);
 
 		dpxbar_set32(dpxbar, T602X_FIFO_WR_N_CLK_EN, prev_dispext_bit);
 		dpxbar_set32(dpxbar, T602X_REG_014, 0x4);
 
-		dpxbar_set32(dpxbar, FIFO_RD_PCLK1_EN, 0x100);
+		dpxbar_set32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
 
 		dpxbar->selected_dispext[index] = -1;
+		dpxbar->route_pending[index] = false;
 	}
 
 	if (enable) {
-		dpxbar_set32(dpxbar, T602X_REG_030, state << 20);
-		dpxbar_set32(dpxbar, T602X_REG_030, state << 8);
+		if (dpin) {
+			/* the values macOS writes (it read the same ones back first) */
+			writel(3, dpin + DPIN_CFG);
+			writel(1, dpin + DPIN_MODE);
+			writel(5, dpin + DPIN_CTRL);
+		}
+
+		dpxbar_mask32(dpxbar, T602X_REG_030,
+			      0xf << apple_dpxbar_t602x_out[index].sel_shift[0],
+			      state << apple_dpxbar_t602x_out[index].sel_shift[0]);
+		dpxbar_mask32(dpxbar, T602X_REG_030,
+			      0xf << apple_dpxbar_t602x_out[index].sel_shift[1],
+			      state << apple_dpxbar_t602x_out[index].sel_shift[1]);
 		udelay(10);
 
-		dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
-		dpxbar_clear32(dpxbar, T602X_REG_014, 0x4);
-
-		dpxbar_clear32(dpxbar, T602X_FIFO_RD_PCLK2_EN, 0x100);
-
-		dpxbar_set32(dpxbar, T602X_FIFO_WR_UNK_EN, dispext_bit);
-		dpxbar_set32(dpxbar, T602X_REG_018, dispext_bit_en);
-
-		dpxbar_set32(dpxbar, T602X_FIFO_RD_N_CLK_EN, 0x100);
-		dpxbar_set32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, dispext_bit);
-		dpxbar_set32(dpxbar, T602X_REG_00C, dispext_bit);
-
-		dpxbar_set32(dpxbar, T602X_REG_01C, 0x100);
-		dpxbar_set32(dpxbar, T602X_REG_034, 0x100);
-
-		dpxbar_set32(dpxbar, T602X_FIFO_RD_UNK_EN, dispext_bit);
+		if (dpin) {
+			writel(0, dpin + DPIN_EN);
+			apple_dpxbar_dpin_wait(dpxbar, dpin, 0);
+		}
 
 		dpxbar->selected_dispext[index] = state;
+		if (dpin)
+			dpxbar->route_pending[index] = true;
+		else
+			apple_dpxbar_t602x_route(dpxbar, index);
 	}
 
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
 
 	if (enable)
-		dev_info(dpxbar->dev, "Switched %s to dispext%u,%u\n",
+		dev_info(dpxbar->dev, "Switched %s to dispext%u,%u%s\n",
 			 apple_dpxbar_names[index], mux_state >> 1,
-			 mux_state & 1);
+			 mux_state & 1, dpin ? " (route pending)" : "");
 	else
 		dev_info(dpxbar->dev, "Switched %s to disconnected state\n",
 			 apple_dpxbar_names[index]);
@@ -385,6 +502,16 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(dpxbar->dpin); ++i) {
+		static const char *const names[] = { "dpin0", "dpin1" };
+
+		if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]))
+			continue;
+		dpxbar->dpin[i] = devm_platform_ioremap_resource_byname(pdev, names[i]);
+		if (IS_ERR(dpxbar->dpin[i]))
+			return PTR_ERR(dpxbar->dpin[i]);
+	}
 
 	if (!of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
 		readl(dpxbar->regs + UNK_TUNABLE);

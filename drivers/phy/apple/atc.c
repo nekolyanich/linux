@@ -931,10 +931,6 @@ static const struct atcphy_mode_configuration *atcphy_get_mode_config(struct app
 		return &atcphy_modes[mode].normal;
 }
 
-static bool cio_top_hack = true;
-module_param(cio_top_hack, bool, 0644);
-MODULE_PARM_DESC(cio_top_hack, "HACK: apply j416s tunable_CIO_ACIOPHY_TOP in USB4 mode");
-
 static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	const int lane0 = atcphy->swap_lanes ? 1 : 0;
@@ -970,13 +966,6 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode 
 	case APPLE_ATCPHY_MODE_USB4:
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.lane_usb4[lane0]);
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.lane_usb4[lane1]);
-		/* HACK: j416s ADT tunable_CIO_ACIOPHY_TOP, which m1n1 does not pass on */
-		if (cio_top_hack) {
-			writel(0x80002c07, atcphy->regs.core + 0x6c);
-			writel(0x0d3c03c0, atcphy->regs.core + 0x70);
-			writel(0x80004807, atcphy->regs.core + 0x78);
-			writel(0x0d3c03c0, atcphy->regs.core + 0x7c);
-		}
 		break;
 
 	case APPLE_ATCPHY_MODE_OFF:

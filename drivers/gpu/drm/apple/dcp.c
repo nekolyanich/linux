@@ -578,6 +578,21 @@ void dcp_switch_disconnect(struct apple_dcp *dcp)
 	dcp->dptx_die = dcp->fixed.dptx_die;
 	dcp->switch_active = false;
 
+	/*
+	 * The dispext side of a crossbar route (its FIFO write enables) is
+	 * shared by every port's crossbar, so releasing the switched route just
+	 * turned off what the fixed one still needs: route it again.
+	 */
+	if (dcp->xbar) {
+		int ret;
+
+		mux_control_deselect(dcp->xbar);
+		ret = mux_control_select(dcp->xbar, dcp->xbar_index);
+		if (ret)
+			dev_warn(dcp->dev, "dp-switch: fixed route reselect failed: %d\n",
+				 ret);
+	}
+
 	/* HDMI plugged in while the switch had this DCP */
 	if (dcp_hdmi_connected(dcp))
 		dcp_dptx_connect(dcp, 0);

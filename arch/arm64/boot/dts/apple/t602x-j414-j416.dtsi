@@ -34,6 +34,33 @@
 	apple,always-on;
 };
 
+/*
+ * HACK: DP tunnelled over USB4 instead of DP alt mode on the left-front port,
+ * until dcpext1 can switch between the two: atc1-dpin0 at host router DP IN 5.
+ */
+&typec1 {
+	/delete-property/ displayport;
+};
+
+&usb4_1_nhi {
+	apple,dpin-adapters = <5 6>;
+	apple,dpin-dcp = <&dcpext1>;
+};
+
+&dcpext1 {
+	/delete-property/ phys;
+	/delete-property/ phy-names;
+	apple,dptx-tunneled;
+	apple,dptx-core = <1>;
+	apple,dptx-phy = <1>;
+	apple,dptx-die = <0>;
+	mux-controls = <&atcphy1_xbar 1>;
+	mux-control-names = "dp-xbar";
+	mux-index = <2>;
+	phys = <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "tunnel-phy";
+};
+
 &dcpext0 {
 	/*  HDMI HPD gpio, used as interrupt*/
 	hdmi-hpd-gpios = <&pinctrl_aop 25 GPIO_ACTIVE_HIGH>;

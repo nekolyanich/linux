@@ -11,7 +11,7 @@
 
 struct phy;
 
-#if IS_ENABLED(CONFIG_PHY_APPLE_ATC)
+#if IS_REACHABLE(CONFIG_PHY_APPLE_ATC)
 int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
 #else
 static inline int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)

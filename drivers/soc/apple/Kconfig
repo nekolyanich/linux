@@ -68,6 +68,14 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_DP_SWITCH
+	bool
+	default ARCH_APPLE
+	help
+	  Where the Type-C and USB4 drivers report DisplayPort sinks on Apple
+	  Silicon Type-C ports and the display driver picks them up. Built in,
+	  so either side may be a module.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST

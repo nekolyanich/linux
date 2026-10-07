@@ -13,9 +13,9 @@
 #include "dcp-internal.h"
 #include "dcp.h"
 
-#define DP_SWITCH_DIES	2
-#define DP_SWITCH_ATCS	8
-#define DP_SWITCH_PORTS	3
+#define DP_SWITCH_DIES	APPLE_DP_SWITCH_DIES
+#define DP_SWITCH_ATCS	APPLE_DP_SWITCH_ATCS
+#define DP_SWITCH_PORTS	APPLE_DP_SWITCH_PORTS
 #define DP_SWITCH_DFPS	(DP_SWITCH_DIES * DP_SWITCH_ATCS * DP_SWITCH_PORTS)
 #define DP_SWITCH_UFPS	4
 
@@ -124,28 +124,30 @@ static void dp_switch_work(struct work_struct *work)
 	mutex_unlock(&dp_switch.lock);
 }
 
-void apple_dp_switch_hotplug(u32 die, u32 atc, u32 port, bool connected)
+/* the switch core calls this with its spinlock held */
+static void dp_switch_event(u32 die, u32 atc, u32 port, bool connected)
 {
-	struct dp_switch_dfp *dfp;
-
 	if (die >= DP_SWITCH_DIES || atc >= DP_SWITCH_ATCS ||
 	    port >= DP_SWITCH_PORTS)
 		return;
 
-	dfp = &dp_switch.dfp[dfp_index(die, atc, port)];
-	if (READ_ONCE(dfp->hpd) == connected)
-		return;
-	WRITE_ONCE(dfp->hpd, connected);
-	pr_info("apple-dp-switch: die %u atc%u port %u %s\n", die, atc, port,
-		connected ? "connected" : "disconnected");
+	WRITE_ONCE(dp_switch.dfp[dfp_index(die, atc, port)].hpd, connected);
 	schedule_work(&dp_switch_work_item);
 }
-EXPORT_SYMBOL_GPL(apple_dp_switch_hotplug);
 
 /* a DCP whose DPTX endpoint just came up may take a waiting sink */
 void dp_switch_kick(void)
 {
 	schedule_work(&dp_switch_work_item);
+}
+
+static int dp_switch_nr_ufps(void)
+{
+	int n = 0;
+
+	for (int i = 0; i < DP_SWITCH_UFPS; i++)
+		n += !!dp_switch.ufp[i];
+	return n;
 }
 
 int dp_switch_add_dcp(struct apple_dcp *dcp)
@@ -159,6 +161,12 @@ int dp_switch_add_dcp(struct apple_dcp *dcp)
 			ret = 0;
 			break;
 		}
+	}
+	/* the first DCP takes the sinks reported so far */
+	if (!ret && dp_switch_nr_ufps() == 1) {
+		ret = apple_dp_switch_register(dp_switch_event);
+		if (ret)
+			dp_switch.ufp[0] = NULL;
 	}
 	mutex_unlock(&dp_switch.lock);
 	return ret;
@@ -177,5 +185,7 @@ void dp_switch_remove_dcp(struct apple_dcp *dcp)
 	for (int i = 0; i < DP_SWITCH_UFPS; i++)
 		if (dp_switch.ufp[i] == dcp)
 			dp_switch.ufp[i] = NULL;
+	if (!dp_switch_nr_ufps())
+		apple_dp_switch_unregister();
 	mutex_unlock(&dp_switch.lock);
 }

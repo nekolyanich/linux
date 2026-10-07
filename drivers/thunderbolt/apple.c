@@ -74,7 +74,6 @@
  * is established.
  */
 
-#include <drm/drm_connector.h>
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/device/bus.h>
@@ -92,6 +91,7 @@
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/dp-switch.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -230,15 +230,16 @@ struct apple_nhi {
 	const char **rx_irq_names;
 	size_t nrings;
 
-	/* host router DP IN adapters fed by a DCP, told about HPD out of band */
+	/*
+	 * Host router DP IN adapters: the display switch routes a DCP into
+	 * the port's dpin0/1 while a DP tunnel from them is up.
+	 */
 	struct apple_nhi_dpin {
-		struct apple_nhi *anhi;
-		struct fwnode_handle *dcp;
-		struct work_struct work;
 		u32 adapter;
-		int index;
 		bool hpd;
 	} dpin[2];
+	int dp_switch_atc;
+	u32 dp_switch_die;
 };
 
 #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
@@ -528,29 +529,13 @@ static bool apple_nhi_add_links(struct tb_nhi *nhi)
 	return !!link;
 }
 
-static void apple_nhi_dpin_work(struct work_struct *work)
+static void apple_nhi_dpin_hpd(struct apple_nhi *anhi, int i, bool hpd)
 {
-	struct apple_nhi_dpin *dpin = container_of(work, typeof(*dpin), work);
-	bool hpd = READ_ONCE(dpin->hpd);
-
-	dev_dbg(dpin->anhi->dev, "dpin%d: DCP hotplug %s\n", dpin->index,
-		hpd ? "connected" : "disconnected");
-	if (IS_REACHABLE(CONFIG_DRM))
-		drm_connector_oob_hotplug_event(dpin->dcp, hpd ?
-				connector_status_connected :
-				connector_status_disconnected);
-}
-
-static void apple_nhi_dpin_hpd(struct apple_nhi_dpin *dpin, bool hpd)
-{
-	if (!dpin->dcp)
+	if (anhi->dp_switch_atc < 0 || anhi->dpin[i].hpd == hpd)
 		return;
-	/*
-	 * DCP connects and waits for the link config synchronously; keep
-	 * that out of tb->lock.
-	 */
-	WRITE_ONCE(dpin->hpd, hpd);
-	schedule_work(&dpin->work);
+	anhi->dpin[i].hpd = hpd;
+	apple_dp_switch_hotplug(anhi->dp_switch_die, anhi->dp_switch_atc,
+				APPLE_DP_SWITCH_DPIN0 + i, hpd);
 }
 
 static int apple_nhi_dp_in_enable(struct tb_nhi *nhi, struct tb_port *in, bool enable)
@@ -559,7 +544,7 @@ static int apple_nhi_dp_in_enable(struct tb_nhi *nhi, struct tb_port *in, bool e
 
 	for (int i = 0; i < ARRAY_SIZE(anhi->dpin); i++) {
 		if (anhi->dpin[i].adapter && anhi->dpin[i].adapter == in->port) {
-			apple_nhi_dpin_hpd(&anhi->dpin[i], enable);
+			apple_nhi_dpin_hpd(anhi, i, enable);
 			break;
 		}
 	}
@@ -569,26 +554,20 @@ static int apple_nhi_dp_in_enable(struct tb_nhi *nhi, struct tb_port *in, bool e
 
 static void apple_nhi_probe_dpin(struct apple_nhi *anhi)
 {
-	struct device_node *dcp;
+	u32 atc;
 	int n;
 
+	anhi->dp_switch_atc = -1;
 	n = of_property_count_u32_elems(anhi->np, "apple,dpin-adapters");
-	if (n <= 0)
+	if (n <= 0 || of_property_read_u32(anhi->np, "apple,dp-switch-atc", &atc))
 		return;
 	n = min_t(int, n, ARRAY_SIZE(anhi->dpin));
 
-	for (int i = 0; i < n; i++) {
-		struct apple_nhi_dpin *dpin = &anhi->dpin[i];
-
+	for (int i = 0; i < n; i++)
 		of_property_read_u32_index(anhi->np, "apple,dpin-adapters", i,
-					   &dpin->adapter);
-		dpin->anhi = anhi;
-		dpin->index = i;
-		INIT_WORK(&dpin->work, apple_nhi_dpin_work);
-		dcp = of_parse_phandle(anhi->np, "apple,dpin-dcp", i);
-		if (dcp)
-			dpin->dcp = of_fwnode_handle(dcp);
-	}
+					   &anhi->dpin[i].adapter);
+	anhi->dp_switch_atc = atc;
+	of_property_read_u32(anhi->np, "apple,dp-switch-die", &anhi->dp_switch_die);
 }
 
 static const struct tb_nhi_ops apple_nhi_ops = {
@@ -751,17 +730,10 @@ static void apple_nhi_remove(struct platform_device *pdev)
 	 * the connection manager deactivates the DP tunnel, and tb_stop()
 	 * leaves DP tunnels alone, so dp_in_enable(false) never runs and DCP
 	 * still thinks the display is there: after a replug it neither
-	 * reroutes nor connects. Tell DCP here instead.
+	 * reroutes nor connects. Tell the display switch here instead.
 	 */
-	for (int i = 0; i < ARRAY_SIZE(anhi->dpin); i++) {
-		struct apple_nhi_dpin *dpin = &anhi->dpin[i];
-
-		if (!dpin->dcp)
-			continue;
-		if (READ_ONCE(dpin->hpd))
-			apple_nhi_dpin_hpd(dpin, false);
-		flush_work(&dpin->work);
-	}
+	for (int i = 0; i < ARRAY_SIZE(anhi->dpin); i++)
+		apple_nhi_dpin_hpd(anhi, i, false);
 }
 
 static const struct of_device_id apple_nhi_match[] = {

@@ -642,6 +642,7 @@ struct atcphy_hw {
  * @tunables.lane_usb3: USB3 lane-specific tunables
  * @tunables.lane_dp: DisplayPort lane-specific tunables
  * @tunables.lane_usb4: USB4 lane-specific tunables
+ * @tunables.cio_top: ACIOPHY top tunables for USB4/Thunderbolt mode (optional)
  * @tunables.usb2phy_reg_dflt: Defaults for the secondary eUSB2 register bank
  * @hw: SoC-specific PHY description
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
@@ -693,6 +694,7 @@ struct apple_atcphy {
 		struct apple_tunable *lane_usb3[2];
 		struct apple_tunable *lane_dp[2];
 		struct apple_tunable *lane_usb4[2];
+		struct apple_tunable *cio_top;
 		struct apple_tunable *usb2phy_reg_dflt;
 	} tunables;
 
@@ -1027,6 +1029,11 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode 
 	case APPLE_ATCPHY_MODE_USB4:
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.lane_usb4[lane0]);
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.lane_usb4[lane1]);
+		/*
+		 * Without these, starting a DP tunnel's pixel clock drops the USB4 link
+		 * in one plug orientation.
+		 */
+		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.cio_top);
 		break;
 
 	case APPLE_ATCPHY_MODE_OFF:
@@ -3218,6 +3225,16 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 	atcphy->ss_tunables = !ss_missing;
 	if (ss_missing)
 		dev_warn(atcphy->dev, "SuperSpeed tunables missing, USB2 only\n");
+
+	/* only passed on by newer loaders */
+	atcphy->tunables.cio_top = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+							    "apple,tunable-cio-top",
+							    atcphy->res.core);
+	if (PTR_ERR_OR_ZERO(atcphy->tunables.cio_top) == -ENOENT)
+		atcphy->tunables.cio_top = NULL;
+	else if (IS_ERR(atcphy->tunables.cio_top))
+		return dev_err_probe(atcphy->dev, PTR_ERR(atcphy->tunables.cio_top),
+				     "Failed to read tunable apple,tunable-cio-top\n");
 
 	return 0;
 }

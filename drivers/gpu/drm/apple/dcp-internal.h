@@ -267,6 +267,16 @@ struct apple_dcp {
 
 	u32 dptx_phy;
 	u32 dptx_die;
+	/* routed by the display switch (dp_switch.c) instead of a fixed phy */
+	bool dp_switch;
+	/* currently driving a sink the switch handed over */
+	bool switch_active;
+	/* the fixed route (HDMI on dcpext0) put aside while switch_active */
+	struct {
+		struct phy *phy;
+		struct mux_control *xbar;
+		u32 dptx_phy, dptx_core, dptx_die;
+	} fixed;
 	/* DP IN of a USB4 router: no local phy, the stream is tunnelled */
 	bool dptx_tunneled;
 	u32 dptx_core;

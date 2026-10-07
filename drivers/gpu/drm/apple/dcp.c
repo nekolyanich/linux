@@ -18,7 +18,9 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/phy/apple-atc.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/dp-switch.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
@@ -361,7 +363,8 @@ static void dcp_dptx_xbar_select(struct apple_dcp *dcp)
 {
 	int ret;
 
-	if (!dcp->dptx_tunneled || !dcp->xbar || dcp->xbar_selected)
+	if (!(dcp->dptx_tunneled || dcp->switch_active) || !dcp->xbar ||
+	    dcp->xbar_selected)
 		return;
 
 	ret = mux_control_select(dcp->xbar, dcp->xbar_index);
@@ -373,7 +376,7 @@ static void dcp_dptx_xbar_select(struct apple_dcp *dcp)
 
 static bool dcp_has_dptx(struct apple_dcp *dcp)
 {
-	return dcp->phy || dcp->dptx_tunneled;
+	return dcp->phy || dcp->dptx_tunneled || dcp->dp_switch;
 }
 
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
@@ -406,6 +409,9 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 		if (ret)
 			dev_warn(dcp->dev, "dptx validate_connection failed: %d\n", ret);
 	}
+	/* DP alt mode: the crossbar feeds the port's DP PHY before connectTo */
+	if (!dcp->dptx_tunneled)
+		dcp_dptx_xbar_select(dcp);
 	dptxport_connect(dcp->dptxport[port].service, dcp->dptx_core,
 			 dcp->dptx_phy, dcp->dptx_die);
 	/*
@@ -437,8 +443,9 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
-	    !dcp->dptx_tunneled)
+	/* a DP sink, also on a DCP whose fixed port is HDMI (GPIO HPD) */
+	if ((dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort ||
+	     dcp->switch_active) && !dcp->dptx_tunneled)
 		dptxport_set_hpd(dcp->dptxport[port].service, true);
 
 	if (dcp->avep)
@@ -475,6 +482,105 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	mutex_unlock(&dcp->hpd_mutex);
 
 	return 0;
+}
+
+static const char *const dcp_switch_port_names[] = { "dpphy", "dpin0", "dpin1" };
+
+static bool dcp_hdmi_connected(struct apple_dcp *dcp)
+{
+	return dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd);
+}
+
+/* a DCP with a fixed HDMI port serves the switch only while HDMI is empty */
+bool dcp_switch_available(struct apple_dcp *dcp)
+{
+	return dcp->dptxport[0].enabled && !dcp->switch_active &&
+	       !dcp_hdmi_connected(dcp);
+}
+
+/*
+ * Called by the display switch with its lock held: route this DCP to the DP
+ * PHY (DP alt mode) or a DP IN (tunnel) of a Type-C port and connect to it.
+ * The phy and crossbar output are taken here, not at probe: a port may be
+ * missing (the m1n1 hypervisor keeps its own).
+ */
+int dcp_switch_connect(struct apple_dcp *dcp, u32 die, u32 atc, u32 port)
+{
+	char name[16];
+	struct phy *phy;
+	struct mux_control *xbar;
+
+	if (port >= ARRAY_SIZE(dcp_switch_port_names))
+		return -EINVAL;
+
+	snprintf(name, sizeof(name), "atc%u", atc);
+	phy = of_phy_get(dcp->dev->of_node, name);
+	if (IS_ERR(phy))
+		return PTR_ERR(phy);
+
+	snprintf(name, sizeof(name), "atc%u-%s", atc, dcp_switch_port_names[port]);
+	xbar = mux_control_get(dcp->dev, name);
+	if (IS_ERR(xbar)) {
+		of_phy_put(phy);
+		return PTR_ERR(xbar);
+	}
+
+	/* put a fixed HDMI route aside; its own crossbar stays selected */
+	dcp->fixed.phy = dcp->phy;
+	dcp->fixed.xbar = dcp->xbar;
+	dcp->fixed.dptx_phy = dcp->dptx_phy;
+	dcp->fixed.dptx_core = dcp->dptx_core;
+	dcp->fixed.dptx_die = dcp->dptx_die;
+	dcp->switch_active = true;
+	dcp->xbar_selected = false;
+
+	dcp->dptx_tunneled = port != APPLE_DP_SWITCH_DPPHY;
+	dcp->dptx_core = port;
+	dcp->dptx_phy = atc;
+	dcp->dptx_die = die;
+	if (dcp->dptx_tunneled)
+		dcp->tunnel_phy = phy;
+	else
+		dcp->phy = phy;
+	dcp->xbar = xbar;
+
+	return dcp_dptx_connect(dcp, 0);
+}
+
+void dcp_switch_disconnect(struct apple_dcp *dcp)
+{
+	struct phy *phy = dcp->dptx_tunneled ? dcp->tunnel_phy : dcp->phy;
+
+	if (!dcp->switch_active)
+		return;
+
+	disconnected_hpd_event(dcp->connector);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected)
+		dptxport_set_hpd(dcp->dptxport[0].service, false);
+	dcp_dptx_disconnect(dcp, 0);
+
+	/* stop the tunnel's pixel clock in case DCP left it running */
+	if (dcp->dptx_tunneled && dcp->tunnel_phy)
+		apple_atc_dp_tunnel_rate(dcp->tunnel_phy, 0);
+
+	mux_control_put(dcp->xbar);
+	of_phy_put(phy);
+	dcp->tunnel_phy = NULL;
+	dcp->dptx_tunneled = false;
+	dcp->dptxport[0].atcphy = NULL;
+
+	dcp->phy = dcp->fixed.phy;
+	dcp->xbar = dcp->fixed.xbar;
+	dcp->dptx_phy = dcp->fixed.dptx_phy;
+	dcp->dptx_core = dcp->fixed.dptx_core;
+	dcp->dptx_die = dcp->fixed.dptx_die;
+	dcp->switch_active = false;
+
+	/* HDMI plugged in while the switch had this DCP */
+	if (dcp_hdmi_connected(dcp))
+		dcp_dptx_connect(dcp, 0);
 }
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
@@ -517,7 +623,7 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 		dev_info(dcp->dev, "DP2HDMI HPD irq, 500ms debounce: connected:%d\n", connected);
 	}
 
-	if (connected)
+	if (connected && !dcp->switch_active)
 		dcp_dptx_connect(dcp, 0);
 
 	return IRQ_HANDLED;
@@ -637,7 +743,7 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	// check HPD state before enabling the edge triggered IRQ
-	if (dcp->hdmi_hpd) {
+	if (dcp->hdmi_hpd && !dcp->switch_active) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
@@ -697,7 +803,7 @@ void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	if (dcp->hdmi_hpd) {
+	if (dcp->hdmi_hpd && !dcp->switch_active) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
@@ -730,7 +836,7 @@ void dcp_poweroff(struct platform_device *pdev)
 
 	_dcp_poweroff(dcp);
 
-	if (dcp->hdmi_hpd) {
+	if (dcp->hdmi_hpd && !dcp->switch_active) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		if (!connected) {
 			disconnected_hpd_event(dcp->connector);
@@ -1209,6 +1315,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	int surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
+	int ret;
 
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
@@ -1271,6 +1378,15 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	dcp->dptx_tunneled = of_property_read_bool(dev->of_node,
 						   "apple,dptx-tunneled");
+	dcp->dp_switch = of_property_read_bool(dev->of_node, "apple,dp-switch");
+	if (dcp->dp_switch) {
+		if (of_property_read_u32(dev->of_node, "mux-index", &dcp->xbar_index))
+			return dev_err_probe(dev, -EINVAL,
+					     "dp-switch DCP without mux-index\n");
+		ret = dp_switch_add_dcp(dcp);
+		if (ret)
+			return dev_err_probe(dev, ret, "dp-switch is full\n");
+	}
 	/* selected after connectTo, see dcp_dptx_connect() */
 	if (dcp->dptx_tunneled &&
 	    !of_property_read_u32(dev->of_node, "mux-index", &dcp->xbar_index)) {
@@ -1362,6 +1478,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 static void dcp_platform_remove(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->dp_switch)
+		dp_switch_remove_dcp(dcp);
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 

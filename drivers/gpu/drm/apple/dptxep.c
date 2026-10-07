@@ -106,8 +106,9 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	// seen as 0x100 under some conditions, 0x101 for tunnelled DP IN
-	u32 unk_field = service->ep->dcp->dptx_tunneled ? 0x101 : 0x0;
+	/* macOS: 0x101 for a tunnelled DP IN, 0x100 for DP alt mode it routes */
+	u32 unk_field = service->ep->dcp->dptx_tunneled ? 0x101 :
+			service->ep->dcp->switch_active ? 0x100 : 0x0;
 	int ret;
 	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
@@ -638,6 +639,8 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 		service->ep->dcp->dptxport[unit].unit = unit;
 		service->ep->dcp->dptxport[unit].service = service;
 		service->ep->dcp->dptxport[unit].enabled = true;
+		if (service->ep->dcp->dp_switch)
+			dp_switch_kick();
 		service->cookie = (void *)&service->ep->dcp->dptxport[unit];
 		complete(&service->ep->dcp->dptxport[unit].enable_completion);
 		break;

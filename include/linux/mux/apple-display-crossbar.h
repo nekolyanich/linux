@@ -8,7 +8,7 @@
 
 struct mux_control;
 
-#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR)
+#if IS_REACHABLE(CONFIG_MUX_APPLE_DPXBAR)
 /*
  * Finish routing a selected t602x dpin output (FIFO and clock enables) once
  * the consumer's link is set up. Returns -EALREADY if nothing was pending.

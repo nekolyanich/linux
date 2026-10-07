@@ -621,7 +621,10 @@
 
 	DIE_NODE(atcphy0_xbar): mux@70304c000 {
 		compatible = "apple,t6020-display-crossbar";
-		reg = <0x7 0x0304c000 0x0 0x4000>;
+		reg = <0x7 0x0304c000 0x0 0x4000>,
+			<0x7 0x01e50000 0x0 0x4000>,
+			<0x7 0x01e58000 0x0 0x4000>;
+		reg-names = "xbar", "dpin0", "dpin1";
 		#mux-control-cells = <1>;
 		power-domains = <&DIE_NODE(ps_atc0_usb)>;
 		status = "disabled";

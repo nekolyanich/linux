@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/string_helpers.h>
 
+#include "nhi.h"
 #include "tb.h"
 
 /* Switch NVM support */
@@ -3683,6 +3684,9 @@ void tb_switch_suspend(struct tb_switch *sw, bool runtime)
 		flags |= TB_WAKE_ON_CONNECT | TB_WAKE_ON_DISCONNECT;
 		flags |= TB_WAKE_ON_USB4 | TB_WAKE_ON_USB3 | TB_WAKE_ON_PCIE;
 	}
+
+	if (!runtime && (sw->tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP))
+		return;
 
 	tb_switch_set_wake(sw, flags, runtime);
 

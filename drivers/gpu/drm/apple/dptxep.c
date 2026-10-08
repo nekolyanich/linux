@@ -376,6 +376,14 @@ static int
 dptxport_call_will_change_link_config(struct apple_epic_service *service)
 {
 	struct dptx_port *dptx = service->cookie;
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	/*
+	 * macOS takes the crossbar route down around every link (re)train and
+	 * routes it again at SetLinkRate.
+	 */
+	if (dcp->switch_active && dcp->xbar_selected)
+		apple_dpxbar_link_down(dcp->xbar);
 
 	dptx->phy_ops.dp.set_lanes = 0;
 	dptx->phy_ops.dp.set_rate = 0;
@@ -416,19 +424,19 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 	/*
 	 * A tunnelled DP IN gets its pixel clock and the crossbar FIFO/clock
 	 * route only once DCP sets the link rate, after the AUX phase, as in
-	 * macOS. The clock comes first: the crossbar output needs it running.
+	 * macOS; a switched route taken down for a retrain comes back here too.
+	 * The clock comes first: the crossbar output needs it running.
 	 */
-	if (dcp->dptx_tunneled) {
-		if (dcp->tunnel_phy) {
-			ret = apple_atc_dp_tunnel_rate(dcp->tunnel_phy,
-						       dcp->dptx_core - 1, link_rate);
-			if (ret)
-				dev_warn(dcp->dev, "link rate %#x: tunnel clock failed: %d\n",
-					 link_rate, ret);
-		}
-		if (dcp->xbar_selected && link_rate)
-			apple_dpxbar_finish(dcp->xbar);
+	if (dcp->dptx_tunneled && dcp->tunnel_phy) {
+		ret = apple_atc_dp_tunnel_rate(dcp->tunnel_phy, dcp->dptx_core - 1,
+					       link_rate);
+		if (ret)
+			dev_warn(dcp->dev, "link rate %#x: tunnel clock failed: %d\n",
+				 link_rate, ret);
 	}
+	if ((dcp->dptx_tunneled || dcp->switch_active) && dcp->xbar_selected &&
+	    link_rate)
+		apple_dpxbar_finish(dcp->xbar);
 
 	switch (link_rate) {
 	case LINK_RATE_RBR:

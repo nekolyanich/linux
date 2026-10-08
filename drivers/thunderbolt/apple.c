@@ -98,7 +98,6 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 #include <linux/usb/pd.h>
-#include <linux/usb/role.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_tbt.h>
@@ -199,8 +198,6 @@ struct apple_cio {
 	struct notifier_block typec_notifier;
 	struct notifier_block pm_notifier;
 	bool pm_stopped;
-	struct usb_role_switch *pm_role_sw;
-	enum usb_role pm_role;
 	struct apple_cio_altmode tbt_altmode;
 	struct apple_cio_altmode usb4_altmode;
 };
@@ -1320,22 +1317,10 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long action,
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
-		if (!acio->current_cable_info)
-			break;
-		/*
-		 * Take the USB side down first, as the Type-C driver does on an
-		 * unplug: devices behind the USB3 tunnel would otherwise outlive
-		 * the link and time out in their own suspend.
-		 */
-		acio->pm_role_sw = fwnode_usb_role_switch_get(acio->connector);
-		if (IS_ERR(acio->pm_role_sw))
-			acio->pm_role_sw = NULL;
-		if (acio->pm_role_sw) {
-			acio->pm_role = usb_role_switch_get_role(acio->pm_role_sw);
-			usb_role_switch_set_role(acio->pm_role_sw, USB_ROLE_NONE);
+		if (acio->current_cable_info) {
+			apple_cio_stop(acio);
+			acio->pm_stopped = true;
 		}
-		apple_cio_stop(acio);
-		acio->pm_stopped = true;
 		break;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
@@ -1349,13 +1334,6 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long action,
 			if (ret)
 				dev_warn(acio->dev, "failed to restart ACIO after sleep: %d\n",
 					 ret);
-		}
-		if (acio->pm_role_sw) {
-			/* the cable is still there: give its USB side back either way */
-			if (acio->target_cable_info)
-				usb_role_switch_set_role(acio->pm_role_sw, acio->pm_role);
-			usb_role_switch_put(acio->pm_role_sw);
-			acio->pm_role_sw = NULL;
 		}
 		break;
 	}

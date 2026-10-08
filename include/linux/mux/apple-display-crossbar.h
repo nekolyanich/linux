@@ -14,8 +14,14 @@ struct mux_control;
  * the consumer's link is set up. Returns -EALREADY if nothing was pending.
  */
 int apple_dpxbar_finish(struct mux_control *mux);
+int apple_dpxbar_link_down(struct mux_control *mux);
 #else
 static inline int apple_dpxbar_finish(struct mux_control *mux)
+{
+	return -EALREADY;
+}
+
+static inline int apple_dpxbar_link_down(struct mux_control *mux)
 {
 	return -EALREADY;
 }

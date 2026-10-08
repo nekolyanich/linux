@@ -29,6 +29,7 @@
 #define T602X_FIFO_WR_N_CLK_EN 0x004
 #define T602X_FIFO_WR_UNK_EN 0x008
 #define T602X_REG_00C 0x00c
+#define T602X_REG_010 0x010
 #define T602X_REG_014 0x014
 #define T602X_REG_018 0x018
 #define T602X_REG_01C 0x01c
@@ -140,13 +141,20 @@ static inline void dpxbar_clear32(struct apple_dpxbar *xbar, u32 reg, u32 clear)
 	dpxbar_mask32(xbar, reg, clear, 0);
 }
 
+/*
+ * Per output: the select fields in 0x030, the enable bit in 0x024/0x028/0x034,
+ * the dispext sink and read clock enables, and the 2-bit role written into
+ * 0x018 and 0x028, 1 for dpphy/dpin0 and 3 for dpin1 (dpin1's layout as macOS
+ * routes it on J414s, from aurora-silicon/linux #46).
+ */
 static const struct {
 	unsigned int sel_shift[2];
 	u32 atc_bit;
+	u32 sink, rd_clk, role;
 } apple_dpxbar_t602x_out[MUX_MAX] = {
-	[MUX_DPPHY] = { { 20, 8 }, ATC_DPPHY },
-	[MUX_DPIN0] = { { 12, 0 }, ATC_DPIN0 },
-	[MUX_DPIN1] = { { 16, 4 }, ATC_DPIN1 },
+	[MUX_DPPHY] = { { 20, 8 }, ATC_DPPHY, T602X_REG_00C, T602X_REG_01C, 1 },
+	[MUX_DPIN0] = { { 12, 0 }, ATC_DPIN0, T602X_REG_00C, T602X_REG_01C, 1 },
+	[MUX_DPIN1] = { { 16, 4 }, ATC_DPIN1, T602X_REG_010, FIFO_RD_PCLK1_EN, 3 },
 };
 
 static void apple_dpxbar_dpin_wait(struct apple_dpxbar *dpxbar,
@@ -176,20 +184,23 @@ static void apple_dpxbar_t602x_route(struct apple_dpxbar *dpxbar, unsigned int i
 	u32 dispext_bit = 1 << state;
 	u32 dispext_bit_en = 1 << (2 * state);
 	u32 atc_bit = apple_dpxbar_t602x_out[index].atc_bit;
+	u32 role = apple_dpxbar_t602x_out[index].role;
 
 	dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
-	dpxbar_clear32(dpxbar, T602X_REG_014, 0x4);
+	dpxbar_clear32(dpxbar, T602X_REG_014, dispext_bit);
 
 	dpxbar_clear32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
+	if (index == MUX_DPIN1)
+		dpxbar_clear32(dpxbar, FIFO_RD_PCLK1_EN, atc_bit);
 
 	dpxbar_set32(dpxbar, T602X_FIFO_WR_UNK_EN, dispext_bit);
-	dpxbar_set32(dpxbar, T602X_REG_018, dispext_bit_en);
+	dpxbar_mask32(dpxbar, T602X_REG_018, dispext_bit_en * 3, dispext_bit_en * role);
 
-	dpxbar_set32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit);
+	dpxbar_mask32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit * 3, atc_bit * role);
 	dpxbar_set32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, dispext_bit);
-	dpxbar_set32(dpxbar, T602X_REG_00C, dispext_bit);
+	dpxbar_set32(dpxbar, apple_dpxbar_t602x_out[index].sink, dispext_bit);
 
-	dpxbar_set32(dpxbar, T602X_REG_01C, atc_bit);
+	dpxbar_set32(dpxbar, apple_dpxbar_t602x_out[index].rd_clk, atc_bit);
 	dpxbar_set32(dpxbar, T602X_REG_034, atc_bit);
 
 	dpxbar_set32(dpxbar, T602X_FIFO_RD_UNK_EN, dispext_bit);
@@ -200,6 +211,62 @@ static void apple_dpxbar_t602x_route(struct apple_dpxbar *dpxbar, unsigned int i
 	 */
 	dpxbar->route_pending[index] = false;
 }
+
+/*
+ * Take a routed output's FIFOs and clocks down, as macOS does around a link
+ * retrain and on release; the dispext stays selected. Called with
+ * dpxbar->lock held.
+ */
+static void apple_dpxbar_t602x_unroute(struct apple_dpxbar *dpxbar, unsigned int index)
+{
+	int state = dpxbar->selected_dispext[index];
+	u32 dispext_bit = 1 << state;
+	u32 dispext_bit_en = 1 << (2 * state);
+	u32 atc_bit = apple_dpxbar_t602x_out[index].atc_bit;
+
+	dpxbar_clear32(dpxbar, T602X_FIFO_RD_UNK_EN, dispext_bit);
+	dpxbar_clear32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, dispext_bit);
+	dpxbar_clear32(dpxbar, apple_dpxbar_t602x_out[index].sink, dispext_bit);
+
+	dpxbar_clear32(dpxbar, apple_dpxbar_t602x_out[index].rd_clk, atc_bit);
+
+	dpxbar_clear32(dpxbar, T602X_FIFO_WR_UNK_EN, dispext_bit);
+	dpxbar_clear32(dpxbar, T602X_REG_018, dispext_bit_en * 3);
+
+	dpxbar_clear32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit * 3);
+
+	dpxbar_set32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
+	dpxbar_set32(dpxbar, T602X_REG_014, dispext_bit);
+
+	dpxbar_set32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
+}
+
+/**
+ * apple_dpxbar_link_down() - Take a t602x output's route down for a link retrain
+ * @mux: the output
+ *
+ * The next apple_dpxbar_finish() routes it again.
+ */
+int apple_dpxbar_link_down(struct mux_control *mux)
+{
+	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	int ret = 0;
+
+	if (index >= MUX_MAX)
+		return -EINVAL;
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	if (dpxbar->selected_dispext[index] < 0 || dpxbar->route_pending[index]) {
+		ret = -EALREADY;
+	} else {
+		apple_dpxbar_t602x_unroute(dpxbar, index);
+		dpxbar->route_pending[index] = true;
+	}
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
 
 int apple_dpxbar_finish(struct mux_control *mux)
 {
@@ -230,8 +297,6 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 	void __iomem *dpin = NULL;
 	unsigned long flags;
 	unsigned int mux_state;
-	unsigned int dispext_bit;
-	unsigned int dispext_bit_en;
 	u32 atc_bit;
 	bool enable;
 	int ret = 0;
@@ -251,8 +316,6 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 		mux_state = 0;
 		enable = false;
 	} else if (state >= 0 && state < 9) {
-		dispext_bit = 1 << state;
-		dispext_bit_en = 1 << (2 * state);
 		mux_state = state;
 		enable = true;
 	} else {
@@ -274,24 +337,12 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 	}
 
 	if (dpxbar->selected_dispext[index] >= 0) {
-		u32 prev_dispext_bit = 1 << dpxbar->selected_dispext[index];
-		u32 prev_dispext_bit_en = 1 << (2 * dpxbar->selected_dispext[index]);
-
-		dpxbar_clear32(dpxbar, T602X_FIFO_RD_UNK_EN, prev_dispext_bit);
-		dpxbar_clear32(dpxbar, T602X_FIFO_WR_DPTX_CLK_EN, prev_dispext_bit);
-		dpxbar_clear32(dpxbar, T602X_REG_00C, prev_dispext_bit);
-
-		dpxbar_clear32(dpxbar, T602X_REG_01C, atc_bit);
-
-		dpxbar_clear32(dpxbar, T602X_FIFO_WR_UNK_EN, prev_dispext_bit);
-		dpxbar_clear32(dpxbar, T602X_REG_018, prev_dispext_bit_en);
-
-		dpxbar_clear32(dpxbar, T602X_FIFO_RD_N_CLK_EN, atc_bit);
-
-		dpxbar_set32(dpxbar, T602X_FIFO_WR_N_CLK_EN, prev_dispext_bit);
-		dpxbar_set32(dpxbar, T602X_REG_014, 0x4);
-
-		dpxbar_set32(dpxbar, T602X_FIFO_RD_PCLK2_EN, atc_bit);
+		if (!dpxbar->route_pending[index])
+			apple_dpxbar_t602x_unroute(dpxbar, index);
+		dpxbar_clear32(dpxbar, T602X_REG_034, atc_bit);
+		dpxbar_mask32(dpxbar, T602X_REG_030,
+			      0xf << apple_dpxbar_t602x_out[index].sel_shift[0] |
+			      0xf << apple_dpxbar_t602x_out[index].sel_shift[1], 0);
 
 		dpxbar->selected_dispext[index] = -1;
 		dpxbar->route_pending[index] = false;

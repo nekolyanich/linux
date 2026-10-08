@@ -744,10 +744,70 @@ static const struct of_device_id apple_nhi_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_nhi_match);
 
+/*
+ * ACIO stays powered through suspend-to-idle, so the NHI only has to let the
+ * connection manager take the domain through system sleep, as the PCI NHI
+ * does. Driver data is struct apple_nhi, not struct tb, hence these wrappers.
+ */
+static int apple_nhi_suspend(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_suspend(anhi->tb);
+}
+
+static int apple_nhi_suspend_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_suspend_noirq(anhi->tb);
+}
+
+static int apple_nhi_resume_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_resume_noirq(anhi->tb);
+}
+
+static int apple_nhi_freeze_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_freeze_noirq(anhi->tb);
+}
+
+static int apple_nhi_thaw_noirq(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_thaw_noirq(anhi->tb);
+}
+
+static void apple_nhi_complete(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	tb_domain_complete(anhi->tb);
+}
+
+static const struct dev_pm_ops apple_nhi_pm_ops = {
+	.suspend = apple_nhi_suspend,
+	.suspend_noirq = apple_nhi_suspend_noirq,
+	.resume_noirq = apple_nhi_resume_noirq,
+	.freeze_noirq = apple_nhi_freeze_noirq,
+	.thaw_noirq = apple_nhi_thaw_noirq,
+	.poweroff = apple_nhi_suspend,
+	.poweroff_noirq = apple_nhi_suspend_noirq,
+	.restore_noirq = apple_nhi_resume_noirq,
+	.complete = apple_nhi_complete,
+};
+
 static struct platform_driver apple_nhi_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-nhi",
 		.of_match_table = apple_nhi_match,
+		.pm = pm_sleep_ptr(&apple_nhi_pm_ops),
 	},
 	.probe = apple_nhi_probe,
 	.remove = apple_nhi_remove,
@@ -1284,24 +1344,6 @@ static void apple_cio_remove(struct platform_device *pdev)
 		apple_cio_stop(acio);
 }
 
-static int apple_cio_prepare(struct device *dev)
-{
-	struct apple_cio *acio = dev_get_drvdata(dev);
-
-	guard(mutex)(&acio->lock);
-
-	if (acio->current_cable_info) {
-		dev_err(dev, "unable to suspend while a USB4/Thunderbolt connection is active\n");
-		return -EBUSY;
-	}
-
-	return 0;
-}
-
-static const struct dev_pm_ops apple_cio_pm_ops = {
-	.prepare = apple_cio_prepare,
-};
-
 static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t8103-usb4-acio",
@@ -1314,7 +1356,6 @@ static struct platform_driver apple_cio_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-acio",
 		.of_match_table = apple_acio_match,
-		.pm = pm_sleep_ptr(&apple_cio_pm_ops),
 	},
 	.probe = apple_cio_probe,
 	.remove = apple_cio_remove,

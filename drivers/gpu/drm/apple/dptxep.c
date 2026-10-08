@@ -420,7 +420,8 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 	 */
 	if (dcp->dptx_tunneled) {
 		if (dcp->tunnel_phy) {
-			ret = apple_atc_dp_tunnel_rate(dcp->tunnel_phy, link_rate);
+			ret = apple_atc_dp_tunnel_rate(dcp->tunnel_phy,
+						       dcp->dptx_core - 1, link_rate);
 			if (ret)
 				dev_warn(dcp->dev, "link rate %#x: tunnel clock failed: %d\n",
 					 link_rate, ret);

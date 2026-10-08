@@ -175,6 +175,13 @@ struct tb_nhi_ops {
 #define QUIRK_RESET_DMA_ON_TEARDOWN			BIT(2)
 #define QUIRK_NO_DMA_PORT				BIT(3)
 #define QUIRK_NO_USB3_BW_ALLOC				BIT(4)
+/*
+ * The host router stays powered and its links trained through system sleep
+ * (Apple ACIO in suspend-to-idle): nothing would complete a router's sleep
+ * request, and a device router told to sleep drops its link some tens of
+ * seconds later. Leave the routers awake.
+ */
+#define QUIRK_NO_SYSTEM_SLEEP				BIT(5)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel

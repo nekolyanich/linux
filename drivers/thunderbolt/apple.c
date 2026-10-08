@@ -94,7 +94,6 @@
 #include <linux/soc/apple/dp-switch.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/spinlock.h>
-#include <linux/suspend.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 #include <linux/usb/pd.h>
@@ -196,8 +195,6 @@ struct apple_cio {
 	struct fwnode_handle *connector;
 	struct mutex typec_lock;
 	struct notifier_block typec_notifier;
-	struct notifier_block pm_notifier;
-	bool pm_stopped;
 	struct apple_cio_altmode tbt_altmode;
 	struct apple_cio_altmode usb4_altmode;
 };
@@ -1174,9 +1171,6 @@ static void apple_cio_put_connector(void *data)
 	fwnode_handle_put(acio->connector);
 }
 
-static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long action,
-			       void *data);
-
 static int apple_cio_probe(struct platform_device *pdev)
 {
 	struct dev_pm_domain_attach_data pd_data = {
@@ -1263,23 +1257,15 @@ static int apple_cio_probe(struct platform_device *pdev)
 	else if (ret < 3)
 		return dev_err_probe(dev, -EINVAL, "not enough PM domains\n");
 
-	acio->pm_notifier.notifier_call = apple_cio_pm_notify;
-	ret = register_pm_notifier(&acio->pm_notifier);
-	if (ret)
-		return dev_err_probe(dev, ret, "unable to register PM notifier\n");
-
 	ret = bus_register_notifier(&typec_bus, &acio->typec_notifier);
-	if (ret) {
-		unregister_pm_notifier(&acio->pm_notifier);
+	if (ret)
 		return dev_err_probe(dev, ret, "unable to register Type-C notifier\n");
-	}
 
 	scoped_guard(mutex, &acio->typec_lock) {
 		ret = bus_for_each_dev(&typec_bus, NULL, acio, apple_cio_scan_altmode);
 	}
 	if (ret) {
 		apple_cio_unregister_typec(acio);
-		unregister_pm_notifier(&acio->pm_notifier);
 		return dev_err_probe(dev, ret,
 				     "unable to register for alternate modes notifications\n");
 	}
@@ -1292,53 +1278,10 @@ static void apple_cio_remove(struct platform_device *pdev)
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
 	apple_cio_unregister_typec(acio);
-	unregister_pm_notifier(&acio->pm_notifier);
 
 	guard(mutex)(&acio->lock);
 	if (acio->current_cable_info)
 		apple_cio_stop(acio);
-}
-
-/*
- * Nothing keeps a USB4 connection across system sleep yet, so take ACIO down
- * before it as for an unplug and bring it up again afterwards if the cable is
- * still there: the connection manager, the display switch and DCP then go
- * through a plug. Done from a PM notifier, before tasks are frozen and devices
- * suspended, because stopping ACIO removes the NHI and its children.
- */
-static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long action,
-			       void *data)
-{
-	struct apple_cio *acio = container_of(nb, struct apple_cio, pm_notifier);
-	int ret;
-
-	guard(mutex)(&acio->lock);
-
-	switch (action) {
-	case PM_SUSPEND_PREPARE:
-	case PM_HIBERNATION_PREPARE:
-		if (acio->current_cable_info) {
-			apple_cio_stop(acio);
-			acio->pm_stopped = true;
-		}
-		break;
-	case PM_POST_SUSPEND:
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-		if (!acio->pm_stopped)
-			break;
-		acio->pm_stopped = false;
-		/* the Type-C driver may have reported a new state meanwhile */
-		if (acio->target_cable_info && !acio->current_cable_info) {
-			ret = apple_cio_start(acio);
-			if (ret)
-				dev_warn(acio->dev, "failed to restart ACIO after sleep: %d\n",
-					 ret);
-		}
-		break;
-	}
-
-	return NOTIFY_DONE;
 }
 
 static int apple_cio_prepare(struct device *dev)

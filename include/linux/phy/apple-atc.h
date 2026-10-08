@@ -12,9 +12,9 @@
 struct phy;
 
 #if IS_REACHABLE(CONFIG_PHY_APPLE_ATC)
-int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate);
+int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 #else
-static inline int apple_atc_dp_tunnel_rate(struct phy *phy, u8 rate)
+static inline int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
 	return -ENODEV;
 }

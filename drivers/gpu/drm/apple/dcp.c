@@ -563,7 +563,7 @@ void dcp_switch_disconnect(struct apple_dcp *dcp)
 
 	/* stop the tunnel's pixel clock in case DCP left it running */
 	if (dcp->dptx_tunneled && dcp->tunnel_phy)
-		apple_atc_dp_tunnel_rate(dcp->tunnel_phy, 0);
+		apple_atc_dp_tunnel_rate(dcp->tunnel_phy, dcp->dptx_core - 1, 0);
 
 	mux_control_put(dcp->xbar);
 	of_phy_put(phy);

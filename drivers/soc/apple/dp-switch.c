@@ -37,8 +37,8 @@ void apple_dp_switch_hotplug(u32 die, u32 atc, u32 port, bool connected)
 	spin_lock_irqsave(&dp_switch_lock, flags);
 	if (test_bit(i, dp_switch_hpd) != connected) {
 		assign_bit(i, dp_switch_hpd, connected);
-		pr_info("apple-dp-switch: die %u atc%u port %u %s\n", die, atc,
-			port, connected ? "connected" : "disconnected");
+		pr_debug("apple-dp-switch: die %u atc%u port %u %s\n", die, atc,
+			 port, connected ? "connected" : "disconnected");
 		if (dp_switch_handler)
 			dp_switch_handler(die, atc, port, connected);
 	}

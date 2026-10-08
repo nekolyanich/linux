@@ -32,6 +32,10 @@ static struct {
 	.lock = __MUTEX_INITIALIZER(dp_switch.lock),
 };
 
+static const char *const dp_switch_port_names[DP_SWITCH_PORTS] = {
+	"dpphy", "dpin0", "dpin1"
+};
+
 static void dp_switch_work(struct work_struct *work);
 static DECLARE_WORK(dp_switch_work_item, dp_switch_work);
 
@@ -90,8 +94,8 @@ static void dp_switch_work(struct work_struct *work)
 		if (dfp->hpd || !dfp->dcp)
 			continue;
 		dfp_decode(i, &die, &atc, &port);
-		dev_info(dfp->dcp->dev, "dp-switch: atc%u port %u released\n",
-			 atc, port);
+		dev_info(dfp->dcp->dev, "dp-switch: releasing atc%u %s\n",
+			 atc, dp_switch_port_names[port]);
 		dcp_switch_disconnect(dfp->dcp);
 		dfp->dcp = NULL;
 	}
@@ -106,12 +110,12 @@ static void dp_switch_work(struct work_struct *work)
 		dfp_decode(i, &die, &atc, &port);
 		dcp = ufp_pick(port != APPLE_DP_SWITCH_DPPHY);
 		if (!dcp) {
-			pr_info("apple-dp-switch: no free DCP for die %u atc%u port %u\n",
-				die, atc, port);
+			pr_warn("apple-dp-switch: no free display controller for atc%u %s\n",
+				atc, dp_switch_port_names[port]);
 			continue;
 		}
-		dev_info(dcp->dev, "dp-switch: taking die %u atc%u port %u\n",
-			 die, atc, port);
+		dev_info(dcp->dev, "dp-switch: driving atc%u %s\n",
+			 atc, dp_switch_port_names[port]);
 		dfp->dcp = dcp;
 		ret = dcp_switch_connect(dcp, die, atc, port);
 		if (ret) {

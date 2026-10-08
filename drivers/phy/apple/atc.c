@@ -2215,8 +2215,8 @@ static int atc_tunnel_set(struct apple_atcphy *atcphy, unsigned int dpin, u8 rat
 	}
 	atcphy->tunnel_dpin_rate[dpin] = rate;
 	atcphy->tunnel_users |= BIT(dpin);
-	dev_info(atcphy->dev, "DP tunnel clock dpin%u rate %#x running (+7044=%08x)\n",
-		 dpin, rate, readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT));
+	dev_dbg(atcphy->dev, "DP tunnel clock dpin%u rate %#x running (+7044=%08x)\n",
+		dpin, rate, readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT));
 	return 0;
 }
 

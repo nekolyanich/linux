@@ -466,6 +466,25 @@ static void disconnected_hpd_event(struct apple_connector *con)
 	}
 }
 
+/*
+ * Drop the cached EDID when a sink goes away, so the next one is read afresh:
+ * dcp_hotplug() frees it only if it still sees the disconnect, which a quick
+ * disconnect and connect (a display switch handover, a replug) folds away.
+ * get_modes() reads it under mode_config.mutex; not for callers that hold
+ * modeset locks already.
+ */
+static void dcp_forget_edid(struct apple_dcp *dcp)
+{
+	struct apple_connector *con = dcp->connector;
+
+	if (!con)
+		return;
+	mutex_lock(&con->base.dev->mode_config.mutex);
+	drm_edid_free(con->drm_edid);
+	con->drm_edid = NULL;
+	mutex_unlock(&con->base.dev->mode_config.mutex);
+}
+
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 {
 	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
@@ -555,6 +574,7 @@ void dcp_switch_disconnect(struct apple_dcp *dcp)
 		return;
 
 	disconnected_hpd_event(dcp->connector);
+	dcp_forget_edid(dcp);
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 	if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected)
@@ -609,6 +629,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	disconnected_hpd_event(dcp->connector);
+	dcp_forget_edid(dcp);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);

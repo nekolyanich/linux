@@ -809,6 +809,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 		if (acio->pd_list->pd_links[i])
 			device_link_del(acio->pd_list->pd_links[i]);
 		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
 
 	acio->current_cable_info = 0;
@@ -842,6 +843,12 @@ static int apple_cio_start(struct apple_cio *acio)
 			goto remove_links;
 		}
 		acio->pd_list->pd_links[i] = link;
+		/*
+		 * ACIO holds these domains for as long as the cable is there. Keep
+		 * system sleep from cycling them behind its back: that kills the M3
+		 * and the NHI under their still bound drivers.
+		 */
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], true);
 	}
 
 	/*
@@ -916,6 +923,7 @@ remove_links:
 		if (acio->pd_list->pd_links[i])
 			device_link_del(acio->pd_list->pd_links[i]);
 		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
 	return ret;
 }

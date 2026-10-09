@@ -591,7 +591,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->nhi.ops = &apple_nhi_ops;
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
-	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC | QUIRK_NO_SYSTEM_SLEEP;
+	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC | QUIRK_NO_SYSTEM_SLEEP |
+			   QUIRK_KEEP_TUNNELS;
 
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
 			      APPLE_CIO_NHI_HOP_COUNT_MASK;

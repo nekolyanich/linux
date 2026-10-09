@@ -170,6 +170,12 @@ struct tb_nhi_ops {
  * seconds later. Leave the routers awake.
  */
 #define QUIRK_NO_SYSTEM_SLEEP				BIT(3)
+/*
+ * With the routers kept awake the links stay trained through system sleep,
+ * and so do the tunnels: leave them alone instead of tearing them down for
+ * sleep and setting them up again on resume.
+ */
+#define QUIRK_KEEP_TUNNELS				BIT(4)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel

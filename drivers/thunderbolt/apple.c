@@ -643,7 +643,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	/* DMA transactions on this platform always go through a DART IOMMU. */
 	anhi->nhi.iommu_dma_protection = true;
 	anhi->nhi.ops = &apple_nhi_ops;
-	anhi->nhi.quirks = QUIRK_NO_SYSTEM_SLEEP;
+	anhi->nhi.quirks = QUIRK_NO_SYSTEM_SLEEP | QUIRK_KEEP_TUNNELS;
 	anhi->nhi.iobase = anhi->nhi_base;
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
 			      APPLE_CIO_NHI_HOP_COUNT_MASK;

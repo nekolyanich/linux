@@ -13,6 +13,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/x86/apple.h>
 
+#include "nhi.h"
 #include "tb.h"
 #include "tb_regs.h"
 #include "tunnel.h"
@@ -3114,7 +3115,9 @@ static int tb_suspend_noirq(struct tb *tb)
 	struct tb_cm *tcm = tb_priv(tb);
 
 	tb_dbg(tb, "suspending...\n");
-	tb_disconnect_and_release_dp(tb);
+	/* a kept DP tunnel leaves the display powered down, not unplugged */
+	if (!(tb->nhi->quirks & QUIRK_KEEP_TUNNELS))
+		tb_disconnect_and_release_dp(tb);
 	tb_switch_exit_redrive(tb->root_switch);
 	tb_switch_suspend(tb->root_switch, false);
 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
@@ -3195,6 +3198,11 @@ static int tb_resume_noirq(struct tb *tb)
 	tb_free_unplugged_xdomains(tb->root_switch);
 	tb_restore_children(tb->root_switch);
 
+	if (tb->nhi->quirks & QUIRK_KEEP_TUNNELS) {
+		tb_dbg(tb, "tunnels kept across sleep\n");
+		goto out;
+	}
+
 	/*
 	 * If we get here from suspend to disk the boot firmware or the
 	 * restore kernel might have created tunnels of its own. Since
@@ -3227,6 +3235,7 @@ static int tb_resume_noirq(struct tb *tb)
 		tb_dbg(tb, "tunnels restarted, sleeping for 100ms\n");
 		msleep(100);
 	}
+out:
 	tb_switch_enter_redrive(tb->root_switch);
 	 /* Allow tb_handle_hotplug to progress events */
 	tcm->hotplug_active = true;

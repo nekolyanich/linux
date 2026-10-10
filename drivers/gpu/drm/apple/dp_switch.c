@@ -6,8 +6,10 @@
  * ones, and DCP's connectTo target names exactly such a pair).
  */
 
+#include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/soc/apple/dp-switch.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #include "dcp-internal.h"
@@ -128,6 +130,52 @@ static void dp_switch_work(struct work_struct *work)
 	mutex_unlock(&dp_switch.lock);
 }
 
+/*
+ * A sink driven across system sleep stays dark: DCP's modeset on resume runs
+ * mid-resume and the sink does not take it, while the same modeset later does.
+ * Once the system is fully up, take every route down and plug it again, as a
+ * replug of the cable would.
+ */
+static void dp_switch_resume_work(struct work_struct *work)
+{
+	u32 die, atc, port;
+	bool released = false;
+
+	mutex_lock(&dp_switch.lock);
+	for (int i = 0; i < DP_SWITCH_DFPS; i++) {
+		struct dp_switch_dfp *dfp = &dp_switch.dfp[i];
+
+		if (!dfp->dcp)
+			continue;
+		dfp_decode(i, &die, &atc, &port);
+		dev_info(dfp->dcp->dev, "dp-switch: replugging atc%u %s after sleep\n",
+			 atc, dp_switch_port_names[port]);
+		dcp_switch_disconnect(dfp->dcp);
+		dfp->dcp = NULL;
+		released = true;
+	}
+	mutex_unlock(&dp_switch.lock);
+
+	if (released) {
+		/* give DCP the pause a cable pull would */
+		msleep(1000);
+		schedule_work(&dp_switch_work_item);
+	}
+}
+static DECLARE_WORK(dp_switch_resume_work_item, dp_switch_resume_work);
+
+static int dp_switch_pm_notify(struct notifier_block *nb, unsigned long action,
+			       void *data)
+{
+	if (action == PM_POST_SUSPEND)
+		schedule_work(&dp_switch_resume_work_item);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block dp_switch_pm_nb = {
+	.notifier_call = dp_switch_pm_notify,
+};
+
 /* the switch core calls this with its spinlock held */
 static void dp_switch_event(u32 die, u32 atc, u32 port, bool connected)
 {
@@ -171,6 +219,8 @@ int dp_switch_add_dcp(struct apple_dcp *dcp)
 		ret = apple_dp_switch_register(dp_switch_event);
 		if (ret)
 			dp_switch.ufp[0] = NULL;
+		else
+			register_pm_notifier(&dp_switch_pm_nb);
 	}
 	mutex_unlock(&dp_switch.lock);
 	return ret;
@@ -178,6 +228,7 @@ int dp_switch_add_dcp(struct apple_dcp *dcp)
 
 void dp_switch_remove_dcp(struct apple_dcp *dcp)
 {
+	flush_work(&dp_switch_resume_work_item);
 	flush_work(&dp_switch_work_item);
 	mutex_lock(&dp_switch.lock);
 	for (int i = 0; i < DP_SWITCH_DFPS; i++) {
@@ -189,7 +240,9 @@ void dp_switch_remove_dcp(struct apple_dcp *dcp)
 	for (int i = 0; i < DP_SWITCH_UFPS; i++)
 		if (dp_switch.ufp[i] == dcp)
 			dp_switch.ufp[i] = NULL;
-	if (!dp_switch_nr_ufps())
+	if (!dp_switch_nr_ufps()) {
 		apple_dp_switch_unregister();
+		unregister_pm_notifier(&dp_switch_pm_nb);
+	}
 	mutex_unlock(&dp_switch.lock);
 }

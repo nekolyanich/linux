@@ -55,6 +55,17 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.get_product_attrs = 18,
 };
 
+/* the LPCM format DCP takes in set_format, prepare, start_link and stop */
+struct dcp_av_audio_fmt {
+	__le32 type;		/* 1: LPCM */
+	__le32 channels;
+	__le32 bits;
+	__le32 rate;
+	__le32 _unk;
+	__le32 speaker_alloc;	/* CEA-861 speaker allocation */
+} __packed;
+static_assert(sizeof(struct dcp_av_audio_fmt) == 24);
+
 struct audiosrv_data {
 	struct platform_device *audio_dev;
 	bool plugged;
@@ -75,6 +86,8 @@ struct audiosrv_data {
 	struct apple_dcp *dcp;
 	struct work_struct link_wq;
 	bool link_up;
+	/* the format the running link was prepared with */
+	struct dcp_av_audio_fmt link_fmt;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -172,8 +185,11 @@ MODULE_PARM_DESC(hack_audio_link_persistent,
 		 "HACK: start the audio link after the modeset and keep it running (48 kHz, 2 ch, 24 bit)");
 
 /* the format macOS 13 passes: LPCM, 2 channels, 24 bit, 48 kHz */
-static const u8 av_link_format[24] = {
-	0x01, 0, 0, 0, 0x02, 0, 0, 0, 0x18, 0, 0, 0, 0x80, 0xbb, 0, 0,
+static const struct dcp_av_audio_fmt av_link_format = {
+	.type = cpu_to_le32(1),
+	.channels = cpu_to_le32(2),
+	.bits = cpu_to_le32(24),
+	.rate = cpu_to_le32(48000),
 };
 
 bool dcp_audiosrv_link_persistent(void)
@@ -188,7 +204,7 @@ static int av_link_start(struct audiosrv_data *asrv)
 	u8 fmt[64] = {};
 	int ret = -ENODEV;
 
-	memcpy(fmt + 0x20, av_link_format, sizeof(av_link_format));
+	memcpy(fmt + 0x20, &av_link_format, sizeof(av_link_format));
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv)
@@ -199,14 +215,14 @@ static int av_link_start(struct audiosrv_data *asrv)
 		if (ret)
 			dev_warn(dcp->dev, "audiosrv: set format: %d\n", ret);
 	}
-	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, av_link_format,
+	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, &av_link_format,
 			       sizeof(av_link_format), 64 - sizeof(av_link_format),
 			       NULL, 0, 64);
 	if (ret) {
 		dev_warn(dcp->dev, "audiosrv: link prepare: %d\n", ret);
 		goto out;
 	}
-	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, av_link_format,
+	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, &av_link_format,
 			       sizeof(av_link_format), 64 - sizeof(av_link_format),
 			       NULL, 0, 64);
 	if (ret) {
@@ -214,25 +230,31 @@ static int av_link_start(struct audiosrv_data *asrv)
 		goto out;
 	}
 	asrv->link_up = true;
+	asrv->link_fmt = av_link_format;
 	dev_info(dcp->dev, "audiosrv: link running (hack_audio_link_persistent)\n");
 out:
 	up_write(&asrv->srv_rwsem);
 	return ret;
 }
 
-/* with asrv->plug_lock held */
+/*
+ * With asrv->plug_lock held. As macOS, stop_link and unprepare carry the
+ * format the link runs with.
+ */
 static void av_link_stop(struct audiosrv_data *asrv)
 {
+	const struct dcp_av_audio_fmt *fmt = &asrv->link_fmt;
+
 	if (!asrv->link_up)
 		return;
 	asrv->link_up = false;
 
 	down_write(&asrv->srv_rwsem);
 	if (asrv->srv) {
-		afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0, 64,
-				 NULL, 0, 64);
-		afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0, 64,
-				 NULL, 0, 64);
+		afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, fmt,
+				 sizeof(*fmt), 64 - sizeof(*fmt), NULL, 0, 64);
+		afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, fmt,
+				 sizeof(*fmt), 64 - sizeof(*fmt), NULL, 0, 64);
 	}
 	up_write(&asrv->srv_rwsem);
 }

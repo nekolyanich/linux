@@ -927,7 +927,11 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	}
 
-	if (dcp->avep)
+	/*
+	 * Only with a sink: the display switch may have released this DCP's
+	 * route while the modeset that powers it on was under way.
+	 */
+	if (dcp->avep && dcp->dptxport[0].connected)
 		av_service_connect(dcp);
 }
 

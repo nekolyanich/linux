@@ -24,6 +24,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
@@ -375,8 +376,10 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid = edid;
 		}
 	}
-	if (dcp->nr_modes && apple_connector->drm_edid)
+	if (dcp->nr_modes && apple_connector->drm_edid) {
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+		av_eld_changed(dcp);
+	}
 
 	return dcp->nr_modes;
 }

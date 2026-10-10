@@ -15,6 +15,8 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsize);
 int dcp_get_eld(struct device *dev, u8 *buf, size_t size);
 bool dcp_audiosrv_link_persistent(void);
+int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
+				 unsigned int bits, unsigned int rate);
 
 void dcpaud_connect(struct platform_device *pdev, bool connected);
 void dcpaud_disconnect(struct platform_device *pdev);

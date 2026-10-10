@@ -332,6 +332,50 @@ static void av_link_work(struct work_struct *work)
 		av_link_configure(asrv);
 }
 
+/* CEA-861 speaker allocation, as macOS sends it: 0 for stereo, 0x0b for 5.1 */
+static u32 av_speaker_alloc(unsigned int channels)
+{
+	switch (channels) {
+	case 6:
+		return 0x0b;	/* FL FR LFE FC RL RR */
+	case 8:
+		return 0x13;	/* FL FR LFE FC RL RR RLC RRC */
+	default:
+		return 0;
+	}
+}
+
+/*
+ * The PCM's format for the persistent link: restart the link with it if it
+ * runs with another one, or keep it for the start after the modeset.
+ */
+int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
+				 unsigned int bits, unsigned int rate)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct dcp_av_audio_fmt fmt = {
+		.type = cpu_to_le32(1),
+		.channels = cpu_to_le32(channels),
+		.bits = cpu_to_le32(bits),
+		.rate = cpu_to_le32(rate),
+		.speaker_alloc = cpu_to_le32(av_speaker_alloc(channels)),
+	};
+
+	guard(mutex)(&asrv->link_lock);
+	asrv->want_fmt = fmt;
+	/* DCP may fill in its own speaker allocation: compare the rest */
+	if (asrv->link_up && asrv->link_fmt.channels == fmt.channels &&
+	    asrv->link_fmt.bits == fmt.bits && asrv->link_fmt.rate == fmt.rate)
+		return 0;
+
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (!av_link_route_live(asrv))
+			return 0;
+	}
+	return av_link_configure(asrv);
+}
+
 /* the display has a mode now: the persistent link may start */
 void av_modeset_done(struct apple_dcp *dcp)
 {
@@ -599,6 +643,8 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	/* no link start for the route that is going away */
 	cancel_work_sync(&asrv->link_wq);
 	guard(mutex)(&asrv->link_lock);
+	/* the next sink starts with stereo, which the TV and the Dell both take */
+	asrv->want_fmt = av_link_format;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
 		if (!asrv->srv) {

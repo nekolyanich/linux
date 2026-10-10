@@ -769,6 +769,7 @@ static inline int tb_port_write(struct tb_port *port, const void *buffer,
 
 struct tb *icm_probe(struct tb_nhi *nhi);
 struct tb *tb_probe(struct tb_nhi *nhi);
+void tb_reoffer_dp_in(struct tb *tb);
 
 extern const struct device_type tb_domain_type;
 extern const struct device_type tb_retimer_type;

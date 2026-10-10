@@ -3451,3 +3451,28 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 	return tb;
 }
 EXPORT_SYMBOL_FOR_MODULES(tb_probe, "thunderbolt_apple");
+
+/**
+ * tb_reoffer_dp_in() - Offer the host router's idle DP IN adapters again
+ * @tb: Domain using the software connection manager
+ *
+ * A DP IN adapter whose tunnel never completed DPRX (nothing drove it) is
+ * dropped from the DP resources until it reports a plug, which it does not
+ * while its sink stays connected. A host whose DP sources come and go by
+ * themselves calls this when one becomes free; each idle host router DP IN
+ * goes through the hotplug path again, which pairs it with a waiting DP OUT.
+ */
+void tb_reoffer_dp_in(struct tb *tb)
+{
+	struct tb_port *port;
+
+	mutex_lock(&tb->lock);
+	if (tb->root_switch) {
+		tb_switch_for_each_port(tb->root_switch, port) {
+			if (tb_port_is_dpin(port))
+				tb_queue_hotplug(tb, 0, port->port, false);
+		}
+	}
+	mutex_unlock(&tb->lock);
+}
+EXPORT_SYMBOL_FOR_MODULES(tb_reoffer_dp_in, "thunderbolt_apple");

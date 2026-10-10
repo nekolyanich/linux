@@ -694,6 +694,15 @@ bool dcp_wants_switch_connector(struct platform_device *pdev)
 	return dcp->dp_switch && dcp->connector_type == DRM_MODE_CONNECTOR_HDMIA;
 }
 
+/* which of a DCP's connectors the sink is on; the other one cannot be used */
+bool dcp_connector_is_current(struct platform_device *pdev,
+			      struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return !dcp->connector_switch || dcp->connector == connector;
+}
+
 void dcp_link_switch_connector(struct platform_device *pdev,
 			       struct apple_connector *connector)
 {

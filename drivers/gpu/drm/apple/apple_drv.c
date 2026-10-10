@@ -250,9 +250,29 @@ static const struct drm_connector_funcs apple_connector_funcs = {
 	.oob_hotplug_event	= apple_connector_oob_hotplug,
 };
 
+/*
+ * A DCP with both an HDMI-A and a switch connector drives one of them at a
+ * time; refuse to put its CRTC on the other.
+ */
+static int apple_connector_atomic_check(struct drm_connector *connector,
+					struct drm_atomic_state *state)
+{
+	struct apple_connector *apple_connector = to_apple_connector(connector);
+	struct drm_connector_state *old_state, *new_state;
+
+	old_state = drm_atomic_get_old_connector_state(state, connector);
+	new_state = drm_atomic_get_new_connector_state(state, connector);
+	if (!new_state->crtc || new_state->crtc == old_state->crtc)
+		return 0;
+
+	return dcp_connector_is_current(apple_connector->dcp, apple_connector) ?
+		0 : -EINVAL;
+}
+
 static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 	.get_modes		= dcp_get_modes,
 	.mode_valid		= dcp_mode_valid,
+	.atomic_check		= apple_connector_atomic_check,
 };
 
 static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {

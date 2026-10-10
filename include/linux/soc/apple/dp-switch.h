@@ -15,6 +15,8 @@
 #include <linux/errno.h>
 #include <linux/types.h>
 
+struct notifier_block;
+
 /* the DFP port numbers the ADT and DCP's connectTo target use */
 #define APPLE_DP_SWITCH_DPPHY	0
 #define APPLE_DP_SWITCH_DPIN0	1
@@ -46,6 +48,15 @@ void apple_dp_switch_hotplug(u32 die, u32 atc, u32 port, bool connected);
  */
 int apple_dp_switch_register(apple_dp_switch_handler_t handler);
 void apple_dp_switch_unregister(void);
+
+/*
+ * A DCP became free for the switch. A sink whose source gave up waiting for a
+ * DCP (a DP tunnel whose DPRX timed out) is not reported again by itself, so
+ * its driver listens here to offer it once more. Process context.
+ */
+void apple_dp_switch_dcp_free(void);
+int apple_dp_switch_register_dcp_free(struct notifier_block *nb);
+void apple_dp_switch_unregister_dcp_free(struct notifier_block *nb);
 #else
 static inline void apple_dp_switch_hotplug(u32 die, u32 atc, u32 port,
 					   bool connected)
@@ -58,6 +69,19 @@ static inline int apple_dp_switch_register(apple_dp_switch_handler_t handler)
 }
 
 static inline void apple_dp_switch_unregister(void)
+{
+}
+
+static inline void apple_dp_switch_dcp_free(void)
+{
+}
+
+static inline int apple_dp_switch_register_dcp_free(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void apple_dp_switch_unregister_dcp_free(struct notifier_block *nb)
 {
 }
 #endif

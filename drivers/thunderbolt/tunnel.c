@@ -1184,6 +1184,13 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 			paths[TB_DP_AUX_PATH_IN]->hops[0].in_hop_index,
 			paths[TB_DP_AUX_PATH_OUT]->hops[last].next_hop_index);
 	} else {
+		/*
+		 * Tell the stream source first, while the host router is still
+		 * there: after an unplug the DP OUT adapter's router is gone
+		 * and disabling it fails, which must not leave the source
+		 * believing the tunnel is still up.
+		 */
+		tb_dp_nhi_dp_in_enable(tunnel->src_port, false);
 		tb_dp_dprx_stop(tunnel);
 		tb_dp_port_hpd_clear(tunnel->src_port);
 		tb_dp_port_set_hops(tunnel->src_port, 0, 0, 0);
@@ -1191,20 +1198,24 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 			tb_dp_port_set_hops(tunnel->dst_port, 0, 0, 0);
 	}
 
+	/* a departed adapter must not keep the remaining one enabled */
 	ret = tb_dp_port_enable(tunnel->src_port, active);
-	if (ret)
+	if (ret && active)
 		return ret;
 
 	if (tb_port_is_dpout(tunnel->dst_port)) {
 		ret = tb_dp_port_enable(tunnel->dst_port, active);
-		if (ret)
+		if (ret && active)
 			return ret;
 	}
 
-	/* the stream source is told only once both adapters are enabled */
-	tb_dp_nhi_dp_in_enable(tunnel->src_port, active);
+	if (!active)
+		return 0;
 
-	return active ? tb_dp_dprx_start(tunnel) : 0;
+	/* the stream source is told only once both adapters are enabled */
+	tb_dp_nhi_dp_in_enable(tunnel->src_port, true);
+
+	return tb_dp_dprx_start(tunnel);
 }
 
 /**

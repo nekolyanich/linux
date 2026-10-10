@@ -426,9 +426,13 @@ int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
 
 	guard(mutex)(&asrv->link_lock);
 	asrv->want_fmt = fmt;
-	/* DCP may fill in its own speaker allocation: compare the rest */
+	/*
+	 * A restart is visible on some sinks (the Dell blinked once): only
+	 * for other channels or another rate. DCP may fill in its own speaker
+	 * allocation, and the sample size stays at 24 bit.
+	 */
 	if (asrv->link_up && asrv->link_fmt.channels == fmt.channels &&
-	    asrv->link_fmt.bits == fmt.bits && asrv->link_fmt.rate == fmt.rate)
+	    asrv->link_fmt.rate == fmt.rate)
 		return 0;
 
 	scoped_guard(mutex, &asrv->plug_lock) {

@@ -305,6 +305,17 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		return ret;
 	substream->runtime->hw = hw;
 
+	/*
+	 * hack_audio_link_persistent: the link runs with 24 bit samples in
+	 * 32 bit words, and a probe of another sample size must not restart
+	 * it (PipeWire's probes did, and the Dell blinked).
+	 */
+	if (dcp_audiosrv_link_persistent())
+		snd_pcm_hw_constraint_mask64(substream->runtime,
+					     SNDRV_PCM_HW_PARAM_FORMAT,
+					     SNDRV_PCM_FMTBIT_S24_LE |
+					     SNDRV_PCM_FMTBIT_S32_LE);
+
 	return snd_dmaengine_pcm_open(substream, dcpaud->chan);
 }
 
@@ -343,20 +354,6 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	if (!ret)
 		return -EINVAL;
 
-	/*
-	 * hack_audio_link_persistent: the link carries the sink's format the
-	 * rules above allow, so restart it with this one if it differs. DCP
-	 * takes at most 24 bit samples (16/20/24 offered by macOS).
-	 */
-	if (dcp_audiosrv_link_persistent()) {
-		ret = dcp_audiosrv_link_set_format(dcpaud->dcp_dev,
-				params_channels(params),
-				min(params_width(params), 24),
-				params_rate(params));
-		if (ret < 0)
-			return ret;
-	}
-
 	memset(&slave_config, 0, sizeof(slave_config));
 	ret = snd_hwparams_to_dma_slave_config(substream, params, &slave_config);
 	dev_info(dcpaud->dev, "snd_hwparams_to_dma_slave_config: %d\n", ret);
@@ -391,6 +388,20 @@ static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
+
+	/*
+	 * hack_audio_link_persistent: the link carries the stream's channels
+	 * and rate. Restart it here, when playback is about to start, not in
+	 * hw_params, which a format probe calls too.
+	 */
+	if (dcp_audiosrv_link_persistent()) {
+		struct snd_pcm_runtime *rt = substream->runtime;
+		int ret = dcp_audiosrv_link_set_format(dcpaud->dcp_dev,
+						       rt->channels, 24,
+						       rt->rate);
+		if (ret < 0)
+			return ret;
+	}
 
 	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
 				    &dcpaud->selected_cookie);

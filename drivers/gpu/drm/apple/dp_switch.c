@@ -23,6 +23,8 @@
 
 struct dp_switch_dfp {
 	bool hpd;
+	/* went away since the last pass, even if it is back already */
+	bool gone;
 	struct apple_dcp *dcp;
 };
 
@@ -94,8 +96,14 @@ static void dp_switch_work(struct work_struct *work)
 	/* release first, so a DCP freed here can take a waiting sink */
 	for (i = 0; i < DP_SWITCH_DFPS; i++) {
 		struct dp_switch_dfp *dfp = &dp_switch.dfp[i];
+		bool gone = xchg(&dfp->gone, false);
 
-		if (dfp->hpd || !dfp->dcp)
+		/*
+		 * A sink that went and came back between two passes (a USB4
+		 * link that dropped and retrained) is a new sink: its old
+		 * route goes, and the loop below routes it afresh.
+		 */
+		if (!dfp->dcp || (dfp->hpd && !gone))
 			continue;
 		dfp_decode(i, &die, &atc, &port);
 		dev_info(dfp->dcp->dev, "dp-switch: releasing atc%u %s\n",
@@ -191,6 +199,8 @@ static void dp_switch_event(u32 die, u32 atc, u32 port, bool connected)
 	    port >= DP_SWITCH_PORTS)
 		return;
 
+	if (!connected)
+		WRITE_ONCE(dp_switch.dfp[dfp_index(die, atc, port)].gone, true);
 	WRITE_ONCE(dp_switch.dfp[dfp_index(die, atc, port)].hpd, connected);
 	schedule_work(&dp_switch_work_item);
 }

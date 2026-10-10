@@ -127,6 +127,8 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 	up_write(&asrv->srv_rwsem);
 
 	asrv->plugged = false;
+	/* nothing is open any more: a re-announced service must be opened afresh */
+	asrv->is_open = false;
 	asrv->link_up = false;
 	if (asrv->audio_dev)
 		dcpaud_disconnect(asrv->audio_dev);

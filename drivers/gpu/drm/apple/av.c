@@ -132,6 +132,11 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		/* the firmware tore the service down (display gone, AV restart) */
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, cookie,
 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
 			       64);
@@ -147,6 +152,11 @@ int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		/* the firmware tore the service down (display gone, AV restart) */
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, cookie,
 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
 			       64);
@@ -162,6 +172,11 @@ int dcp_audiosrv_stoplink(struct device *dev)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		/* the firmware tore the service down (display gone, AV restart) */
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0, 64,
 			       NULL, 0, 64);
 	up_write(&asrv->srv_rwsem);
@@ -176,6 +191,11 @@ int dcp_audiosrv_unprepare(struct device *dev)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		/* the firmware tore the service down (display gone, AV restart) */
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0, 64,
 			       NULL, 0, 64);
 	up_write(&asrv->srv_rwsem);

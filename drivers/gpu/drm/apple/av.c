@@ -10,6 +10,7 @@
 #include <linux/of_platform.h>
 #include <linux/rwsem.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include "audio.h"
@@ -92,6 +93,9 @@ struct audiosrv_data {
 	struct dcp_av_audio_fmt link_fmt;
 	/* the format the link is to run with */
 	struct dcp_av_audio_fmt want_fmt;
+	/* report 0xe0115001 went to 0: DCP runs the audio stream */
+	bool stream_confirmed;
+	wait_queue_head_t report_wq;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -250,6 +254,7 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
 	int ret;
 
 	guard(rwsem_write)(&asrv->srv_rwsem);
+	WRITE_ONCE(asrv->stream_confirmed, false);
 	ret = afk_service_call(service, 0, asrv->cmds.prepare, &fmt, sizeof(fmt),
 			       64 - sizeof(fmt), reply, sizeof(reply), 0);
 	if (ret) {
@@ -280,6 +285,18 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
 				 sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
 		return ret;
 	}
+	/*
+	 * On the Dell reports 0xe0115000 and 0xe0115001 both go to 0 around
+	 * prepare and start_link and the DMA runs. On the TV behind the
+	 * USB-C to HDMI adapter only 0xe0115000 did (4 of 4 starts with status 0
+	 * followed by EIO), and the DPA never took a sample. Not understood
+	 * yet: only say so.
+	 */
+	if (!wait_event_timeout(asrv->report_wq,
+				READ_ONCE(asrv->stream_confirmed),
+				msecs_to_jiffies(500)))
+		dev_warn(dcp->dev,
+			 "audiosrv: DCP did not confirm the audio stream (report 0xe0115001)\n");
 	asrv->link_up = true;
 	asrv->link_fmt = fmt;
 	dev_info(dcp->dev,
@@ -620,9 +637,19 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 						  const void *data, size_t data_size)
 {
+	struct audiosrv_data *asrv = service->ep->dcp->audiosrv;
+
 	dev_dbg(service->ep->dcp->dev, "got audio report %d size %zx\n", idx, data_size);
 	print_hex_dump_debug("audio report: ", DUMP_PREFIX_OFFSET, 16, 4, data,
 			     data_size, false);
+
+	/* 0x70 bytes: an event code at +0x50, a flag at +0x60 */
+	if (data_size >= 0x64 &&
+	    get_unaligned_le32(data + 0x50) == 0xe0115001) {
+		WRITE_ONCE(asrv->stream_confirmed,
+			   !get_unaligned_le32(data + 0x60));
+		wake_up(&asrv->report_wq);
+	}
 
 	return 0;
 }
@@ -771,6 +798,7 @@ int avep_init(struct apple_dcp *dcp)
 	init_rwsem(&audiosrv_data->srv_rwsem);
 	mutex_init(&audiosrv_data->plug_lock);
 	mutex_init(&audiosrv_data->link_lock);
+	init_waitqueue_head(&audiosrv_data->report_wq);
 	audiosrv_data->want_fmt = av_link_format;
 
 	switch (dcp->fw_compat) {

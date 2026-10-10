@@ -17,5 +17,6 @@ int dcp_get_eld(struct device *dev, u8 *buf, size_t size);
 
 void dcpaud_connect(struct platform_device *pdev, bool connected);
 void dcpaud_disconnect(struct platform_device *pdev);
+void dcpaud_eld_changed(struct platform_device *pdev);
 
 #endif /* __AUDIO_H__ */

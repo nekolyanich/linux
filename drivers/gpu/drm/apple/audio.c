@@ -24,7 +24,9 @@
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/initval.h>
+#include <sound/control.h>
 #include <sound/jack.h>
+#include <drm/drm_eld.h>
 
 #include "av.h"
 #include "dcp.h"
@@ -56,6 +58,11 @@ struct dcp_audio {
 	void *productattrs;
 
 	struct snd_pcm_chmap *chmap_info;
+
+	/* the sink's ELD as last announced through the "ELD" control */
+	struct snd_kcontrol *eld_ctl;
+	u8 eld[MAX_ELD_BYTES];
+	int eld_len;
 };
 
 /*
@@ -493,6 +500,90 @@ static int dcpaud_create_pcm(struct dcp_audio *dcpaud)
 	return 0;
 }
 
+/* reread the sink's ELD and tell userspace if it changed */
+static void dcpaud_update_eld(struct dcp_audio *dcpaud)
+{
+	u8 eld[MAX_ELD_BYTES];
+	int len = 0;
+	bool changed;
+
+	if (!dcpaud->eld_ctl)
+		return;
+	if (dcpaud->connected)
+		len = dcp_get_eld(dcpaud->dcp_dev, eld, sizeof(eld));
+
+	mutex_lock(&dcpaud->data_lock);
+	changed = len != dcpaud->eld_len || memcmp(eld, dcpaud->eld, len);
+	if (changed) {
+		memcpy(dcpaud->eld, eld, len);
+		dcpaud->eld_len = len;
+	}
+	mutex_unlock(&dcpaud->data_lock);
+
+	if (changed)
+		snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE |
+			       SNDRV_CTL_EVENT_MASK_INFO, &dcpaud->eld_ctl->id);
+}
+
+/* the DCP side has a new ELD for the current sink (its EDID was read) */
+void dcpaud_eld_changed(struct platform_device *pdev)
+{
+	dcpaud_update_eld(platform_get_drvdata(pdev));
+}
+
+static int dcpaud_eld_info(struct snd_kcontrol *kcontrol,
+			   struct snd_ctl_elem_info *uinfo)
+{
+	struct dcp_audio *dcpaud = snd_kcontrol_chip(kcontrol);
+
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
+	mutex_lock(&dcpaud->data_lock);
+	uinfo->count = dcpaud->eld_len;
+	mutex_unlock(&dcpaud->data_lock);
+
+	return 0;
+}
+
+static int dcpaud_eld_get(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct dcp_audio *dcpaud = snd_kcontrol_chip(kcontrol);
+
+	mutex_lock(&dcpaud->data_lock);
+	memset(ucontrol->value.bytes.data, 0, sizeof(ucontrol->value.bytes.data));
+	memcpy(ucontrol->value.bytes.data, dcpaud->eld, dcpaud->eld_len);
+	mutex_unlock(&dcpaud->data_lock);
+
+	return 0;
+}
+
+static const struct snd_kcontrol_new dcpaud_eld_ctl = {
+	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+	.name = "ELD",
+	.info = dcpaud_eld_info,
+	.get = dcpaud_eld_get,
+};
+
+static int dcpaud_create_eld_ctl(struct dcp_audio *dcpaud)
+{
+	struct snd_kcontrol *kctl;
+	int ret;
+
+	kctl = snd_ctl_new1(&dcpaud_eld_ctl, dcpaud);
+	if (!kctl)
+		return -ENOMEM;
+	/* the playback PCM's device number, as HDMI codecs do */
+	kctl->id.device = 0;
+
+	ret = snd_ctl_add(dcpaud->card, kctl);
+	if (ret)
+		return ret;
+
+	dcpaud->eld_ctl = kctl;
+	return 0;
+}
+
 /* expects to be called with data_lock locked and unlocks it */
 static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 {
@@ -509,6 +600,7 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 	mutex_unlock(&dcpaud->data_lock);
 
 	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
+	dcpaud_update_eld(dcpaud);
 
 	if (!connected) {
 		snd_pcm_stream_lock(substream);
@@ -581,6 +673,10 @@ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 		goto err_free_card;
 
 	ret = dcpaud_create_jack(dcpaud);
+	if (ret)
+		goto err_free_card;
+
+	ret = dcpaud_create_eld_ctl(dcpaud);
 	if (ret)
 		goto err_free_card;
 

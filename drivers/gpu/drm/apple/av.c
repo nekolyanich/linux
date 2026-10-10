@@ -355,6 +355,20 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	asrv->is_open = false;
 }
 
+/* DRM read the sink's EDID: let the audio card announce the new ELD */
+void av_eld_changed(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	if (!asrv)
+		return;
+
+	mutex_lock(&asrv->plug_lock);
+	if (asrv->audio_dev)
+		dcpaud_eld_changed(asrv->audio_dev);
+	mutex_unlock(&asrv->plug_lock);
+}
+
 static void av_work_service_start(struct work_struct *work)
 {
 	struct audiosrv_data *audiosrv_data;

@@ -196,6 +196,12 @@ static const struct dcp_av_audio_fmt av_link_format = {
 	.rate = cpu_to_le32(48000),
 };
 
+/* HACK for a bench A/B: skip the close/open between set_format and prepare */
+static bool hack_audio_link_reopen = true;
+module_param(hack_audio_link_reopen, bool, 0644);
+MODULE_PARM_DESC(hack_audio_link_reopen,
+		 "HACK: close and reopen the audio service on a link (re)start, as macOS (default: on)");
+
 bool dcp_audiosrv_link_persistent(void)
 {
 	return hack_audio_link_persistent;
@@ -230,6 +236,44 @@ static bool av_link_route_live(struct audiosrv_data *asrv)
 
 	return asrv->is_open && asrv->srv && dcp->valid_mode &&
 	       !dcp->during_modeset && dcp->dptxport[0].connected;
+}
+
+/* with asrv->plug_lock held */
+static int av_link_prepare_start(struct audiosrv_data *asrv,
+				 struct apple_epic_service *service,
+				 const struct dcp_av_audio_fmt *pfmt)
+{
+	struct apple_dcp *dcp = asrv->dcp;
+	struct dcp_av_audio_fmt fmt = *pfmt;
+	u8 reply[64] = {};
+	int ret;
+
+	guard(rwsem_write)(&asrv->srv_rwsem);
+	ret = afk_service_call(service, 0, asrv->cmds.prepare, &fmt, sizeof(fmt),
+			       64 - sizeof(fmt), reply, sizeof(reply), 0);
+	if (ret) {
+		dev_warn(dcp->dev, "audiosrv: link prepare: %d\n", ret);
+		return ret;
+	}
+	dev_dbg(dcp->dev, "audiosrv: prepare reply (reopen %d):\n",
+		hack_audio_link_reopen);
+	print_hex_dump_debug("prepare: ", DUMP_PREFIX_OFFSET, 16, 4, reply,
+			     sizeof(reply), false);
+	ret = afk_service_call(service, 0, asrv->cmds.start_link, &fmt,
+			       sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
+	if (ret) {
+		dev_warn(dcp->dev, "audiosrv: link start: %d\n", ret);
+		afk_service_call(service, 0, asrv->cmds.unprepare, &fmt,
+				 sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
+		return ret;
+	}
+	asrv->link_up = true;
+	asrv->link_fmt = fmt;
+	dev_info(dcp->dev,
+		 "audiosrv: link running: %u ch, %u bit, %u Hz, alloc 0x%02x (hack_audio_link_persistent)\n",
+		 le32_to_cpu(fmt.channels), le32_to_cpu(fmt.bits),
+		 le32_to_cpu(fmt.rate), le32_to_cpu(fmt.speaker_alloc));
+	return 0;
 }
 
 /*
@@ -269,7 +313,12 @@ static int av_link_configure(struct audiosrv_data *asrv)
 						       reply, sizeof(reply), 0);
 			if (ret) {
 				dev_warn(dcp->dev, "audiosrv: set format: %d\n", ret);
-			} else if (le32_to_cpup((__le32 *)(reply + 0x20)) == 1) {
+			} else {
+				dev_dbg(dcp->dev, "audiosrv: set format reply:\n");
+				print_hex_dump_debug("set_format: ", DUMP_PREFIX_OFFSET,
+						     16, 4, reply, sizeof(reply), false);
+			}
+			if (!ret && le32_to_cpup((__le32 *)(reply + 0x20)) == 1) {
 				/* DCP echoes the format, with its speaker allocation */
 				memcpy(&fmt, reply + 0x20, sizeof(fmt));
 			}
@@ -277,11 +326,14 @@ static int av_link_configure(struct audiosrv_data *asrv)
 		av_link_stop(asrv);
 	}
 
-	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
-			       NULL, 0, 16);
-	if (!ret && !service->torndown)
-		ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
-				       NULL, 0, 32);
+	ret = 0;
+	if (hack_audio_link_reopen) {
+		ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0,
+				       16, NULL, 0, 16);
+		if (!ret && !service->torndown)
+			ret = afk_service_call(service, 0, asrv->cmds.open, NULL,
+					       0, 32, NULL, 0, 32);
+	}
 	if (service->torndown) {
 		/* the service is announced afresh and opened from there */
 		service->enabled = false;
@@ -299,29 +351,9 @@ static int av_link_configure(struct audiosrv_data *asrv)
 	if (asrv->srv != service || !av_link_route_live(asrv))
 		return -ENODEV;
 
-	guard(rwsem_write)(&asrv->srv_rwsem);
-	ret = afk_service_call(service, 0, asrv->cmds.prepare, &fmt, sizeof(fmt),
-			       64 - sizeof(fmt), NULL, 0, 64);
-	if (ret) {
-		dev_warn(dcp->dev, "audiosrv: link prepare: %d\n", ret);
-		return ret;
-	}
-	ret = afk_service_call(service, 0, asrv->cmds.start_link, &fmt,
-			       sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
-	if (ret) {
-		dev_warn(dcp->dev, "audiosrv: link start: %d\n", ret);
-		afk_service_call(service, 0, asrv->cmds.unprepare, &fmt,
-				 sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
-		return ret;
-	}
-	asrv->link_up = true;
-	asrv->link_fmt = fmt;
-	dev_info(dcp->dev,
-		 "audiosrv: link running: %u ch, %u bit, %u Hz, alloc 0x%02x (hack_audio_link_persistent)\n",
-		 le32_to_cpu(fmt.channels), le32_to_cpu(fmt.bits),
-		 le32_to_cpu(fmt.rate), le32_to_cpu(fmt.speaker_alloc));
-	return 0;
+	return av_link_prepare_start(asrv, service, &fmt);
 }
+
 
 static void av_link_work(struct work_struct *work)
 {

@@ -85,9 +85,13 @@ struct audiosrv_data {
 	/* hack_audio_link_persistent: the link runs from the first modeset on */
 	struct apple_dcp *dcp;
 	struct work_struct link_wq;
+	/* serialises (re)configuring the link with the service's open/close */
+	struct mutex link_lock;
 	bool link_up;
 	/* the format the running link was prepared with */
 	struct dcp_av_audio_fmt link_fmt;
+	/* the format the link is to run with */
+	struct dcp_av_audio_fmt want_fmt;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -197,46 +201,6 @@ bool dcp_audiosrv_link_persistent(void)
 	return hack_audio_link_persistent;
 }
 
-/* with asrv->plug_lock held */
-static int av_link_start(struct audiosrv_data *asrv)
-{
-	struct apple_dcp *dcp = asrv->dcp;
-	u8 fmt[64] = {};
-	int ret = -ENODEV;
-
-	memcpy(fmt + 0x20, &av_link_format, sizeof(av_link_format));
-
-	down_write(&asrv->srv_rwsem);
-	if (!asrv->srv)
-		goto out;
-	if (asrv->cmds.set_format) {
-		ret = afk_service_call(asrv->srv, 0, asrv->cmds.set_format, fmt,
-				       sizeof(fmt), 0, NULL, 0, 64);
-		if (ret)
-			dev_warn(dcp->dev, "audiosrv: set format: %d\n", ret);
-	}
-	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, &av_link_format,
-			       sizeof(av_link_format), 64 - sizeof(av_link_format),
-			       NULL, 0, 64);
-	if (ret) {
-		dev_warn(dcp->dev, "audiosrv: link prepare: %d\n", ret);
-		goto out;
-	}
-	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, &av_link_format,
-			       sizeof(av_link_format), 64 - sizeof(av_link_format),
-			       NULL, 0, 64);
-	if (ret) {
-		dev_warn(dcp->dev, "audiosrv: link start: %d\n", ret);
-		goto out;
-	}
-	asrv->link_up = true;
-	asrv->link_fmt = av_link_format;
-	dev_info(dcp->dev, "audiosrv: link running (hack_audio_link_persistent)\n");
-out:
-	up_write(&asrv->srv_rwsem);
-	return ret;
-}
-
 /*
  * With asrv->plug_lock held. As macOS, stop_link and unprepare carry the
  * format the link runs with.
@@ -259,17 +223,113 @@ static void av_link_stop(struct audiosrv_data *asrv)
 	up_write(&asrv->srv_rwsem);
 }
 
+/* with asrv->plug_lock held: the switch may have released the route meanwhile */
+static bool av_link_route_live(struct audiosrv_data *asrv)
+{
+	struct apple_dcp *dcp = asrv->dcp;
+
+	return asrv->is_open && asrv->srv && dcp->valid_mode &&
+	       !dcp->during_modeset && dcp->dptxport[0].connected;
+}
+
+/*
+ * (Re)start the link with asrv->want_fmt, in the order the macOS 13 trace
+ * shows for a plug and for a format change (TV over DP alt mode, dcpext0):
+ * set_format (0,20) with the new format; stop_link (0,10) and unprepare
+ * (0,11) with the old one; close (0,5) and open (0,4) on the same channel;
+ * prepare (0,6) and start_link (0,7) with the new format. DCP keeps the
+ * format it picked for the sink (6 channels for the TV) until the service
+ * is opened again, so a prepare without the close and open fails there.
+ *
+ * With asrv->link_lock held and asrv->plug_lock not held: a teardown may
+ * come in on the close's reply and takes plug_lock on the AFK workqueue that
+ * also delivers the reply.
+ */
+static int av_link_configure(struct audiosrv_data *asrv)
+{
+	struct apple_dcp *dcp = asrv->dcp;
+	struct dcp_av_audio_fmt fmt = asrv->want_fmt;
+	struct apple_epic_service *service;
+	u8 req[64] = {}, reply[64] = {};
+	int ret;
+
+	lockdep_assert_held(&asrv->link_lock);
+
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (!av_link_route_live(asrv))
+			return -ENODEV;
+		service = asrv->srv;
+
+		if (asrv->cmds.set_format) {
+			memcpy(req + 0x20, &fmt, sizeof(fmt));
+			scoped_guard(rwsem_write, &asrv->srv_rwsem)
+				ret = afk_service_call(service, 0,
+						       asrv->cmds.set_format,
+						       req, sizeof(req), 0,
+						       reply, sizeof(reply), 0);
+			if (ret) {
+				dev_warn(dcp->dev, "audiosrv: set format: %d\n", ret);
+			} else if (le32_to_cpup((__le32 *)(reply + 0x20)) == 1) {
+				/* DCP echoes the format, with its speaker allocation */
+				memcpy(&fmt, reply + 0x20, sizeof(fmt));
+			}
+		}
+		av_link_stop(asrv);
+	}
+
+	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
+			       NULL, 0, 16);
+	if (!ret && !service->torndown)
+		ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
+				       NULL, 0, 32);
+	if (service->torndown) {
+		/* the service is announced afresh and opened from there */
+		service->enabled = false;
+		return -EAGAIN;
+	}
+
+	guard(mutex)(&asrv->plug_lock);
+	if (ret) {
+		dev_err(dcp->dev, "audiosrv: reopen for the new format: %d\n", ret);
+		asrv->is_open = false;
+		if (asrv->audio_dev)
+			dcpaud_disconnect(asrv->audio_dev);
+		return ret;
+	}
+	if (asrv->srv != service || !av_link_route_live(asrv))
+		return -ENODEV;
+
+	guard(rwsem_write)(&asrv->srv_rwsem);
+	ret = afk_service_call(service, 0, asrv->cmds.prepare, &fmt, sizeof(fmt),
+			       64 - sizeof(fmt), NULL, 0, 64);
+	if (ret) {
+		dev_warn(dcp->dev, "audiosrv: link prepare: %d\n", ret);
+		return ret;
+	}
+	ret = afk_service_call(service, 0, asrv->cmds.start_link, &fmt,
+			       sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
+	if (ret) {
+		dev_warn(dcp->dev, "audiosrv: link start: %d\n", ret);
+		afk_service_call(service, 0, asrv->cmds.unprepare, &fmt,
+				 sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
+		return ret;
+	}
+	asrv->link_up = true;
+	asrv->link_fmt = fmt;
+	dev_info(dcp->dev,
+		 "audiosrv: link running: %u ch, %u bit, %u Hz, alloc 0x%02x (hack_audio_link_persistent)\n",
+		 le32_to_cpu(fmt.channels), le32_to_cpu(fmt.bits),
+		 le32_to_cpu(fmt.rate), le32_to_cpu(fmt.speaker_alloc));
+	return 0;
+}
+
 static void av_link_work(struct work_struct *work)
 {
 	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data, link_wq);
 
-	struct apple_dcp *dcp = asrv->dcp;
-
-	guard(mutex)(&asrv->plug_lock);
-	/* only on a live route: the switch may have released it meanwhile */
-	if (hack_audio_link_persistent && asrv->is_open && !asrv->link_up &&
-	    dcp->valid_mode && !dcp->during_modeset && dcp->dptxport[0].connected)
-		av_link_start(asrv);
+	guard(mutex)(&asrv->link_lock);
+	if (hack_audio_link_persistent && !asrv->link_up)
+		av_link_configure(asrv);
 }
 
 /* the display has a mode now: the persistent link may start */
@@ -508,6 +568,7 @@ void av_service_connect(struct apple_dcp *dcp)
 
 	/* open AV audio service */
 	dev_info(dcp->dev, "%s: starting audio service, plugged:%d\n", __func__,  asrv->plugged);
+	guard(mutex)(&asrv->link_lock);
 	if (asrv->is_open)
 		return;
 
@@ -537,6 +598,7 @@ void av_service_disconnect(struct apple_dcp *dcp)
 
 	/* no link start for the route that is going away */
 	cancel_work_sync(&asrv->link_wq);
+	guard(mutex)(&asrv->link_lock);
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
 		if (!asrv->srv) {
@@ -618,6 +680,8 @@ int avep_init(struct apple_dcp *dcp)
 		return -ENOMEM;
 	init_rwsem(&audiosrv_data->srv_rwsem);
 	mutex_init(&audiosrv_data->plug_lock);
+	mutex_init(&audiosrv_data->link_lock);
+	audiosrv_data->want_fmt = av_link_format;
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:

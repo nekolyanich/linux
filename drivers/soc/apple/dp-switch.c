@@ -9,6 +9,7 @@
 #include <linux/bitmap.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/notifier.h>
 #include <linux/soc/apple/dp-switch.h>
 #include <linux/spinlock.h>
 
@@ -18,6 +19,7 @@
 static DEFINE_SPINLOCK(dp_switch_lock);
 static DECLARE_BITMAP(dp_switch_hpd, DP_SWITCH_DFPS);
 static apple_dp_switch_handler_t dp_switch_handler;
+static BLOCKING_NOTIFIER_HEAD(dp_switch_dcp_free_chain);
 
 static unsigned int dfp_index(u32 die, u32 atc, u32 port)
 {
@@ -77,3 +79,21 @@ void apple_dp_switch_unregister(void)
 	spin_unlock_irqrestore(&dp_switch_lock, flags);
 }
 EXPORT_SYMBOL_GPL(apple_dp_switch_unregister);
+
+void apple_dp_switch_dcp_free(void)
+{
+	blocking_notifier_call_chain(&dp_switch_dcp_free_chain, 0, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_dp_switch_dcp_free);
+
+int apple_dp_switch_register_dcp_free(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&dp_switch_dcp_free_chain, nb);
+}
+EXPORT_SYMBOL_GPL(apple_dp_switch_register_dcp_free);
+
+void apple_dp_switch_unregister_dcp_free(struct notifier_block *nb)
+{
+	blocking_notifier_chain_unregister(&dp_switch_dcp_free_chain, nb);
+}
+EXPORT_SYMBOL_GPL(apple_dp_switch_unregister_dcp_free);

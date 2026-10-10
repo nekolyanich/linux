@@ -3,6 +3,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/completion.h>
+#include <linux/moduleparam.h>
 #include <linux/mux/apple-display-crossbar.h>
 #include <linux/phy/apple-atc.h>
 #include <linux/phy/phy.h>
@@ -161,6 +162,12 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 		return -EINVAL;
 	return 0;
 }
+
+/* HACK for a bench experiment: tell DCP a tunnelled DP IN has no AP HPD */
+static bool hack_tunnel_no_hpd_support;
+module_param(hack_tunnel_no_hpd_support, bool, 0644);
+MODULE_PARM_DESC(hack_tunnel_no_hpd_support,
+		 "HACK: answer HPD support = 0 for a tunnelled DP IN");
 
 static int
 dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
@@ -503,7 +510,8 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 	 * dp2hdmi HPD comes from a GPIO on the AP side. For a DP IN tunnelled
 	 * over USB4 macOS answers 1.
 	 */
-	reply->supported = cpu_to_le32(service->ep->dcp->dptx_tunneled ? 1 : 0);
+	reply->supported = cpu_to_le32(service->ep->dcp->dptx_tunneled &&
+				       !hack_tunnel_no_hpd_support ? 1 : 0);
 	return 0;
 }
 

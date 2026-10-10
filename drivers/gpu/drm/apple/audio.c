@@ -614,7 +614,8 @@ static int dcpaud_create_jack(struct dcp_audio *dcpaud)
 {
 	struct snd_card *card = dcpaud->card;
 
-	return snd_jack_new(card, "HDMI/DP", SND_JACK_AVOUT,
+	/* "HDMI/DP,pcm=N", the name alsa-ucm and PipeWire look for */
+	return snd_jack_new(card, "HDMI/DP,pcm=0", SND_JACK_AVOUT,
 			    &dcpaud->jack, true, false);
 }
 

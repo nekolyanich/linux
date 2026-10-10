@@ -665,6 +665,7 @@ struct apple_atcphy {
 	/* DP IN adapters (BIT(dpin)) whose pixel clock runs, and their rates */
 	u8 tunnel_users;
 	u8 tunnel_dpin_rate[2];
+	u8 tunnel_slept;
 	bool pipehandler_up;
 
 	struct {
@@ -2012,6 +2013,7 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 
 	lockdep_assert_held(&atcphy->lock);
 	atcphy->tunnel_users = 0;
+	atcphy->tunnel_slept = 0;
 	atcphy->tunnel_dpin_rate[0] = 0;
 	atcphy->tunnel_dpin_rate[1] = 0;
 	if (!atcphy->tunnel_saved)
@@ -2182,6 +2184,11 @@ static int atc_tunnel_set(struct apple_atcphy *atcphy, unsigned int dpin, u8 rat
 	selector = atc_tunnel_rate_selector(rate);
 	if (selector < 0)
 		return selector;
+	/* the first SetLinkRate after system sleep: cycle it as DPMS off/on does */
+	if (atcphy->tunnel_slept & BIT(dpin)) {
+		atcphy->tunnel_slept &= ~BIT(dpin);
+		atc_tunnel_stop(atcphy, dpin);
+	}
 	if (atcphy->tunnel_dpin_rate[dpin] == rate)
 		return 0;
 	if (!atcphy->tunnel_users) {
@@ -2850,10 +2857,31 @@ static const struct of_device_id atcphy_match[] = {
 };
 MODULE_DEVICE_TABLE(of, atcphy_match);
 
+/*
+ * A DP tunnel's pixel clock does not come back from system sleep by itself,
+ * but its rate stays cached, so the SetLinkRate that DCP sends on resume found
+ * it "running" and left the sink dark until a DPMS cycle. Note which ones ran
+ * and let that SetLinkRate cycle them. Touching the PLL here instead made DCP
+ * skip the link training on resume altogether.
+ */
+static int atcphy_suspend_late(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+
+	guard(mutex)(&atcphy->lock);
+	atcphy->tunnel_slept = atcphy->tunnel_users;
+	return 0;
+}
+
+static const struct dev_pm_ops atcphy_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(atcphy_suspend_late, NULL)
+};
+
 static struct platform_driver atcphy_driver = {
 	.driver = {
 		.name = "phy-apple-atc",
 		.of_match_table = atcphy_match,
+		.pm = pm_sleep_ptr(&atcphy_pm_ops),
 	},
 	.probe = atcphy_probe,
 };

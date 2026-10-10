@@ -58,6 +58,13 @@ struct dcp_audio {
 	struct snd_pcm_chmap *chmap_info;
 };
 
+/*
+ * SIO takes one descriptor per period from a pool of 64 that all its channels
+ * share, so a stream with many small periods fails to start with -ENOMEM.
+ * Leave room for both DCPs' streams at once.
+ */
+#define DCPAUD_MAX_PERIODS	16
+
 static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.info	 = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		   SNDRV_PCM_INFO_INTERLEAVED,
@@ -72,7 +79,7 @@ static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.period_bytes_min	= 4096, /* TODO */
 	.period_bytes_max	= SIZE_MAX,
 	.periods_min		= 2,
-	.periods_max		= UINT_MAX,
+	.periods_max		= DCPAUD_MAX_PERIODS,
 };
 
 static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
@@ -280,7 +287,7 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			  SNDRV_PCM_INFO_INTERLEAVED;
 	hw.periods_min = 2;
-	hw.periods_max = UINT_MAX;
+	hw.periods_max = DCPAUD_MAX_PERIODS;
 	hw.period_bytes_min = 256;
 	hw.period_bytes_max = SIZE_MAX; // TODO dma_get_max_seg_size(dma_dev);
 	hw.buffer_bytes_max = SIZE_MAX;

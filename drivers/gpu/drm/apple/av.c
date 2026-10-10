@@ -241,9 +241,12 @@ static void av_link_work(struct work_struct *work)
 {
 	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data, link_wq);
 
+	struct apple_dcp *dcp = asrv->dcp;
+
 	guard(mutex)(&asrv->plug_lock);
+	/* only on a live route: the switch may have released it meanwhile */
 	if (hack_audio_link_persistent && asrv->is_open && !asrv->link_up &&
-	    asrv->dcp->valid_mode)
+	    dcp->valid_mode && !dcp->during_modeset && dcp->dptxport[0].connected)
 		av_link_start(asrv);
 }
 
@@ -510,16 +513,23 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
+	/* no link start for the route that is going away */
+	cancel_work_sync(&asrv->link_wq);
+
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
-		if (!asrv->srv)
+		if (!asrv->srv) {
+			asrv->link_up = false;
 			return;
+		}
 		service = asrv->srv;
 	}
 
 	/* close AV audio service */
 	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
-	if (!asrv->is_open)
+	if (!asrv->is_open) {
+		asrv->link_up = false;
 		return;
+	}
 
 	mutex_lock(&asrv->plug_lock);
 

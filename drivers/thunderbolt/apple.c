@@ -240,6 +240,8 @@ struct apple_nhi {
 	} dpin[2];
 	int dp_switch_atc;
 	u32 dp_switch_die;
+	/* a DCP became free: offer DP IN adapters that gave up waiting */
+	struct notifier_block dcp_free_nb;
 };
 
 #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
@@ -582,6 +584,15 @@ static const struct tb_nhi_ops apple_nhi_ops = {
 	.dp_in_enable = apple_nhi_dp_in_enable,
 };
 
+static int apple_nhi_dcp_free(struct notifier_block *nb, unsigned long action,
+			      void *data)
+{
+	struct apple_nhi *anhi = container_of(nb, struct apple_nhi, dcp_free_nb);
+
+	tb_reoffer_dp_in(anhi->tb);
+	return NOTIFY_OK;
+}
+
 static int apple_nhi_probe(struct platform_device *pdev)
 {
 	struct apple_cio *acio = dev_get_drvdata(pdev->dev.parent);
@@ -704,6 +715,11 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	mutex_unlock(&anhi->tb->lock);
 
+	if (anhi->dp_switch_atc >= 0) {
+		anhi->dcp_free_nb.notifier_call = apple_nhi_dcp_free;
+		apple_dp_switch_register_dcp_free(&anhi->dcp_free_nb);
+	}
+
 	acio->nhi_boot_status = 0;
 	complete(&acio->nhi_boot_completion);
 	return 0;
@@ -723,6 +739,8 @@ static void apple_nhi_remove(struct platform_device *pdev)
 {
 	struct apple_nhi *anhi = platform_get_drvdata(pdev);
 
+	if (anhi->dcp_free_nb.notifier_call)
+		apple_dp_switch_unregister_dcp_free(&anhi->dcp_free_nb);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);
 

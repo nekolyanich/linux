@@ -30,6 +30,7 @@ static struct {
 	struct mutex lock;
 	struct dp_switch_dfp dfp[DP_SWITCH_DFPS];
 	struct apple_dcp *ufp[DP_SWITCH_UFPS];
+	bool kicked;
 } dp_switch = {
 	.lock = __MUTEX_INITIALIZER(dp_switch.lock),
 };
@@ -84,6 +85,7 @@ static struct apple_dcp *ufp_pick(bool tunnel)
 
 static void dp_switch_work(struct work_struct *work)
 {
+	bool freed = xchg(&dp_switch.kicked, false);
 	u32 die, atc, port;
 	int i;
 
@@ -100,6 +102,7 @@ static void dp_switch_work(struct work_struct *work)
 			 atc, dp_switch_port_names[port]);
 		dcp_switch_disconnect(dfp->dcp);
 		dfp->dcp = NULL;
+		freed = true;
 	}
 
 	for (i = 0; i < DP_SWITCH_DFPS; i++) {
@@ -127,7 +130,12 @@ static void dp_switch_work(struct work_struct *work)
 		}
 	}
 
+	/* a DCP is still free: offer it to sinks that stopped waiting for one */
+	freed = freed && ufp_pick(true);
 	mutex_unlock(&dp_switch.lock);
+
+	if (freed)
+		apple_dp_switch_dcp_free();
 }
 
 /*
@@ -187,9 +195,10 @@ static void dp_switch_event(u32 die, u32 atc, u32 port, bool connected)
 	schedule_work(&dp_switch_work_item);
 }
 
-/* a DCP whose DPTX endpoint just came up may take a waiting sink */
+/* a DCP just became available (DPTX endpoint up, HDMI unplugged) */
 void dp_switch_kick(void)
 {
+	WRITE_ONCE(dp_switch.kicked, true);
 	schedule_work(&dp_switch_work_item);
 }
 

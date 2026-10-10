@@ -661,6 +661,9 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 
 	if (connected && !dcp->switch_active)
 		dcp_dptx_connect(dcp, 0);
+	else if (!connected && !dcp->switch_active)
+		/* the HDMI port let go of this DCP: the switch may use it */
+		dp_switch_kick();
 
 	return IRQ_HANDLED;
 }

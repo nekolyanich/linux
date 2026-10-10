@@ -305,17 +305,6 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		return ret;
 	substream->runtime->hw = hw;
 
-	/* hack_audio_link_persistent: the link runs at 48 kHz, 2 channels, 24 bit */
-	if (dcp_audiosrv_link_persistent()) {
-		struct snd_pcm_runtime *rt = substream->runtime;
-
-		snd_pcm_hw_constraint_single(rt, SNDRV_PCM_HW_PARAM_RATE, 48000);
-		snd_pcm_hw_constraint_single(rt, SNDRV_PCM_HW_PARAM_CHANNELS, 2);
-		snd_pcm_hw_constraint_mask64(rt, SNDRV_PCM_HW_PARAM_FORMAT,
-					     SNDRV_PCM_FMTBIT_S24_LE |
-					     SNDRV_PCM_FMTBIT_S32_LE);
-	}
-
 	return snd_dmaengine_pcm_open(substream, dcpaud->chan);
 }
 
@@ -353,6 +342,20 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 		return ret;
 	if (!ret)
 		return -EINVAL;
+
+	/*
+	 * hack_audio_link_persistent: the link carries the sink's format the
+	 * rules above allow, so restart it with this one if it differs. DCP
+	 * takes at most 24 bit samples (16/20/24 offered by macOS).
+	 */
+	if (dcp_audiosrv_link_persistent()) {
+		ret = dcp_audiosrv_link_set_format(dcpaud->dcp_dev,
+				params_channels(params),
+				min(params_width(params), 24),
+				params_rate(params));
+		if (ret < 0)
+			return ret;
+	}
 
 	memset(&slave_config, 0, sizeof(slave_config));
 	ret = snd_hwparams_to_dma_slave_config(substream, params, &slave_config);

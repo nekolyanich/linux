@@ -186,7 +186,7 @@ static bool av_skip_link(struct apple_dcp *dcp, const char *what)
 static bool hack_audio_link_persistent;
 module_param(hack_audio_link_persistent, bool, 0644);
 MODULE_PARM_DESC(hack_audio_link_persistent,
-		 "HACK: start the audio link after the modeset and keep it running (48 kHz, 2 ch, 24 bit)");
+		 "HACK: start the audio link after the modeset and keep it running, in the PCM's format");
 
 /* the format macOS 13 passes: LPCM, 2 channels, 24 bit, 48 kHz */
 static const struct dcp_av_audio_fmt av_link_format = {

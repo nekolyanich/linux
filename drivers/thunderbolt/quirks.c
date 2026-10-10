@@ -62,6 +62,13 @@ static void quirk_apple_t6020_host(struct tb_switch *sw)
 	 * enters the tunnel.
 	 */
 	sw->quirks |= QUIRK_DP_IN_NFC_BUFFERS;
+	/*
+	 * DCP trains its tunnels at HBR2, as macOS does, but without
+	 * bandwidth allocation mode the tunnel is accounted at the common
+	 * maximum (HBR3 with most sinks), which starves a second display on
+	 * the same link. Offer HBR2 only.
+	 */
+	sw->quirks |= QUIRK_DP_IN_MAX_HBR2;
 }
 
 static void quirk_block_rpm_in_redrive(struct tb_switch *sw)

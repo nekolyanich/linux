@@ -866,6 +866,11 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 	 */
 	out_rate = tb_dp_cap_get_rate(out_dp_cap);
 	out_lanes = tb_dp_cap_get_lanes(out_dp_cap);
+	if ((in->sw->quirks & QUIRK_DP_IN_MAX_HBR2) && out_rate > 5400) {
+		out_rate = 5400;
+		out_dp_cap = tb_dp_cap_set_rate(out_dp_cap, out_rate);
+		tb_tunnel_dbg(tunnel, "DP IN limited to HBR2\n");
+	}
 	bw = tb_dp_bandwidth(out_rate, out_lanes);
 	tb_tunnel_dbg(tunnel,
 		      "DP OUT maximum supported bandwidth %u Mb/s x%u = %u Mb/s\n",

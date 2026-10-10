@@ -264,6 +264,43 @@ static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
 	.mode_fixup		= dcp_crtc_mode_fixup,
 };
 
+/*
+ * The display switch routes a DCP with a fixed HDMI port to Type-C ports as
+ * well; give those sinks a DisplayPort connector of their own on the same
+ * CRTC, so the HDMI-A connector names the HDMI port only. At most one of the
+ * two is ever connected.
+ */
+static int apple_probe_switch_connector(struct drm_device *drm,
+					struct platform_device *dcp,
+					struct apple_encoder *enc)
+{
+	struct apple_connector *connector;
+	int ret;
+
+	connector = kzalloc(sizeof(*connector), GFP_KERNEL);
+	if (!connector)
+		return -ENOMEM;
+	mutex_init(&connector->chunk_lock);
+	drm_connector_helper_add(&connector->base,
+				 &apple_connector_helper_funcs);
+
+	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
+				 DRM_MODE_CONNECTOR_DisplayPort);
+	if (ret) {
+		kfree(connector);
+		return ret;
+	}
+
+	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
+	connector->connected = false;
+	connector->dcp = dcp;
+	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
+
+	dcp_link_switch_connector(dcp, connector);
+
+	return drm_connector_attach_encoder(&connector->base, &enc->base);
+}
+
 static int apple_probe_per_dcp(struct device *dev,
 			       struct drm_device *drm,
 			       struct platform_device *dcp,
@@ -338,7 +375,14 @@ static int apple_probe_per_dcp(struct device *dev,
 	crtc->dcp = dcp;
 	dcp_link(dcp, crtc, connector);
 
-	return drm_connector_attach_encoder(&connector->base, &enc->base);
+	ret = drm_connector_attach_encoder(&connector->base, &enc->base);
+	if (ret)
+		return ret;
+
+	if (dcp_wants_switch_connector(dcp))
+		return apple_probe_switch_connector(drm, dcp, enc);
+
+	return 0;
 }
 
 static int apple_get_fb_resource(struct device *dev, const char *name,

@@ -563,6 +563,13 @@ int dcp_switch_connect(struct apple_dcp *dcp, u32 die, u32 atc, u32 port)
 		dcp->phy = phy;
 	dcp->xbar = xbar;
 
+	/* a Type-C sink is DisplayPort, not the fixed port's HDMI */
+	if (dcp->connector_switch) {
+		if (dcp->connector_fixed->connected)
+			disconnected_hpd_event(dcp->connector_fixed);
+		dcp->connector = dcp->connector_switch;
+	}
+
 	return dcp_dptx_connect(dcp, 0);
 }
 
@@ -597,6 +604,8 @@ void dcp_switch_disconnect(struct apple_dcp *dcp)
 	dcp->dptx_core = dcp->fixed.dptx_core;
 	dcp->dptx_die = dcp->fixed.dptx_die;
 	dcp->switch_active = false;
+	if (dcp->connector_switch)
+		dcp->connector = dcp->connector_fixed;
 
 	/*
 	 * The dispext side of a crossbar route (its FIFO write enables) is
@@ -675,6 +684,26 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
 
 	dcp->crtc = crtc;
 	dcp->connector = connector;
+}
+
+/* a switch member whose own connector is typed for its fixed HDMI port */
+bool dcp_wants_switch_connector(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->dp_switch && dcp->connector_type == DRM_MODE_CONNECTOR_HDMIA;
+}
+
+void dcp_link_switch_connector(struct platform_device *pdev,
+			       struct apple_connector *connector)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	dcp->connector_fixed = dcp->connector;
+	dcp->connector_switch = connector;
+	/* the switch may have routed a sink before the connectors existed */
+	if (dcp->switch_active)
+		dcp->connector = connector;
 }
 
 

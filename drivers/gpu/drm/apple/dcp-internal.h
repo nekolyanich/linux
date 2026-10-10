@@ -121,6 +121,13 @@ struct apple_dcp {
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
+	/*
+	 * A DCP with a fixed HDMI port that the display switch may also route
+	 * to a Type-C port gets a DisplayPort connector for those routes;
+	 * connector points at whichever of the two is in use.
+	 */
+	struct apple_connector *connector_fixed;
+	struct apple_connector *connector_switch;
 
 	struct apple_dcp_hw_data hw;
 

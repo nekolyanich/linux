@@ -14,6 +14,7 @@
 #include <linux/component.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
+#include <linux/of.h>
 #include <linux/of_dma.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
@@ -521,10 +522,16 @@ static int dcpaud_create_jack(struct dcp_audio *dcpaud)
 static void dcpaud_set_card_names(struct dcp_audio *dcpaud)
 {
 	struct snd_card *card = dcpaud->card;
+	int id = of_alias_get_id(dcpaud->dcp_dev->of_node, "dcpext");
 
 	strscpy(card->driver, "apple_dcp", sizeof(card->driver));
-	strscpy(card->longname, "Apple DisplayPort", sizeof(card->longname));
 	strscpy(card->shortname, "Apple DisplayPort", sizeof(card->shortname));
+	/* one card per DCP: tell them apart by the DCP that drives the sink */
+	if (id >= 0)
+		snprintf(card->longname, sizeof(card->longname),
+			 "Apple DisplayPort (dcpext%d)", id);
+	else
+		strscpy(card->longname, "Apple DisplayPort", sizeof(card->longname));
 }
 
 #ifdef CONFIG_SND_DEBUG

@@ -5,6 +5,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/kconfig.h>
+#include <linux/moduleparam.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/rwsem.h>
@@ -136,11 +137,28 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 	}
 }
 
+/* HACK for a bench experiment: on a tunnelled DP IN, open the audio service only */
+static bool hack_tunnel_skip_audio_link;
+module_param(hack_tunnel_skip_audio_link, bool, 0644);
+MODULE_PARM_DESC(hack_tunnel_skip_audio_link,
+		 "HACK: skip audio prepare/start/stop/unprepare on a tunnelled DP IN");
+
+static bool av_skip_link(struct apple_dcp *dcp, const char *what)
+{
+	if (!hack_tunnel_skip_audio_link || !dcp->dptx_tunneled)
+		return false;
+	dev_info(dcp->dev, "audiosrv: %s skipped (hack_tunnel_skip_audio_link)\n", what);
+	return true;
+}
+
 int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
+
+	if (av_skip_link(dcp, "prepare"))
+		return 0;
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
@@ -162,6 +180,9 @@ int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
+	if (av_skip_link(dcp, "start_link"))
+		return 0;
+
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
 		/* the firmware tore the service down (display gone, AV restart) */
@@ -182,6 +203,9 @@ int dcp_audiosrv_stoplink(struct device *dev)
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
+	if (av_skip_link(dcp, "stop_link"))
+		return 0;
+
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
 		/* the firmware tore the service down (display gone, AV restart) */
@@ -200,6 +224,9 @@ int dcp_audiosrv_unprepare(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
+
+	if (av_skip_link(dcp, "unprepare"))
+		return 0;
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {

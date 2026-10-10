@@ -625,13 +625,19 @@ static void dcpaud_set_card_names(struct dcp_audio *dcpaud)
 	int id = of_alias_get_id(dcpaud->dcp_dev->of_node, "dcpext");
 
 	strscpy(card->driver, "apple_dcp", sizeof(card->driver));
-	strscpy(card->shortname, "Apple DisplayPort", sizeof(card->shortname));
-	/* one card per DCP: tell them apart by the DCP that drives the sink */
-	if (id >= 0)
+	/*
+	 * One card per DCP, and the display switch moves sinks between them: name
+	 * each after its DCP, in the short name too, which is what sound servers
+	 * show next to the output.
+	 */
+	if (id >= 0) {
+		snprintf(card->shortname, sizeof(card->shortname), "Apple dcpext%d", id);
 		snprintf(card->longname, sizeof(card->longname),
 			 "Apple DisplayPort (dcpext%d)", id);
-	else
+	} else {
+		strscpy(card->shortname, "Apple DisplayPort", sizeof(card->shortname));
 		strscpy(card->longname, "Apple DisplayPort", sizeof(card->longname));
+	}
 }
 
 #ifdef CONFIG_SND_DEBUG

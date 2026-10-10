@@ -123,6 +123,17 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 		dcpaud_disconnect(asrv->audio_dev);
 
 	mutex_unlock(&asrv->plug_lock);
+
+	/*
+	 * Torn down by the firmware on its own (it restarted its AV interfaces),
+	 * not as a side effect of our close, which still waits for its reply
+	 * and disables the service itself: disable it here so its AFK slot can
+	 * be reused.
+	 */
+	scoped_guard(spinlock_irqsave, &service->lock) {
+		if (bitmap_empty(service->cmd_map, MAX_PENDING_CMDS))
+			service->enabled = false;
+	}
 }
 
 int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)

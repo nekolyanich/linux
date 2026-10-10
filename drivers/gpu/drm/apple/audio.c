@@ -389,20 +389,6 @@ static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
 
-	/*
-	 * hack_audio_link_persistent: the link carries the stream's channels
-	 * and rate. Restart it here, when playback is about to start, not in
-	 * hw_params, which a format probe calls too.
-	 */
-	if (dcp_audiosrv_link_persistent()) {
-		struct snd_pcm_runtime *rt = substream->runtime;
-		int ret = dcp_audiosrv_link_set_format(dcpaud->dcp_dev,
-						       rt->channels, 24,
-						       rt->rate);
-		if (ret < 0)
-			return ret;
-	}
-
 	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
 				    &dcpaud->selected_cookie);
 }
@@ -419,6 +405,24 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			return -ENXIO;
 
 		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+		/*
+		 * hack_audio_link_persistent: the link carries the stream's
+		 * channels and rate. Restart it only here, when playback
+		 * starts: alsa-lib's hw_params also prepares, so format probes
+		 * reach prepare. A link DCP refuses must not fail the PCM:
+		 * playback then stalls instead.
+		 */
+		if (dcp_audiosrv_link_persistent()) {
+			struct snd_pcm_runtime *rt = substream->runtime;
+
+			ret = dcp_audiosrv_link_set_format(dcpaud->dcp_dev,
+							   rt->channels, 24,
+							   rt->rate);
+			if (ret < 0)
+				dev_warn(dcpaud->dev,
+					 "audio link for %u ch %u Hz: %d\n",
+					 rt->channels, rt->rate, ret);
+		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
 		if (ret < 0)

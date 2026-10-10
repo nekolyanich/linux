@@ -457,12 +457,13 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 
 	if (av_skip_link(dcp, "prepare"))
 		return 0;
-	/* the persistent link is not the PCM's to start or stop */
-	if (hack_audio_link_persistent) {
-		if (!asrv->link_up)
-			schedule_work(&asrv->link_wq);
+	/*
+	 * The persistent link is not the PCM's to start or stop; trigger
+	 * START restarts it if needed. Not from here: format probes prepare
+	 * too, and a start DCP refuses drops the sink's HPD 5 s later.
+	 */
+	if (hack_audio_link_persistent)
 		return 0;
-	}
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {

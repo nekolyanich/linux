@@ -28,6 +28,8 @@
 #define QUIRK_KEEP_POWER_IN_DP_REDRIVE			BIT(2)
 /* DP IN adapters need non-flow-controlled buffers for the DP video path */
 #define QUIRK_DP_IN_NFC_BUFFERS				BIT(3)
+/* DP tunnels from this router's DP IN adapters run at HBR2 at most */
+#define QUIRK_DP_IN_MAX_HBR2				BIT(4)
 /* NFC buffers macOS gives an Apple host router DP IN adapter (ADP_CS_4) */
 #define APPLE_DP_IN_NFC_BUFFERS				5
 

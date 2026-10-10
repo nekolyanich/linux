@@ -23,6 +23,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
@@ -1273,6 +1274,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			jiffies_to_msecs(ret));
 	}
 	dcp->valid_mode = true;
+	av_modeset_done(dcp);
 
 	return 0;
 }

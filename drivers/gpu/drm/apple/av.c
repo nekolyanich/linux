@@ -26,6 +26,7 @@ struct dcp_av_audio_cmds {
 	u32 start_link;
 	u32 stop_link;
 	u32 unprepare;
+	u32 set_format;	/* 0: not known for this firmware */
 	/* commands in group 1*/
 	u32 get_elements;
 	u32 get_product_attrs;
@@ -49,6 +50,7 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.start_link = 7,
 	.stop_link = 10,
 	.unprepare = 11,
+	.set_format = 20,
 	.get_elements = 16,
 	.get_product_attrs = 18,
 };
@@ -68,6 +70,11 @@ struct audiosrv_data {
 	bool warned_get_elements;
 	bool warned_get_product_attrs;
 	bool is_open;
+
+	/* hack_audio_link_persistent: the link runs from the first modeset on */
+	struct apple_dcp *dcp;
+	struct work_struct link_wq;
+	bool link_up;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -120,6 +127,7 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 	up_write(&asrv->srv_rwsem);
 
 	asrv->plugged = false;
+	asrv->link_up = false;
 	if (asrv->audio_dev)
 		dcpaud_disconnect(asrv->audio_dev);
 
@@ -151,6 +159,99 @@ static bool av_skip_link(struct apple_dcp *dcp, const char *what)
 	return true;
 }
 
+/*
+ * HACK for a bench experiment, as macOS 13 does it: set the format and start
+ * the audio link once the display has its mode, keep it running, and let
+ * playback only move DMA. PCM prepare/start/stop then send nothing to DCP.
+ */
+static bool hack_audio_link_persistent;
+module_param(hack_audio_link_persistent, bool, 0644);
+MODULE_PARM_DESC(hack_audio_link_persistent,
+		 "HACK: start the audio link after the modeset and keep it running (48 kHz, 2 ch, 24 bit)");
+
+/* the format macOS 13 passes: LPCM, 2 channels, 24 bit, 48 kHz */
+static const u8 av_link_format[24] = {
+	0x01, 0, 0, 0, 0x02, 0, 0, 0, 0x18, 0, 0, 0, 0x80, 0xbb, 0, 0,
+};
+
+bool dcp_audiosrv_link_persistent(void)
+{
+	return hack_audio_link_persistent;
+}
+
+/* with asrv->plug_lock held */
+static int av_link_start(struct audiosrv_data *asrv)
+{
+	struct apple_dcp *dcp = asrv->dcp;
+	u8 fmt[64] = {};
+	int ret = -ENODEV;
+
+	memcpy(fmt + 0x20, av_link_format, sizeof(av_link_format));
+
+	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv)
+		goto out;
+	if (asrv->cmds.set_format) {
+		ret = afk_service_call(asrv->srv, 0, asrv->cmds.set_format, fmt,
+				       sizeof(fmt), 0, NULL, 0, 64);
+		if (ret)
+			dev_warn(dcp->dev, "audiosrv: set format: %d\n", ret);
+	}
+	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, av_link_format,
+			       sizeof(av_link_format), 64 - sizeof(av_link_format),
+			       NULL, 0, 64);
+	if (ret) {
+		dev_warn(dcp->dev, "audiosrv: link prepare: %d\n", ret);
+		goto out;
+	}
+	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, av_link_format,
+			       sizeof(av_link_format), 64 - sizeof(av_link_format),
+			       NULL, 0, 64);
+	if (ret) {
+		dev_warn(dcp->dev, "audiosrv: link start: %d\n", ret);
+		goto out;
+	}
+	asrv->link_up = true;
+	dev_info(dcp->dev, "audiosrv: link running (hack_audio_link_persistent)\n");
+out:
+	up_write(&asrv->srv_rwsem);
+	return ret;
+}
+
+/* with asrv->plug_lock held */
+static void av_link_stop(struct audiosrv_data *asrv)
+{
+	if (!asrv->link_up)
+		return;
+	asrv->link_up = false;
+
+	down_write(&asrv->srv_rwsem);
+	if (asrv->srv) {
+		afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0, 64,
+				 NULL, 0, 64);
+		afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0, 64,
+				 NULL, 0, 64);
+	}
+	up_write(&asrv->srv_rwsem);
+}
+
+static void av_link_work(struct work_struct *work)
+{
+	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data, link_wq);
+
+	guard(mutex)(&asrv->plug_lock);
+	if (hack_audio_link_persistent && asrv->is_open && !asrv->link_up &&
+	    asrv->dcp->valid_mode)
+		av_link_start(asrv);
+}
+
+/* the display has a mode now: the persistent link may start */
+void av_modeset_done(struct apple_dcp *dcp)
+{
+	if (hack_audio_link_persistent && dcp->audiosrv)
+		schedule_work(&dcp->audiosrv->link_wq);
+}
+
 int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -159,6 +260,12 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 
 	if (av_skip_link(dcp, "prepare"))
 		return 0;
+	/* the persistent link is not the PCM's to start or stop */
+	if (hack_audio_link_persistent) {
+		if (!asrv->link_up)
+			schedule_work(&asrv->link_wq);
+		return 0;
+	}
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
@@ -182,6 +289,10 @@ int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
 
 	if (av_skip_link(dcp, "start_link"))
 		return 0;
+	/* the persistent link is not the PCM's to start or stop */
+	if (hack_audio_link_persistent) {
+		return 0;
+	}
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
@@ -205,6 +316,10 @@ int dcp_audiosrv_stoplink(struct device *dev)
 
 	if (av_skip_link(dcp, "stop_link"))
 		return 0;
+	/* the persistent link is not the PCM's to start or stop */
+	if (hack_audio_link_persistent) {
+		return 0;
+	}
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
@@ -227,6 +342,10 @@ int dcp_audiosrv_unprepare(struct device *dev)
 
 	if (av_skip_link(dcp, "unprepare"))
 		return 0;
+	/* the persistent link is not the PCM's to start or stop */
+	if (hack_audio_link_persistent) {
+		return 0;
+	}
 
 	down_write(&asrv->srv_rwsem);
 	if (!asrv->srv) {
@@ -377,6 +496,10 @@ void av_service_connect(struct apple_dcp *dcp)
 	if (asrv->audio_dev)
 		dcpaud_connect(asrv->audio_dev, asrv->plugged);
 	mutex_unlock(&asrv->plug_lock);
+
+	/* re-announced after the mode was set (an AV restart): start right away */
+	if (hack_audio_link_persistent && dcp->valid_mode)
+		schedule_work(&asrv->link_wq);
 }
 
 void av_service_disconnect(struct apple_dcp *dcp)
@@ -400,6 +523,8 @@ void av_service_disconnect(struct apple_dcp *dcp)
 
 	if (asrv->audio_dev)
 		dcpaud_disconnect(asrv->audio_dev);
+	/* as macOS: stop and unprepare a running link before the close */
+	av_link_stop(asrv);
 
 	mutex_unlock(&asrv->plug_lock);
 
@@ -473,7 +598,9 @@ int avep_init(struct apple_dcp *dcp)
 	}
 
 	dcp->audiosrv = audiosrv_data;
+	audiosrv_data->dcp = dcp;
 	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
+	INIT_WORK(&audiosrv_data->link_wq, av_link_work);
 
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {

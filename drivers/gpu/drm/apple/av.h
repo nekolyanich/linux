@@ -10,10 +10,12 @@
 void av_service_connect(struct apple_dcp *dcp);
 void av_service_disconnect(struct apple_dcp *dcp);
 void av_eld_changed(struct apple_dcp *dcp);
+void av_modeset_done(struct apple_dcp *dcp);
 #else
 static inline void av_service_connect(struct apple_dcp *dcp) { }
 static inline void av_service_disconnect(struct apple_dcp *dcp) { }
 static inline void av_eld_changed(struct apple_dcp *dcp) { }
+static inline void av_modeset_done(struct apple_dcp *dcp) { }
 #endif
 
 #endif /* __AV_H__ */

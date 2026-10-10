@@ -28,6 +28,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_eld.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -36,6 +37,7 @@
 #include <drm/drm_vblank.h>
 
 #include "afk.h"
+#include "audio.h"
 #include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
@@ -692,6 +694,31 @@ bool dcp_wants_switch_connector(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	return dcp->dp_switch && dcp->connector_type == DRM_MODE_CONNECTOR_HDMIA;
+}
+
+/*
+ * Copy the ELD of the connector the sink is on now (the display switch may
+ * have moved the DCP to its other connector) for the audio side. Returns the
+ * number of bytes, 0 without a sink or without audio in its EDID.
+ */
+int dcp_get_eld(struct device *dev, u8 *buf, size_t size)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct drm_connector *connector;
+	int len = 0;
+
+	if (!dcp->connector)
+		return 0;
+	connector = &dcp->connector->base;
+
+	mutex_lock(&connector->eld_mutex);
+	if (dcp->connector->connected && connector->eld[DRM_ELD_BASELINE_ELD_LEN]) {
+		len = min_t(size_t, drm_eld_size(connector->eld), size);
+		memcpy(buf, connector->eld, len);
+	}
+	mutex_unlock(&connector->eld_mutex);
+
+	return len;
 }
 
 /* which of a DCP's connectors the sink is on; the other one cannot be used */

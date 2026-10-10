@@ -246,6 +246,7 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
 	struct apple_dcp *dcp = asrv->dcp;
 	struct dcp_av_audio_fmt fmt = *pfmt;
 	u8 reply[64] = {};
+	u32 status;
 	int ret;
 
 	guard(rwsem_write)(&asrv->srv_rwsem);
@@ -259,6 +260,18 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
 		hack_audio_link_reopen);
 	print_hex_dump_debug("prepare: ", DUMP_PREFIX_OFFSET, 16, 4, reply,
 			     sizeof(reply), false);
+	/*
+	 * The reply carries an IOReturn at +0x30. On the TV behind the
+	 * USB-C to HDMI adapter DCP answers 0xe00002e2 (kIOReturnNotPermitted),
+	 * restarts its AV interfaces ("Capabilities changed") and drops HPD
+	 * 5 s later. Do not start a link DCP refused to prepare.
+	 */
+	status = le32_to_cpup((__le32 *)(reply + 0x30));
+	if (status) {
+		dev_warn(dcp->dev, "audiosrv: link prepare refused: 0x%08x\n",
+			 status);
+		return -EPERM;
+	}
 	ret = afk_service_call(service, 0, asrv->cmds.start_link, &fmt,
 			       sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
 	if (ret) {
@@ -608,9 +621,8 @@ static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 						  const void *data, size_t data_size)
 {
 	dev_dbg(service->ep->dcp->dev, "got audio report %d size %zx\n", idx, data_size);
-#ifdef DEBUG
-	print_hex_dump(KERN_DEBUG, "audio report: ", DUMP_PREFIX_NONE, 16, 1, data, data_size, true);
-#endif
+	print_hex_dump_debug("audio report: ", DUMP_PREFIX_OFFSET, 16, 4, data,
+			     data_size, false);
 
 	return 0;
 }

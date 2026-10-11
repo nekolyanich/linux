@@ -103,6 +103,9 @@ struct audiosrv_data {
 	wait_queue_head_t report_wq;
 	/* DCP asked to stop (0xe0115004) or start (0xe0115000) the link */
 	struct work_struct link_req_wq;
+	/* one more start after an unconfirmed one, if DCP stays quiet */
+	struct delayed_work link_recover_wq;
+	unsigned int recoveries;
 	bool req_stop, req_start;
 	/* a start on DCP's request ran since the last modeset completed */
 	bool req_started;
@@ -350,9 +353,19 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
 	 */
 	if (!wait_event_timeout(asrv->report_wq,
 				READ_ONCE(asrv->stream_confirmed),
-				msecs_to_jiffies(500)))
+				msecs_to_jiffies(500))) {
 		dev_warn(dcp->dev,
 			 "audiosrv: DCP did not confirm the audio stream (report 0xe0115001)\n");
+		/*
+		 * DCP may not ask again (natively the TV after a plug: 1 of
+		 * 4 connects). Start once more later, see av_link_recover().
+		 */
+		if (asrv->recoveries < 2)
+			mod_delayed_work(system_wq, &asrv->link_recover_wq,
+					 3 * HZ);
+	} else {
+		asrv->recoveries = 0;
+	}
 	asrv->link_up = true;
 	asrv->link_fmt = fmt;
 	dev_info(dcp->dev,
@@ -493,6 +506,34 @@ static void av_link_req_stop(struct audiosrv_data *asrv)
 	dev_info(asrv->dcp->dev, "audiosrv: link stopped on DCP's request\n");
 }
 
+/*
+ * A start that DCP did not confirm, with no request from DCP and no modeset
+ * for 3 s since: stop and close the link, then open, prepare and start it
+ * again, at most twice per connection. A restart on the open service from
+ * trigger START was refused 4 of 4 times; after a close DCP refuses with a
+ * short replug and asks again, and those requests mostly gave a confirmed
+ * stream natively.
+ */
+static void av_link_recover(struct work_struct *work)
+{
+	struct audiosrv_data *asrv = container_of(to_delayed_work(work),
+						  struct audiosrv_data,
+						  link_recover_wq);
+
+	if (!hack_audio_link_persistent)
+		return;
+
+	guard(mutex)(&asrv->link_lock);
+	if (!asrv->link_up || READ_ONCE(asrv->stream_confirmed) ||
+	    asrv->dcp->during_modeset)
+		return;
+	asrv->recoveries++;
+	dev_info(asrv->dcp->dev, "audiosrv: restarting an unconfirmed link (%u)\n",
+		 asrv->recoveries);
+	av_link_req_stop(asrv);
+	av_link_configure(asrv, false);
+}
+
 static void av_link_req_work(struct work_struct *work)
 {
 	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data,
@@ -504,6 +545,8 @@ static void av_link_req_work(struct work_struct *work)
 	guard(mutex)(&asrv->link_lock);
 	if (xchg(&asrv->req_stop, false))
 		av_link_req_stop(asrv);
+	if (READ_ONCE(asrv->req_stop) || READ_ONCE(asrv->req_start))
+		cancel_delayed_work(&asrv->link_recover_wq);
 	if (xchg(&asrv->req_start, false)) {
 		/* DCP asked to start the link (report 0xe0115000 at 1) */
 		asrv->req_started = true;
@@ -944,10 +987,12 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	/* no link start for the route that is going away */
 	cancel_work_sync(&asrv->link_wq);
 	cancel_work_sync(&asrv->link_req_wq);
+	cancel_delayed_work_sync(&asrv->link_recover_wq);
 	guard(mutex)(&asrv->link_lock);
 	/* the next sink starts with stereo, which the TV and the Dell both take */
 	asrv->want_fmt = av_link_format;
 	asrv->tries = 0;
+	asrv->recoveries = 0;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
 		if (!asrv->srv) {
@@ -1053,6 +1098,7 @@ int avep_init(struct apple_dcp *dcp)
 	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
 	INIT_WORK(&audiosrv_data->link_wq, av_link_work);
 	INIT_WORK(&audiosrv_data->link_req_wq, av_link_req_work);
+	INIT_DELAYED_WORK(&audiosrv_data->link_recover_wq, av_link_recover);
 
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {

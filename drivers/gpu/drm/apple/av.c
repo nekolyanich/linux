@@ -9,6 +9,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/rwsem.h>
+#include <linux/sizes.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -206,6 +207,21 @@ static const struct dcp_av_audio_fmt av_link_format = {
 	.rate = cpu_to_le32(48000),
 };
 
+static int
+dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
+			   u32 command, void *output, size_t output_maxsize,
+			   size_t *output_size);
+
+/*
+ * HACK: as macOS 13, read the sink's audio elements before set_format on
+ * every link (re)start. macOS does so after every plug; DCP may refuse a
+ * prepare until the client read the capabilities it changed.
+ */
+static bool hack_audio_link_elements = true;
+module_param(hack_audio_link_elements, bool, 0644);
+MODULE_PARM_DESC(hack_audio_link_elements,
+		 "HACK: read the audio elements before set_format on a link (re)start (default: on)");
+
 /* HACK for a bench A/B: skip the close/open between set_format and prepare */
 static bool hack_audio_link_reopen = true;
 module_param(hack_audio_link_reopen, bool, 0644);
@@ -356,6 +372,17 @@ static int av_link_configure(struct audiosrv_data *asrv)
 		if (!av_link_route_live(asrv))
 			return -ENODEV;
 		service = asrv->srv;
+
+		if (hack_audio_link_elements && asrv->cmds.get_elements) {
+			size_t size = 0;
+
+			scoped_guard(rwsem_write, &asrv->srv_rwsem)
+				ret = dcp_audiosrv_osobject_call(service, 1,
+						asrv->cmds.get_elements, NULL,
+						SZ_64K, &size);
+			dev_info(dcp->dev, "audiosrv: elements before the link: %d, %zu bytes\n",
+				 ret, size);
+		}
 
 		if (asrv->cmds.set_format) {
 			memcpy(req + 0x20, &fmt, sizeof(fmt));

@@ -28,6 +28,7 @@ struct dcp_av_audio_cmds {
 	u32 stop_link;
 	u32 unprepare;
 	u32 set_format;	/* 0: not known for this firmware */
+	u32 link_status; /* 0: not known for this firmware */
 	/* commands in group 1*/
 	u32 get_elements;
 	u32 get_product_attrs;
@@ -52,6 +53,7 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.stop_link = 10,
 	.unprepare = 11,
 	.set_format = 20,
+	.link_status = 13,
 	.get_elements = 16,
 	.get_product_attrs = 18,
 };
@@ -288,6 +290,23 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
 		afk_service_call(service, 0, asrv->cmds.unprepare, &fmt,
 				 sizeof(fmt), 64 - sizeof(fmt), NULL, 0, 64);
 		return ret;
+	}
+	/*
+	 * macOS 13 follows every start_link with (0,13), 64 bytes with 1 at
+	 * +0x20 (TV and Dell traces); we never sent it. Send it the same way
+	 * in case DCP confirms the stream only after it.
+	 */
+	if (asrv->cmds.link_status) {
+		u8 req[64] = {};
+
+		put_unaligned_le32(1, req + 0x20);
+		memset(reply, 0, sizeof(reply));
+		ret = afk_service_call(service, 0, asrv->cmds.link_status, req,
+				       sizeof(req), 0, reply, sizeof(reply), 0);
+		dev_info(dcp->dev, "audiosrv: link status: %d, 0x%08x\n", ret,
+			 get_unaligned_le32(reply + 0x20));
+		print_hex_dump_debug("link_status: ", DUMP_PREFIX_OFFSET, 16, 4,
+				     reply, sizeof(reply), false);
 	}
 	/*
 	 * On the Dell reports 0xe0115000 and 0xe0115001 both go to 0 around

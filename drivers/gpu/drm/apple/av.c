@@ -29,6 +29,7 @@ struct dcp_av_audio_cmds {
 	u32 unprepare;
 	u32 set_format;	/* 0: not known for this firmware */
 	u32 link_status; /* 0: not known for this firmware */
+	u32 set_mode;	/* 0: not known for this firmware */
 	/* commands in group 1*/
 	u32 get_elements;
 	u32 get_product_attrs;
@@ -54,6 +55,7 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.unprepare = 11,
 	.set_format = 20,
 	.link_status = 13,
+	.set_mode = 14,
 	.get_elements = 16,
 	.get_product_attrs = 18,
 };
@@ -356,6 +358,24 @@ static int av_link_configure(struct audiosrv_data *asrv)
 		if (!av_link_route_live(asrv))
 			return -ENODEV;
 		service = asrv->srv;
+
+		/*
+		 * macOS 13 sends (0,14) with 2 at +0x20 on every plug, before
+		 * the elements and set_format (TV and Dell traces); we never
+		 * did. Its meaning is not known.
+		 */
+		if (asrv->cmds.set_mode) {
+			u8 mreq[64] = {}, mreply[64] = {};
+
+			put_unaligned_le32(2, mreq + 0x20);
+			scoped_guard(rwsem_write, &asrv->srv_rwsem)
+				ret = afk_service_call(service, 0,
+						       asrv->cmds.set_mode,
+						       mreq, sizeof(mreq), 0,
+						       mreply, sizeof(mreply), 0);
+			dev_info(dcp->dev, "audiosrv: set mode 2: %d, 0x%08x\n",
+				 ret, get_unaligned_le32(mreply + 0x20));
+		}
 
 		if (asrv->cmds.set_format) {
 			memcpy(req + 0x20, &fmt, sizeof(fmt));

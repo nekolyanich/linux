@@ -415,6 +415,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	struct apple_epic_service *service;
 	unsigned long flags;
 	u8 idx = tag & 0xff;
+	bool short_reply;
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	size_t rxlen, txlen;
@@ -426,12 +427,16 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		return;
 	}
 
-	if (payload_size < sizeof(*cmd)) {
+	/*
+	 * Seen with the reply to a close that DCP sent after tearing the
+	 * service down. Still complete the command, with an error, so its
+	 * caller does not wait it out and its slot is freed.
+	 */
+	short_reply = payload_size < sizeof(*cmd);
+	if (short_reply)
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: command reply on channel %d too small: %ld\n",
 			ep->endpoint, channel, payload_size);
-		return;
-	}
 
 	if (idx >= MAX_PENDING_CMDS) {
 		dev_err(ep->dcp->dev,
@@ -458,7 +463,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	}
 
 	service->cmds[idx].done = true;
-	service->cmds[idx].retcode = le32_to_cpu(cmd->retcode);
+	service->cmds[idx].retcode = short_reply ? ~0U : le32_to_cpu(cmd->retcode);
 	if (service->cmds[idx].free_on_ack) {
 		/* defer freeing until we're no longer in atomic context */
 		rxbuf = service->cmds[idx].rxbuf;

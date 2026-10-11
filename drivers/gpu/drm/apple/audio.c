@@ -59,6 +59,9 @@ struct dcp_audio {
 
 	struct snd_pcm_chmap *chmap_info;
 
+	/* stops a running stream on a disconnect, outside the DCP's locks */
+	struct work_struct stop_work;
+
 	/* the sink's ELD as last announced through the "ELD" control */
 	struct snd_kcontrol *eld_ctl;
 	u8 eld[MAX_ELD_BYTES];
@@ -631,12 +634,24 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
 	dcpaud_update_eld(dcpaud);
 
-	if (!connected) {
-		snd_pcm_stream_lock(substream);
-		if (substream->runtime)
-			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
-		snd_pcm_stream_unlock(substream);
-	}
+	/*
+	 * The DCP reports a disconnect with its link_lock and plug_lock held,
+	 * and trigger START takes them under the stream lock to restart the
+	 * persistent link: stop the stream from a work item.
+	 */
+	if (!connected && substream)
+		schedule_work(&dcpaud->stop_work);
+}
+
+static void dcpaud_stop_work(struct work_struct *work)
+{
+	struct dcp_audio *dcpaud = container_of(work, struct dcp_audio, stop_work);
+	struct snd_pcm_substream *substream = dcpaud->substream;
+
+	snd_pcm_stream_lock(substream);
+	if (substream->runtime && !dcpaud_connection_up(dcpaud))
+		snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
+	snd_pcm_stream_unlock(substream);
 }
 
 static int dcpaud_create_jack(struct dcp_audio *dcpaud)
@@ -830,6 +845,7 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
 {
 	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
 
+	cancel_work_sync(&dcpaud->stop_work);
 	/* snd_card_free_when_closed() checks for NULL */
 	snd_card_free_when_closed(dcpaud->card);
 
@@ -862,6 +878,7 @@ static int dcpaud_probe(struct platform_device *pdev)
 
 	dcpaud->dev = &pdev->dev;
 	mutex_init(&dcpaud->data_lock);
+	INIT_WORK(&dcpaud->stop_work, dcpaud_stop_work);
 	platform_set_drvdata(pdev, dcpaud);
 
 	return component_add(&pdev->dev, &dcpaud_comp_ops);

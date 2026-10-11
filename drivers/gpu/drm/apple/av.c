@@ -910,33 +910,6 @@ void av_service_connect(struct apple_dcp *dcp)
 	if (asrv->is_open)
 		return;
 
-	/*
-	 * As macOS 13 on a plug, before the open: read the elements and set
-	 * the format, which the start inside the modeset then uses. DCP's
-	 * own pick for the TV was 6 channels.
-	 */
-	if (hack_audio_link_persistent) {
-		struct dcp_av_audio_fmt fmt = asrv->want_fmt;
-		u8 req[64] = {}, reply[64] = {};
-		size_t size = 0;
-
-		ret = 0;
-		scoped_guard(rwsem_write, &asrv->srv_rwsem) {
-			if (hack_audio_link_elements && asrv->cmds.get_elements)
-				ret = dcp_audiosrv_osobject_call(service, 1,
-						asrv->cmds.get_elements, NULL,
-						SZ_256K, &size);
-			memcpy(req + 0x20, &fmt, sizeof(fmt));
-			if (asrv->cmds.set_format)
-				ret = afk_service_call(service, 0,
-						       asrv->cmds.set_format,
-						       req, sizeof(req), 0,
-						       reply, sizeof(reply), 0);
-		}
-		dev_info(dcp->dev, "audiosrv: on plug: %zu bytes of elements, set format: %d\n",
-			 size, ret);
-	}
-
 	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
 			       NULL, 0, 32);
 	if (ret) {

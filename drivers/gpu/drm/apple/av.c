@@ -442,6 +442,16 @@ int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
 	return av_link_configure(asrv);
 }
 
+/* the link runs and DCP confirmed the audio stream (report 0xe0115001) */
+bool dcp_audiosrv_link_ready(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	guard(mutex)(&asrv->link_lock);
+	return asrv->link_up && READ_ONCE(asrv->stream_confirmed);
+}
+
 /* the display has a mode now: the persistent link may start */
 void av_modeset_done(struct apple_dcp *dcp)
 {

@@ -425,6 +425,19 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 				dev_warn(dcpaud->dev,
 					 "audio link for %u ch %u Hz: %d\n",
 					 rt->channels, rt->rate, ret);
+			/*
+			 * Without DCP running the audio stream the DPA takes
+			 * no data (EIO after one buffer), and DMA on such a
+			 * DPA was followed by SIO crashes ("Shim DMA
+			 * unavailable"): do not start it.
+			 */
+			if (!dcp_audiosrv_link_ready(dcpaud->dcp_dev)) {
+				dev_warn(dcpaud->dev,
+					 "DCP runs no audio stream, not starting DMA\n");
+				pm_runtime_mark_last_busy(dcpaud->dev);
+				__pm_runtime_put_autosuspend(dcpaud->dev);
+				return -EIO;
+			}
 		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);

@@ -1053,6 +1053,10 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 	if (ret)
 		goto out;
 	if (retcode) {
+		dev_dbg(service->ep->dcp->dev,
+			"AFK[ep:%02x]: %s call %u:%u returned 0x%x\n",
+			service->ep->endpoint, service->ops->name, group,
+			command, retcode);
 		ret = -EINVAL;
 		goto out;
 	}

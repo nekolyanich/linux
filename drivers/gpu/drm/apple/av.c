@@ -359,24 +359,6 @@ static int av_link_configure(struct audiosrv_data *asrv)
 			return -ENODEV;
 		service = asrv->srv;
 
-		/*
-		 * macOS 13 sends (0,14) with 2 at +0x20 on every plug, before
-		 * the elements and set_format (TV and Dell traces); we never
-		 * did. Its meaning is not known.
-		 */
-		if (asrv->cmds.set_mode) {
-			u8 mreq[64] = {}, mreply[64] = {};
-
-			put_unaligned_le32(2, mreq + 0x20);
-			scoped_guard(rwsem_write, &asrv->srv_rwsem)
-				ret = afk_service_call(service, 0,
-						       asrv->cmds.set_mode,
-						       mreq, sizeof(mreq), 0,
-						       mreply, sizeof(mreply), 0);
-			dev_info(dcp->dev, "audiosrv: set mode 2: %d, 0x%08x\n",
-				 ret, get_unaligned_le32(mreply + 0x20));
-		}
-
 		if (asrv->cmds.set_format) {
 			memcpy(req + 0x20, &fmt, sizeof(fmt));
 			scoped_guard(rwsem_write, &asrv->srv_rwsem)
@@ -403,6 +385,25 @@ static int av_link_configure(struct audiosrv_data *asrv)
 	if (hack_audio_link_reopen) {
 		ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0,
 				       16, NULL, 0, 16);
+		/*
+		 * macOS 13 sends (0,14) with 2 at +0x20 on every plug, while
+		 * the service is not open yet (TV and Dell traces; DCP
+		 * answers 3 at +0x10). Sent on the open service DCP refused
+		 * it (8 of 8). Its meaning is not known.
+		 */
+		if (!ret && !service->torndown && asrv->cmds.set_mode) {
+			u8 mreq[64] = {}, mreply[64] = {};
+			int mret;
+
+			put_unaligned_le32(2, mreq + 0x20);
+			mret = afk_service_call(service, 0, asrv->cmds.set_mode,
+						mreq, sizeof(mreq), 0, mreply,
+						sizeof(mreply), 0);
+			dev_info(dcp->dev,
+				 "audiosrv: set mode 2: %d, 0x%08x 0x%08x\n",
+				 mret, get_unaligned_le32(mreply + 0x10),
+				 get_unaligned_le32(mreply + 0x20));
+		}
 		if (!ret && !service->torndown)
 			ret = afk_service_call(service, 0, asrv->cmds.open, NULL,
 					       0, 32, NULL, 0, 32);

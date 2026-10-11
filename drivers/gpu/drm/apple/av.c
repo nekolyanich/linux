@@ -11,6 +11,8 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_eld.h>
+
 #include "audio.h"
 #include "afk.h"
 #include "av.h"
@@ -232,7 +234,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	void *bfr;
 	int ret;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -250,7 +252,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 		*output_size = le64_to_cpu(hdr->used_size);
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 
@@ -271,6 +273,19 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 		asrv->warned_get_elements = true;
 	} else {
 		dev_dbg(dev, "audiosrv: got %zd bytes worth of elements\n", size);
+	}
+
+	/*
+	 * DCP answers with nothing, not with an error, when the elements do
+	 * not fit: say so when the sink announces audio in its ELD.
+	 */
+	if (!ret && !size) {
+		u8 eld[MAX_ELD_BYTES];
+
+		if (dcp_get_eld(dev, eld, sizeof(eld)) > 0)
+			dev_warn_ratelimited(dev,
+				"audiosrv: no audio elements from DCP for a sink with an ELD (more than %zu bytes?)\n",
+				maxsize);
 	}
 
 	return ret;

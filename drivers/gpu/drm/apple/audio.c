@@ -441,8 +441,10 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
-		if (ret < 0)
+		if (ret < 0) {
+			pm_runtime_put_autosuspend(dcpaud->dev);
 			return ret;
+		}
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -454,8 +456,13 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	}
 
 	ret = snd_dmaengine_pcm_trigger(substream, cmd);
-	if (ret < 0)
+	if (ret < 0) {
+		/* a failed START is not followed by sync_stop */
+		if (cmd == SNDRV_PCM_TRIGGER_START ||
+		    cmd == SNDRV_PCM_TRIGGER_RESUME)
+			pm_runtime_put_autosuspend(dcpaud->dev);
 		return ret;
+	}
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -464,13 +471,30 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		/* the runtime PM reference goes in sync_stop */
 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
 		if (ret < 0)
 			return ret;
 		break;
 	}
+
+	return 0;
+}
+
+/*
+ * After a STOP or SUSPEND, outside the stream lock. The DMA terminate is
+ * asynchronous: putting the runtime PM reference in trigger STOP powered
+ * the DPA's domain (ps_dpa*) down while SIO still ran DMA towards it, and
+ * SIO crashed ("Shim DMA unavailable", the TERMINATE timing out after
+ * it). Wait for the terminate first.
+ */
+static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
+{
+	struct dcp_audio *dcpaud = substream->pcm->private_data;
+
+	snd_dmaengine_pcm_sync_stop(substream);
+	pm_runtime_mark_last_busy(dcpaud->dev);
+	__pm_runtime_put_autosuspend(dcpaud->dev);
 
 	return 0;
 }
@@ -482,6 +506,7 @@ struct snd_pcm_ops dcp_playback_ops = {
 	.hw_free = dcp_pcm_hw_free,
 	.prepare = dcp_pcm_prepare,
 	.trigger = dcp_pcm_trigger,
+	.sync_stop = dcp_pcm_sync_stop,
 	.pointer = snd_dmaengine_pcm_pointer,
 };
 

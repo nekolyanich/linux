@@ -33,7 +33,8 @@
 #include "audio.h"
 #include "parser.h"
 
-#define DCPAUD_ELEMENTS_MAXSIZE		65536
+/* as macOS 13 asks for; DCP answers with nothing when they do not fit */
+#define DCPAUD_ELEMENTS_MAXSIZE		SZ_256K
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 
 struct dcp_audio {
@@ -896,18 +897,27 @@ static const struct component_ops dcpaud_comp_ops = {
 	.unbind	= dcpaud_comp_unbind,
 };
 
+static void dcpaud_free_elements(void *elements)
+{
+	kvfree(elements);
+}
+
 static int dcpaud_probe(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
+	int ret;
 
 	dcpaud = devm_kzalloc(&pdev->dev, sizeof(*dcpaud), GFP_KERNEL);
 	if (!dcpaud)
 		return -ENOMEM;
 
-	dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
-					GFP_KERNEL);
+	dcpaud->elements = kvzalloc(DCPAUD_ELEMENTS_MAXSIZE, GFP_KERNEL);
 	if (!dcpaud->elements)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(&pdev->dev, dcpaud_free_elements,
+				       dcpaud->elements);
+	if (ret)
+		return ret;
 
 	dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
 					    GFP_KERNEL);

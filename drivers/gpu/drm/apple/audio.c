@@ -33,7 +33,7 @@
 #include "audio.h"
 #include "parser.h"
 
-#define DCPAUD_ELEMENTS_MAXSIZE		16384
+#define DCPAUD_ELEMENTS_MAXSIZE		65536
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 
 struct dcp_audio {

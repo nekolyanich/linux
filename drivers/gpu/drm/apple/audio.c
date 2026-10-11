@@ -55,6 +55,8 @@ struct dcp_audio {
 
 	struct snd_pcm_chmap_elem selected_chmap;
 	struct dcp_sound_cookie selected_cookie;
+	/* the stream holds a runtime PM reference, put in sync_stop */
+	bool pm_held;
 	void *elements;
 	void *productattrs;
 
@@ -404,13 +406,18 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (!dcpaud_connection_up(dcpaud))
 			return -ENXIO;
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+		/*
+		 * A failed START is undone with a STOP and then sync_stop, which
+		 * puts the reference, whether or not START got it.
+		 */
+		if (!dcpaud->pm_held) {
+			WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+			dcpaud->pm_held = true;
+		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
-		if (ret < 0) {
-			pm_runtime_put_autosuspend(dcpaud->dev);
+		if (ret < 0)
 			return ret;
-		}
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -422,13 +429,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	}
 
 	ret = snd_dmaengine_pcm_trigger(substream, cmd);
-	if (ret < 0) {
-		/* a failed START is not followed by sync_stop */
-		if (cmd == SNDRV_PCM_TRIGGER_START ||
-		    cmd == SNDRV_PCM_TRIGGER_RESUME)
-			pm_runtime_put_autosuspend(dcpaud->dev);
+	if (ret < 0)
 		return ret;
-	}
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -457,10 +459,20 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	bool held;
 
 	snd_dmaengine_pcm_sync_stop(substream);
-	pm_runtime_mark_last_busy(dcpaud->dev);
-	__pm_runtime_put_autosuspend(dcpaud->dev);
+
+	/* START sets it under the stream lock */
+	snd_pcm_stream_lock_irq(substream);
+	held = dcpaud->pm_held;
+	dcpaud->pm_held = false;
+	snd_pcm_stream_unlock_irq(substream);
+
+	if (held) {
+		pm_runtime_mark_last_busy(dcpaud->dev);
+		__pm_runtime_put_autosuspend(dcpaud->dev);
+	}
 
 	return 0;
 }

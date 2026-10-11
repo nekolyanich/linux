@@ -413,7 +413,15 @@ static void av_link_work(struct work_struct *work)
 	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data, link_wq);
 
 	guard(mutex)(&asrv->link_lock);
-	if (hack_audio_link_persistent && !asrv->link_up)
+	/*
+	 * A modeset takes the stream down: DCP reports 0xe0115004/5 and then
+	 * 0xe0115000/1 at 1 and does not bring them back by itself (natively
+	 * the Dell after kanshi's modeset). macOS stops the link around the
+	 * modeset and starts it again after: restart a link that runs
+	 * without a confirmed stream.
+	 */
+	if (hack_audio_link_persistent &&
+	    (!asrv->link_up || !READ_ONCE(asrv->stream_confirmed)))
 		av_link_configure(asrv);
 }
 

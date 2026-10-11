@@ -7,8 +7,10 @@
 #ifndef _DRM_APPLE_DCP_AFK_H
 #define _DRM_APPLE_DCP_AFK_H
 
+#include <linux/cleanup.h>
 #include <linux/completion.h>
 #include <linux/kconfig.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 #include "dcp.h"
@@ -43,6 +45,8 @@ struct apple_epic_service {
 	DECLARE_BITMAP(cmd_map, MAX_PENDING_CMDS);
 	u8 cmd_tag;
 	spinlock_t lock;
+	/* pins of callers using the service outside their owner's lock */
+	unsigned int users;
 
 	u32 channel;
 	bool enabled;
@@ -201,4 +205,38 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
 		     void *output, size_t output_len, size_t output_pad);
+
+/*
+ * Pin a live service for use outside the lock that guards the owner's
+ * pointer to it: a pinned slot is not handed to a newer service (see
+ * afk_alloc_service_slot()). As aurora-silicon/linux 5837706b.
+ */
+static inline struct apple_epic_service *
+afk_service_get(struct apple_epic_service *service)
+{
+	unsigned long flags;
+	bool live;
+
+	if (!service)
+		return NULL;
+	spin_lock_irqsave(&service->lock, flags);
+	live = service->enabled && !service->torndown;
+	if (live)
+		service->users++;
+	spin_unlock_irqrestore(&service->lock, flags);
+	return live ? service : NULL;
+}
+
+static inline void afk_service_put(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	if (!WARN_ON(!service->users))
+		service->users--;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+DEFINE_FREE(afk_service_put, struct apple_epic_service *,
+	    if (_T) afk_service_put(_T))
 #endif

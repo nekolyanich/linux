@@ -257,7 +257,8 @@ static int afk_alloc_service_slot(struct apple_dcp_afkep *ep)
 		if (service->enabled || !service->torndown)
 			continue;
 		spin_lock_irqsave(&service->lock, flags);
-		idle = bitmap_empty(service->cmd_map, MAX_PENDING_CMDS);
+		idle = bitmap_empty(service->cmd_map, MAX_PENDING_CMDS) &&
+		       !service->users;
 		spin_unlock_irqrestore(&service->lock, flags);
 		if (idle) {
 			dev_dbg(ep->dcp->dev,

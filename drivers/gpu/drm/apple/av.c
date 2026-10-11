@@ -349,14 +349,15 @@ static const struct apple_epic_service_ops avep_ops[] = {
 
 void av_service_connect(struct apple_dcp *dcp)
 {
-	struct apple_epic_service *service;
+	struct apple_epic_service *service __free(afk_service_put) = NULL;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
+	/* pinned: the open below runs without srv_rwsem */
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
-		if (!asrv->srv)
+		service = afk_service_get(asrv->srv);
+		if (!service)
 			return;
-		service = asrv->srv;
 	}
 
 	/* open AV audio service */
@@ -380,14 +381,15 @@ void av_service_connect(struct apple_dcp *dcp)
 
 void av_service_disconnect(struct apple_dcp *dcp)
 {
-	struct apple_epic_service *service;
+	struct apple_epic_service *service __free(afk_service_put) = NULL;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
-		if (!asrv->srv)
+		/* pinned: the close below runs without srv_rwsem */
+		service = afk_service_get(asrv->srv);
+		if (!service)
 			return;
-		service = asrv->srv;
 	}
 
 	/* close AV audio service */

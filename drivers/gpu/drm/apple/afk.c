@@ -392,6 +392,22 @@ static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel)
 		ops->teardown(service);
 }
 
+/*
+ * With service->lock held. Teardown leaves a service enabled while one of
+ * its commands still waits for a reply (DCP tears the AV interfaces down
+ * with the reply to a refused prepare or to our close); once its last
+ * command is done, disable it so afk_alloc_service_slot() can reuse the
+ * slot. Without this every refusal leaked a slot of the AV endpoint until
+ * "too many enabled services" left the next sink without audio.
+ */
+static void afk_release_cmd_locked(struct apple_epic_service *service, int idx)
+{
+	bitmap_release_region(service->cmd_map, idx, 0);
+	if (service->torndown &&
+	    bitmap_empty(service->cmd_map, MAX_PENDING_CMDS))
+		service->enabled = false;
+}
+
 static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 				  u16 tag, void *payload, size_t payload_size)
 {
@@ -451,7 +467,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		txlen = service->cmds[idx].txlen;
 		rxbuf_dma = service->cmds[idx].rxbuf_dma;
 		txbuf_dma = service->cmds[idx].txbuf_dma;
-		bitmap_release_region(service->cmd_map, idx, 0);
+		afk_release_cmd_locked(service, idx);
 	} else {
 		rxbuf = txbuf = NULL;
 		rxlen = txlen = 0;
@@ -956,6 +972,11 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 	cmd.txlen = cpu_to_le32(payload_len);
 
 	spin_lock_irqsave(&service->lock, flags);
+	/* disabled after a teardown: its slot may already be someone else's */
+	if (!service->enabled) {
+		ret = -ENODEV;
+		goto err_unlock;
+	}
 	idx = bitmap_find_free_region(service->cmd_map, MAX_PENDING_CMDS, 0);
 	if (idx < 0) {
 		ret = -ENOSPC;
@@ -1013,7 +1034,7 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 
 err_free_cmd:
 	spin_lock_irqsave(&service->lock, flags);
-	bitmap_release_region(service->cmd_map, idx, 0);
+	afk_release_cmd_locked(service, idx);
 err_unlock:
 	spin_unlock_irqrestore(&service->lock, flags);
 	dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);

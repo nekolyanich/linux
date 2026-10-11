@@ -421,8 +421,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			ret = dcp_audiosrv_link_set_format(dcpaud->dcp_dev,
 							   rt->channels, 24,
 							   rt->rate);
-			if (ret < 0)
-				dev_warn(dcpaud->dev,
+			if (ret < 0 && ret != -EAGAIN)
+				dev_warn_ratelimited(dcpaud->dev,
 					 "audio link for %u ch %u Hz: %d\n",
 					 rt->channels, rt->rate, ret);
 			/*
@@ -432,7 +432,7 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			 * unavailable"): do not start it.
 			 */
 			if (!dcp_audiosrv_link_ready(dcpaud->dcp_dev)) {
-				dev_warn(dcpaud->dev,
+				dev_warn_ratelimited(dcpaud->dev,
 					 "DCP runs no audio stream, not starting DMA\n");
 				pm_runtime_mark_last_busy(dcpaud->dev);
 				__pm_runtime_put_autosuspend(dcpaud->dev);

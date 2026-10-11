@@ -96,6 +96,10 @@ struct audiosrv_data {
 	/* report 0xe0115001 went to 0: DCP runs the audio stream */
 	bool stream_confirmed;
 	wait_queue_head_t report_wq;
+	/* the last (re)start from the PCM, to space out retries */
+	struct dcp_av_audio_fmt tried_fmt;
+	unsigned long tried_at;
+	unsigned int tries;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -428,17 +432,40 @@ int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
 	asrv->want_fmt = fmt;
 	/*
 	 * A restart is visible on some sinks (the Dell blinked once): only
-	 * for other channels or another rate. DCP may fill in its own speaker
-	 * allocation, and the sample size stays at 24 bit.
+	 * for other channels or another rate, or when DCP did not confirm the
+	 * stream. DCP may fill in its own speaker allocation, and the sample
+	 * size stays at 24 bit.
 	 */
 	if (asrv->link_up && asrv->link_fmt.channels == fmt.channels &&
-	    asrv->link_fmt.rate == fmt.rate)
+	    asrv->link_fmt.rate == fmt.rate && READ_ONCE(asrv->stream_confirmed))
 		return 0;
+	/*
+	 * Natively the Dell's link started 0.55 s after a modeset to a new
+	 * mode was never confirmed, and PipeWire retries START every 25 ms:
+	 * retry the same format at most every 2 s, since every start may make
+	 * DCP restart its AV interfaces.
+	 */
+	if (asrv->tried_fmt.channels == fmt.channels &&
+	    asrv->tried_fmt.rate == fmt.rate) {
+		/* a sink that never confirms must not cycle HPD forever */
+		if (asrv->tries >= 3 ||
+		    time_before(jiffies, asrv->tried_at + 2 * HZ))
+			return asrv->link_up ? 0 : -EAGAIN;
+	} else {
+		asrv->tries = 0;
+	}
 
 	scoped_guard(mutex, &asrv->plug_lock) {
 		if (!av_link_route_live(asrv))
 			return 0;
 	}
+	asrv->tried_fmt = fmt;
+	asrv->tried_at = jiffies;
+	asrv->tries++;
+	if (asrv->link_up)
+		dev_info(dcp->dev, "audiosrv: restarting the link (%s)\n",
+			 READ_ONCE(asrv->stream_confirmed) ? "new format" :
+							     "stream not confirmed");
 	return av_link_configure(asrv);
 }
 
@@ -731,6 +758,7 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	guard(mutex)(&asrv->link_lock);
 	/* the next sink starts with stereo, which the TV and the Dell both take */
 	asrv->want_fmt = av_link_format;
+	asrv->tries = 0;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
 		if (!asrv->srv) {

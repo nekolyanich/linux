@@ -266,23 +266,32 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		.flags = SND_DMAENGINE_PCM_DAI_FLAG_PACK,
 	};
 	struct snd_pcm_hardware hw;
+	bool connected;
 	int ret;
 
 	mutex_lock(&dcpaud->data_lock);
 	ret = dcpaud_init_dma(dcpaud);
-	if (ret < 0)
-		return ret;
-
-	if (!dcpaud->connected) {
+	if (ret < 0) {
 		mutex_unlock(&dcpaud->data_lock);
-		return -ENXIO;
+		return ret;
 	}
-	dcpaud->open_cookie = dcpaud->connection_cookie;
+
+	/*
+	 * Open without a sink too, as HDA HDMI does: DCP drops the sink for a
+	 * few seconds while it restarts its AV interfaces, and PipeWire's
+	 * probe then dropped the card's profiles for good. A stream opened
+	 * while the sink is away belongs to its next connection; it starts
+	 * only on a live connection (trigger START).
+	 */
+	connected = dcpaud->connected;
+	dcpaud->open_cookie = dcpaud->connection_cookie + !connected;
 	mutex_unlock(&dcpaud->data_lock);
 
-	ret = dcpaud_read_remote_info(dcpaud);
-	if (ret < 0)
-		return ret;
+	if (connected) {
+		ret = dcpaud_read_remote_info(dcpaud);
+		if (ret < 0)
+			dev_dbg(dcpaud->dev, "no remote info: %d\n", ret);
+	}
 
 	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_FORMAT,
 			    dcpaud_rule_format, dcpaud,
@@ -349,14 +358,14 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
 	int ret;
 
-	if (!dcpaud_connection_up(dcpaud))
-		return -ENXIO;
-
-	ret = dcpaud_select_cookie(dcpaud, params);
-	if (ret < 0)
-		return ret;
-	if (!ret)
-		return -EINVAL;
+	/* without the sink nothing to pick the element from (see open) */
+	if (dcpaud_connection_up(dcpaud)) {
+		ret = dcpaud_select_cookie(dcpaud, params);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			return -EINVAL;
+	}
 
 	memset(&slave_config, 0, sizeof(slave_config));
 	ret = snd_hwparams_to_dma_slave_config(substream, params, &slave_config);
@@ -390,8 +399,9 @@ static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 
+	/* without the sink there is nothing to prepare (see open) */
 	if (!dcpaud_connection_up(dcpaud))
-		return -ENXIO;
+		return 0;
 
 	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
 				    &dcpaud->selected_cookie);

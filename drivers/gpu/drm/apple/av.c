@@ -770,12 +770,16 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
-	size_t size;
+	size_t size = 0;
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
-	ret = dcp_audiosrv_osobject_call(asrv->srv, 1, asrv->cmds.get_elements,
-					 elements, maxsize, &size);
+	if (asrv->srv)
+		ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
+						 asrv->cmds.get_elements,
+						 elements, maxsize, &size);
+	else
+		ret = -ENODEV;
 	up_write(&asrv->srv_rwsem);
 
 	if (ret && asrv->warned_get_elements) {
@@ -805,13 +809,16 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
-	size_t size;
+	size_t size = 0;
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
-	ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
-					 asrv->cmds.get_product_attrs, attrs,
-					 maxsize, &size);
+	if (asrv->srv)
+		ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
+						 asrv->cmds.get_product_attrs,
+						 attrs, maxsize, &size);
+	else
+		ret = -ENODEV;
 	up_write(&asrv->srv_rwsem);
 
 	if (ret && asrv->warned_get_product_attrs) {

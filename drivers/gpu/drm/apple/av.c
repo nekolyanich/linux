@@ -101,6 +101,15 @@ struct audiosrv_data {
 	/* report 0xe0115001 went to 0: DCP runs the audio stream */
 	bool stream_confirmed;
 	wait_queue_head_t report_wq;
+	/* DCP asked to stop (0xe0115004) or start (0xe0115000) the link */
+	struct work_struct link_req_wq;
+	bool req_stop, req_start;
+	/* a start on DCP's request ran since the last modeset completed */
+	bool req_started;
+	/* DCP keeps the audio across this modeset (report 0xe0115006 at 0) */
+	bool seamless;
+	/* we closed the open service ourselves; open it before a prepare */
+	bool svc_closed;
 	/* the last (re)start from the PCM, to space out retries */
 	struct dcp_av_audio_fmt tried_fmt;
 	unsigned long tried_at;
@@ -160,6 +169,8 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 	/* nothing is open any more: a re-announced service must be opened afresh */
 	asrv->is_open = false;
 	asrv->link_up = false;
+	asrv->svc_closed = false;
+	asrv->seamless = false;
 	if (asrv->audio_dev)
 		dcpaud_disconnect(asrv->audio_dev);
 
@@ -246,6 +257,8 @@ static void av_link_stop(struct audiosrv_data *asrv)
 	if (!asrv->link_up)
 		return;
 	asrv->link_up = false;
+	WRITE_ONCE(asrv->stream_confirmed, false);
+	WRITE_ONCE(asrv->seamless, false);
 
 	down_write(&asrv->srv_rwsem);
 	if (asrv->srv) {
@@ -258,12 +271,14 @@ static void av_link_stop(struct audiosrv_data *asrv)
 }
 
 /* with asrv->plug_lock held: the switch may have released the route meanwhile */
-static bool av_link_route_live(struct audiosrv_data *asrv)
+static bool av_link_route_live(struct audiosrv_data *asrv, bool in_modeset)
 {
 	struct apple_dcp *dcp = asrv->dcp;
 
-	return asrv->is_open && asrv->srv && dcp->valid_mode &&
-	       !dcp->during_modeset && dcp->dptxport[0].connected;
+	if (!asrv->is_open || !asrv->srv || !dcp->dptxport[0].connected)
+		return false;
+	/* DCP asks for the link inside a modeset, as macOS starts it there */
+	return in_modeset || (dcp->valid_mode && !dcp->during_modeset);
 }
 
 /* with asrv->plug_lock held */
@@ -360,7 +375,7 @@ static int av_link_prepare_start(struct audiosrv_data *asrv,
  * come in on the close's reply and takes plug_lock on the AFK workqueue that
  * also delivers the reply.
  */
-static int av_link_configure(struct audiosrv_data *asrv)
+static int av_link_configure(struct audiosrv_data *asrv, bool in_modeset)
 {
 	struct apple_dcp *dcp = asrv->dcp;
 	struct dcp_av_audio_fmt fmt = asrv->want_fmt;
@@ -371,11 +386,16 @@ static int av_link_configure(struct audiosrv_data *asrv)
 	lockdep_assert_held(&asrv->link_lock);
 
 	scoped_guard(mutex, &asrv->plug_lock) {
-		if (!av_link_route_live(asrv))
+		if (!av_link_route_live(asrv, in_modeset))
 			return -ENODEV;
 		service = asrv->srv;
 
-		if (hack_audio_link_elements && asrv->cmds.get_elements) {
+		/*
+		 * Inside a modeset macOS 13 sends only open, prepare and
+		 * start_link: no elements, no set_format.
+		 */
+		if (!in_modeset && hack_audio_link_elements &&
+		    asrv->cmds.get_elements) {
 			size_t size = 0;
 
 			scoped_guard(rwsem_write, &asrv->srv_rwsem)
@@ -386,7 +406,7 @@ static int av_link_configure(struct audiosrv_data *asrv)
 				 ret, size);
 		}
 
-		if (asrv->cmds.set_format) {
+		if (!in_modeset && asrv->cmds.set_format) {
 			memcpy(req + 0x20, &fmt, sizeof(fmt));
 			scoped_guard(rwsem_write, &asrv->srv_rwsem)
 				ret = afk_service_call(service, 0,
@@ -409,12 +429,15 @@ static int av_link_configure(struct audiosrv_data *asrv)
 	}
 
 	ret = 0;
-	if (hack_audio_link_reopen) {
-		ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0,
-				       16, NULL, 0, 16);
+	if (hack_audio_link_reopen || asrv->svc_closed) {
+		if (!asrv->svc_closed)
+			ret = afk_service_call(service, 0, asrv->cmds.close,
+					       NULL, 0, 16, NULL, 0, 16);
 		if (!ret && !service->torndown)
 			ret = afk_service_call(service, 0, asrv->cmds.open, NULL,
 					       0, 32, NULL, 0, 32);
+		if (!ret)
+			asrv->svc_closed = false;
 	}
 	if (service->torndown) {
 		/* the service is announced afresh and opened from there */
@@ -430,10 +453,63 @@ static int av_link_configure(struct audiosrv_data *asrv)
 			dcpaud_disconnect(asrv->audio_dev);
 		return ret;
 	}
-	if (asrv->srv != service || !av_link_route_live(asrv))
+	if (asrv->srv != service || !av_link_route_live(asrv, in_modeset))
 		return -ENODEV;
 
-	return av_link_prepare_start(asrv, service, &fmt);
+	ret = av_link_prepare_start(asrv, service, &fmt);
+	if (ret == -EPERM) {
+		/*
+		 * As macOS after the refusal on the TV's first plug: close
+		 * the service at once; DCP replugs the sink and asks again.
+		 */
+		if (!afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
+				      NULL, 0, 16))
+			asrv->svc_closed = true;
+	}
+	return ret;
+}
+
+/*
+ * DCP asked to stop the link (report 0xe0115004 at 1): around a modeset
+ * macOS 13 stops, unprepares and closes it there, before the mode is set.
+ * With asrv->link_lock held.
+ */
+static void av_link_req_stop(struct audiosrv_data *asrv)
+{
+	struct apple_epic_service *service;
+
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (!asrv->srv || !asrv->is_open || asrv->svc_closed)
+			return;
+		service = asrv->srv;
+		av_link_stop(asrv);
+	}
+	/* without plug_lock: a teardown may come in on the reply */
+	if (!afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16, NULL,
+			      0, 16))
+		asrv->svc_closed = true;
+	if (service->torndown)
+		service->enabled = false;
+	dev_info(asrv->dcp->dev, "audiosrv: link stopped on DCP's request\n");
+}
+
+static void av_link_req_work(struct work_struct *work)
+{
+	struct audiosrv_data *asrv = container_of(work, struct audiosrv_data,
+						  link_req_wq);
+
+	if (!hack_audio_link_persistent)
+		return;
+
+	guard(mutex)(&asrv->link_lock);
+	if (xchg(&asrv->req_stop, false))
+		av_link_req_stop(asrv);
+	if (xchg(&asrv->req_start, false)) {
+		/* DCP asked to start the link (report 0xe0115000 at 1) */
+		asrv->req_started = true;
+		dev_info(asrv->dcp->dev, "audiosrv: starting the link on DCP's request\n");
+		av_link_configure(asrv, true);
+	}
 }
 
 
@@ -444,14 +520,15 @@ static void av_link_work(struct work_struct *work)
 	guard(mutex)(&asrv->link_lock);
 	/*
 	 * A modeset takes the stream down: DCP reports 0xe0115004/5 and then
-	 * 0xe0115000/1 at 1 and does not bring them back by itself (natively
-	 * the Dell after kanshi's modeset). macOS stops the link around the
-	 * modeset and starts it again after: restart a link that runs
-	 * without a confirmed stream.
+	 * 0xe0115000/1 at 1, and the link follows those requests inside the
+	 * modeset (av_link_req_work), as on macOS. A restart right after the
+	 * modeset DCP refused ("Capabilities changed", 2 of 2 on the Dell).
+	 * Only start a link that is down and that no request started.
 	 */
-	if (hack_audio_link_persistent &&
-	    (!asrv->link_up || !READ_ONCE(asrv->stream_confirmed)))
-		av_link_configure(asrv);
+	if (xchg(&asrv->req_started, false))
+		return;
+	if (hack_audio_link_persistent && !asrv->link_up)
+		av_link_configure(asrv, false);
 }
 
 /* CEA-861 speaker allocation, as macOS sends it: 0 for stereo, 0x0b for 5.1 */
@@ -512,7 +589,7 @@ int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
 	}
 
 	scoped_guard(mutex, &asrv->plug_lock) {
-		if (!av_link_route_live(asrv))
+		if (!av_link_route_live(asrv, false))
 			return 0;
 	}
 	asrv->tried_fmt = fmt;
@@ -522,7 +599,7 @@ int dcp_audiosrv_link_set_format(struct device *dev, unsigned int channels,
 		dev_info(dcp->dev, "audiosrv: restarting the link (%s)\n",
 			 READ_ONCE(asrv->stream_confirmed) ? "new format" :
 							     "stream not confirmed");
-	return av_link_configure(asrv);
+	return av_link_configure(asrv, false);
 }
 
 /* the link runs and DCP confirmed the audio stream (report 0xe0115001) */
@@ -757,11 +834,44 @@ static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 			     data_size, false);
 
 	/* 0x70 bytes: an event code at +0x50, a flag at +0x60 */
-	if (data_size >= 0x64 &&
-	    get_unaligned_le32(data + 0x50) == 0xe0115001) {
-		WRITE_ONCE(asrv->stream_confirmed,
-			   !get_unaligned_le32(data + 0x60));
-		wake_up(&asrv->report_wq);
+	if (data_size >= 0x64) {
+		u32 code = get_unaligned_le32(data + 0x50);
+		u32 flag = get_unaligned_le32(data + 0x60);
+
+		/*
+		 * 0xe0115001 goes to 0 once DCP runs the stream we started.
+		 * Its 1 in a modeset DCP keeps the audio across means nothing
+		 * (macOS 13 played on through 4 of 4 such modesets): only a
+		 * new prepare forgets the confirmation.
+		 */
+		if (code == 0xe0115001 && !flag) {
+			WRITE_ONCE(asrv->stream_confirmed, true);
+			wake_up(&asrv->report_wq);
+		}
+		/*
+		 * 0xe0115006 goes 1 and then 2 a few seconds after DCP gets
+		 * samples (macOS runs the DMA from the link start on); a
+		 * modeset after that starts with it at 0 and DCP keeps the
+		 * audio across it: macOS sends only (0,13) and (0,20) then.
+		 */
+		if (code == 0xe0115006)
+			WRITE_ONCE(asrv->seamless, flag == 0);
+		/*
+		 * Otherwise, at 1, these ask the client to stop (0xe0115004)
+		 * or start (0xe0115000) the link, and macOS 13 does so right
+		 * away, inside the modeset (TV and Dell traces, around the
+		 * modesets before 0xe0115006 reached 2). The calls need
+		 * replies from this workqueue.
+		 */
+		if (flag && !READ_ONCE(asrv->seamless)) {
+			if (code == 0xe0115004) {
+				WRITE_ONCE(asrv->req_stop, true);
+				schedule_work(&asrv->link_req_wq);
+			} else if (code == 0xe0115000) {
+				WRITE_ONCE(asrv->req_start, true);
+				schedule_work(&asrv->link_req_wq);
+			}
+		}
 	}
 
 	return 0;
@@ -800,6 +910,33 @@ void av_service_connect(struct apple_dcp *dcp)
 	if (asrv->is_open)
 		return;
 
+	/*
+	 * As macOS 13 on a plug, before the open: read the elements and set
+	 * the format, which the start inside the modeset then uses. DCP's
+	 * own pick for the TV was 6 channels.
+	 */
+	if (hack_audio_link_persistent) {
+		struct dcp_av_audio_fmt fmt = asrv->want_fmt;
+		u8 req[64] = {}, reply[64] = {};
+		size_t size = 0;
+
+		ret = 0;
+		scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+			if (hack_audio_link_elements && asrv->cmds.get_elements)
+				ret = dcp_audiosrv_osobject_call(service, 1,
+						asrv->cmds.get_elements, NULL,
+						SZ_256K, &size);
+			memcpy(req + 0x20, &fmt, sizeof(fmt));
+			if (asrv->cmds.set_format)
+				ret = afk_service_call(service, 0,
+						       asrv->cmds.set_format,
+						       req, sizeof(req), 0,
+						       reply, sizeof(reply), 0);
+		}
+		dev_info(dcp->dev, "audiosrv: on plug: %zu bytes of elements, set format: %d\n",
+			 size, ret);
+	}
+
 	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
 			       NULL, 0, 32);
 	if (ret) {
@@ -826,6 +963,7 @@ void av_service_disconnect(struct apple_dcp *dcp)
 
 	/* no link start for the route that is going away */
 	cancel_work_sync(&asrv->link_wq);
+	cancel_work_sync(&asrv->link_req_wq);
 	guard(mutex)(&asrv->link_lock);
 	/* the next sink starts with stereo, which the TV and the Dell both take */
 	asrv->want_fmt = av_link_format;
@@ -855,8 +993,11 @@ void av_service_disconnect(struct apple_dcp *dcp)
 
 	mutex_unlock(&asrv->plug_lock);
 
-	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
-			       NULL, 0, 16);
+	ret = 0;
+	if (!asrv->svc_closed)
+		ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0,
+				       16, NULL, 0, 16);
+	asrv->svc_closed = false;
 	if (ret) {
 		dev_err(dcp->dev, "error closing audio service: %d\n", ret);
 	}
@@ -931,6 +1072,7 @@ int avep_init(struct apple_dcp *dcp)
 	audiosrv_data->dcp = dcp;
 	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
 	INIT_WORK(&audiosrv_data->link_wq, av_link_work);
+	INIT_WORK(&audiosrv_data->link_req_wq, av_link_req_work);
 
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {

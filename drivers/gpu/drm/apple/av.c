@@ -674,7 +674,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	ret = afk_service_call(service, group, command, hdr, sizeof(*hdr), output_maxsize,
 			       bfr, sizeof(*hdr) + output_maxsize, 0);
 	if (ret)
-		return ret;
+		goto out;
 
 	if (output)
 		memcpy(output, bfr + sizeof(*hdr), output_maxsize);
@@ -682,7 +682,9 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	if (output_size)
 		*output_size = le64_to_cpu(hdr->used_size);
 
-	return 0;
+out:
+	kfree(bfr);
+	return ret;
 }
 
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize)

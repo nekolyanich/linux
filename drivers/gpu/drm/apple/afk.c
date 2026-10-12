@@ -494,6 +494,7 @@ struct epic_std_service_ap_call {
 	__le32 unk0;
 	struct epic_service_call call;
 } __attribute__((packed));
+static_assert(sizeof(struct epic_std_service_ap_call) == 68);
 
 static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 					u32 type, struct epic_hdr *ehdr,
@@ -535,14 +536,16 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 
 		/*
 		 * Command numbers are per group: a group-less .call handler
-		 * would take another group's call for a group 0 one.
+		 * would take another group's call for a group 0 one. Without
+		 * call_v2 there is no handler for it, and AFK cannot guess a
+		 * reply, so it gets none, as a call without any handler.
 		 */
 		if (!service->ops->call_v2 && (group || !service->ops->call)) {
 			if (group)
-				dev_warn_once(ep->dcp->dev,
-					      "AFK[ep:%02x]: %s (chan:%u) apcall %u:%u has no handler, sending NO reply\n",
-					      ep->endpoint, service->ops->name,
-					      channel, group, command);
+				dev_warn_ratelimited(ep->dcp->dev,
+						     "AFK[ep:%02x]: %s (chan:%u) apcall %u:%u has no handler, sending NO reply\n",
+						     ep->endpoint, service->ops->name,
+						     channel, group, command);
 			return;
 		}
 		reply = kzalloc(payload_size, GFP_KERNEL);

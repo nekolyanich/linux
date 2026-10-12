@@ -661,9 +661,10 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 
 /*
  * Group 1 calls 3 and 4 come around link (re)configuration, audio prepare
- * included. They look like the drive settings the J700 code reads in them:
- * a lane count at +0x10 in (1, 3) and at +0x00 in (1, 4), levels per lane
- * from +0x20. macOS 13 acks both with the request, (1, 3) with +0x00..0x03
+ * included. They carry a lane count at +0x10 in (1, 3) and at +0x00 in
+ * (1, 4); the J700 code reads (1, 3) as drive settings with levels per
+ * lane from +0x20, and its group 0 GET (0, 4) has the count at +0x00.
+ * macOS 13 acks both with the request, (1, 3) with +0x00..0x03
  * cleared and (1, 4) with +0x10..0x13 and +0x20 to the end cleared, so
  * what DCP left there does not go back (42 of 42 traced pairs on t6020,
  * 13.5 firmware: TV through a USB-C to HDMI adapter, Dell over TB).
@@ -704,9 +705,13 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 	if (group == 1 && (command == 3 || command == 4))
 		return dptxport_call_group1(command, data, size, reply, room);
 
-	dev_warn_once(service->ep->dcp->dev,
-		      "DPTXPort: unknown AP call %u:%u, echoing it\n",
-		      group, command);
+	/*
+	 * Echo it, as group 0 acks an unhandled call: no reply might stall
+	 * DCP's caller.
+	 */
+	dev_warn_ratelimited(service->ep->dcp->dev,
+			     "DPTXPort: unknown AP call %u:%u, echoing it\n",
+			     group, command);
 	memcpy(reply, data, min(room, size));
 	return 0;
 }

@@ -390,7 +390,7 @@ TRACE_EVENT(
 
 	TP_printk("%s: dptx%d: AP Call %u:%d (%s) with len %lu", __get_str(devname),
 		  __entry->unit, __entry->group, __entry->idx,
-		  __entry->group ? "group" : show_dptxport_apcall(__entry->idx),
+		  __entry->group ? "-" : show_dptxport_apcall(__entry->idx),
 		  __entry->len));
 
 TRACE_EVENT(

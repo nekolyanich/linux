@@ -558,36 +558,12 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	return 0;
 }
 
-/*
- * DCP also sends the port calls of other groups: group 1 commands 3 and 4
- * around every audio prepare and start_link, group 8 command 9. Their
- * numbers overlap group 0's, where 3 and 4 are SET/GET_DRIVE_SETTINGS.
- * macOS 13 answers them with an echo, for (1, 4) with the word at 0x10
- * cleared (TV and Dell traces). Answered as group 0 calls, they overwrote
- * the drive settings, and DCP refused most audio starts behind a USB-C to
- * HDMI adapter ("Capabilities changed") or never confirmed the stream.
- */
-static int dptxport_call_other_group(u16 group, u32 idx, const void *data,
-				     size_t data_size, void *reply,
-				     size_t reply_size)
-{
-	memcpy(reply, data, min(reply_size, data_size));
-	if (group == 1 && idx == 4 && reply_size >= 0x14)
-		memset(reply + 0x10, 0, 4);
-	return 0;
-}
-
-static int dptxport_call(struct apple_epic_service *service, u16 group,
-			 u32 idx, const void *data, size_t data_size,
-			 void *reply, size_t reply_size)
+static int dptxport_call(struct apple_epic_service *service, u32 idx,
+			 const void *data, size_t data_size, void *reply,
+			 size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
-
-	if (group)
-		return dptxport_call_other_group(group, idx, data, data_size,
-						 reply, reply_size);
-
-	trace_dptxport_apcall(dptx, idx, data_size);
+	trace_dptxport_apcall(dptx, 0, idx, data_size);
 
 	switch (idx) {
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
@@ -683,11 +659,64 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 	}
 }
 
+/*
+ * Group 1 calls 3 and 4 come around link (re)configuration, audio prepare
+ * included. They look like the drive settings the J700 code reads in them:
+ * a lane count at +0x10 in (1, 3) and at +0x00 in (1, 4), levels per lane
+ * from +0x20. macOS 13 acks both with the request, (1, 3) with +0x00..0x03
+ * cleared and (1, 4) with +0x10..0x13 and +0x20 to the end cleared, so
+ * what DCP left there does not go back (42 of 42 traced pairs on t6020,
+ * 13.5 firmware: TV through a USB-C to HDMI adapter, Dell over TB).
+ */
+static int dptxport_call_group1(u32 command, const void *data,
+				size_t data_size, void *reply, size_t reply_size)
+{
+	size_t size = min(reply_size, data_size);
+
+	memcpy(reply, data, size);
+	if (command == 3) {
+		memset(reply, 0, min_t(size_t, size, 0x4));
+	} else if (size > 0x10) {
+		memset(reply + 0x10, 0, min_t(size_t, size - 0x10, 0x4));
+		if (size > 0x20)
+			memset(reply + 0x20, 0, size - 0x20);
+	}
+	return 0;
+}
+
+static int dptxport_group_call(struct apple_epic_service *service, u16 group,
+			       u32 command, const void *data, size_t size,
+			       void *reply, size_t room)
+{
+	struct dptx_port *dptx = service->cookie;
+
+	if (!group)
+		return dptxport_call(service, command, data, size, reply, room);
+
+	trace_dptxport_apcall(dptx, group, command, size);
+	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u:%u (%zu bytes)\n",
+		group, command, size);
+	if (size)
+		print_hex_dump_debug("DPTXPort: apcall data: ",
+				     DUMP_PREFIX_OFFSET, 16, 1, data,
+				     min(size, (size_t)64), true);
+
+	if (group == 1 && (command == 3 || command == 4))
+		return dptxport_call_group1(command, data, size, reply, room);
+
+	dev_warn_once(service->ep->dcp->dev,
+		      "DPTXPort: unknown AP call %u:%u, echoing it\n",
+		      group, command);
+	memcpy(reply, data, min(room, size));
+	return 0;
+}
+
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.init = dptxport_init,
 		.call = dptxport_call,
+		.call_v2 = dptxport_group_call,
 	},
 	{}
 };

@@ -67,9 +67,11 @@ struct apple_epic_service_ops {
 
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
-	int (*call)(struct apple_epic_service *service, u16 group, u32 idx,
+	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);
+	int (*call_v2)(struct apple_epic_service *service, u16 group, u32 command,
+		       const void *data, size_t size, void *reply, size_t room);
 	int (*report)(struct apple_epic_service *service, enum epic_subtype type,
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);

@@ -558,11 +558,35 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call(struct apple_epic_service *service, u32 idx,
-			 const void *data, size_t data_size, void *reply,
-			 size_t reply_size)
+/*
+ * DCP also sends the port calls of other groups: group 1 commands 3 and 4
+ * around every audio prepare and start_link, group 8 command 9. Their
+ * numbers overlap group 0's, where 3 and 4 are SET/GET_DRIVE_SETTINGS.
+ * macOS 13 answers them with an echo, for (1, 4) with the word at 0x10
+ * cleared (TV and Dell traces). Answered as group 0 calls, they overwrote
+ * the drive settings, and DCP refused most audio starts behind a USB-C to
+ * HDMI adapter ("Capabilities changed") or never confirmed the stream.
+ */
+static int dptxport_call_other_group(u16 group, u32 idx, const void *data,
+				     size_t data_size, void *reply,
+				     size_t reply_size)
+{
+	memcpy(reply, data, min(reply_size, data_size));
+	if (group == 1 && idx == 4 && reply_size >= 0x14)
+		memset(reply + 0x10, 0, 4);
+	return 0;
+}
+
+static int dptxport_call(struct apple_epic_service *service, u16 group,
+			 u32 idx, const void *data, size_t data_size,
+			 void *reply, size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
+
+	if (group)
+		return dptxport_call_other_group(group, idx, data, data_size,
+						 reply, reply_size);
+
 	trace_dptxport_apcall(dptx, idx, data_size);
 
 	switch (idx) {

@@ -491,7 +491,8 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 
 struct epic_std_service_ap_call {
 	__le32 unk0;
-	__le32 unk1;
+	__le16 unk1;
+	__le16 group;
 	__le32 type;
 	__le32 len;
 	__le32 magic;
@@ -537,7 +538,8 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		if (!reply)
 			return;
 
-		ret = service->ops->call(service, le32_to_cpu(call->type),
+		ret = service->ops->call(service, le16_to_cpu(call->group),
+					 le32_to_cpu(call->type),
 					 payload + sizeof(*call), call_size,
 					 reply + sizeof(*call), call_size);
 		if (ret) {

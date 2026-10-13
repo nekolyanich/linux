@@ -145,6 +145,8 @@
 #define TPS_SYSTEM_POWER_STATE_S3	0x03
 #define TPS_SYSTEM_POWER_STATE_S4	0x04
 #define TPS_SYSTEM_POWER_STATE_S5	0x05
+/* CD321x: what macOS sets on a port with nothing plugged in */
+#define CD321X_SYSTEM_POWER_STATE_UNPLUGGED	0x02
 
 /* TPS_REG_POWER_STATUS bits (masks shared by TPS_FIELD_GET accessors and FIELD_PREP) */
 #define TPS_POWER_STATUS_CONNECTION_MASK	BIT(0)

@@ -50,6 +50,13 @@
 #define TPS_REG_RX_IDENTITY_SOP		0x48
 #define TPS_REG_CF_VID_STATUS		0x5e
 #define TPS_REG_DP_SID_STATUS		0x58
+
+/*
+ * Not documented. macOS writes 0x2000 here after each DATA_STATUS HPD_IRQ,
+ * and around a disconnect, so bit 13 is taken to acknowledge HPD_IRQ.
+ */
+#define CD321X_REG_DATA_CONTROL		0x50
+#define CD321X_DATA_CONTROL_HPD_IRQ_ACK	BIT(13)
 #define TPS_REG_INTEL_VID_STATUS	0x59
 #define TPS_REG_DATA_STATUS		0x5f
 #define TPS_REG_SLEEP_CONF		0x70
@@ -694,6 +701,47 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 	cd321x->state.data = NULL;
 }
 
+static void cd321x_write_data_control(struct tps6598x *tps, u32 val)
+{
+	__le32 v = cpu_to_le32(val);
+	int ret;
+
+	ret = tps6598x_block_write(tps, CD321X_REG_DATA_CONTROL, &v, sizeof(v));
+	if (ret)
+		dev_warn(tps->dev, "failed to write data control 0x%x: %d\n",
+			 val, ret);
+}
+
+/*
+ * After a session in DP alt mode, the controller reports the cable power
+ * path "in" and the session's data status once the partner is gone, and
+ * then gives the next partner no VBUS. macOS puts the port into system power
+ * state 2 on every disconnect and back into S0 on the next connect; do the
+ * same, in its order. A failure here only warns: the cable state above is
+ * already applied, and a later event still reaches the port.
+ */
+static void cd321x_unplug_sleep(struct tps6598x *tps)
+{
+	int ret;
+
+	cd321x_write_data_control(tps, CD321X_DATA_CONTROL_HPD_IRQ_ACK);
+	ret = tps->data->switch_power_state(tps, CD321X_SYSTEM_POWER_STATE_UNPLUGGED);
+	if (ret)
+		dev_warn(tps->dev, "failed to enter the unplugged power state: %d\n",
+			 ret);
+	cd321x_write_data_control(tps, CD321X_DATA_CONTROL_HPD_IRQ_ACK);
+	cd321x_write_data_control(tps, 0);
+}
+
+static void cd321x_plug_wake(struct tps6598x *tps)
+{
+	int ret;
+
+	ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	if (ret)
+		dev_warn(tps->dev, "failed to return to S0 on connect: %d\n", ret);
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -780,12 +828,17 @@ static void cd321x_update_work(struct work_struct *work)
 	power_supply_changed(tps->psy);
 
 	/* If the plug is disconnected, we are done */
-	if (!new_connected)
+	if (!new_connected) {
+		if (old_connected || (st.status_changed & TPS_STATUS_PLUG_PRESENT))
+			cd321x_unplug_sleep(tps);
 		return;
+	}
 
 	/* Set up partner if we were previously disconnected (or changed). */
 	if (!tps->partner) {
 		struct typec_partner_desc desc = { };
+
+		cd321x_plug_wake(tps);
 
 		desc.usb_pd = is_pd;
 		desc.accessory = TYPEC_ACCESSORY_NONE; /* XXX: handle accessories */

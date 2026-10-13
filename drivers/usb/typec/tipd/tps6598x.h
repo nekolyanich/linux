@@ -304,6 +304,8 @@ struct tipd_data {
 	int (*apply_patch)(struct tps6598x *tps);
 	int (*init)(struct tps6598x *tps);
 	int (*switch_power_state)(struct tps6598x *tps, u8 target_state);
+	/* CD321x: sleep an empty port as macOS does (traced on CD321x only) */
+	bool port_sleep;
 	bool (*read_data_status)(struct tps6598x *tps);
 	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);

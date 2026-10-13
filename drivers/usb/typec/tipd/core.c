@@ -733,6 +733,9 @@ static void cd321x_port_sleep(struct cd321x *cd321x)
 	u32 status;
 	int ret;
 
+	if (!tps->data->port_sleep)
+		return;
+
 	ret = tps6598x_read32(tps, TPS_REG_STATUS, &status);
 	if (ret || (status & TPS_STATUS_PLUG_PRESENT)) {
 		cd321x->port_power = CD321X_PORT_UNKNOWN;
@@ -756,6 +759,9 @@ static void cd321x_port_wake(struct cd321x *cd321x)
 {
 	struct tps6598x *tps = &cd321x->tps;
 	int ret;
+
+	if (!tps->data->port_sleep)
+		return;
 
 	ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 	if (ret) {
@@ -2068,6 +2074,7 @@ static const struct tipd_data tipd_cd321x_data = {
 	.read_power_status = tps6598x_read_power_status,
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
+	.port_sleep = true,
 	.probe_unplugged = cd321x_probe_unplugged,
 	.connect = cd321x_connect,
 };

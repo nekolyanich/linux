@@ -50,16 +50,17 @@
 #define TPS_REG_RX_IDENTITY_SOP		0x48
 #define TPS_REG_CF_VID_STATUS		0x5e
 #define TPS_REG_DP_SID_STATUS		0x58
-
-/*
- * Not documented. macOS writes 0x2000 here after each DATA_STATUS HPD_IRQ,
- * and around a disconnect, so bit 13 is taken to acknowledge HPD_IRQ.
- */
-#define CD321X_REG_DATA_CONTROL		0x50
-#define CD321X_DATA_CONTROL_HPD_IRQ_ACK	BIT(13)
 #define TPS_REG_INTEL_VID_STATUS	0x59
 #define TPS_REG_DATA_STATUS		0x5f
 #define TPS_REG_SLEEP_CONF		0x70
+
+/*
+ * CD321x register 0x50, not in TI's public register list: 6 bytes, of which
+ * macOS reads and writes 4. It writes BIT(13) after each DATA_STATUS HPD_IRQ
+ * and around a disconnect, then clears it; what the bit does is not known.
+ */
+#define CD321X_REG_0X50			0x50
+#define CD321X_0X50_BIT13		BIT(13)
 
 /* TPS_REG_SYSTEM_CONF bits */
 #define TPS_SYSCONF_PORTINFO(c)		((c) & 7)
@@ -701,45 +702,53 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 	cd321x->state.data = NULL;
 }
 
-static void cd321x_write_data_control(struct tps6598x *tps, u32 val)
+static void cd321x_write_0x50(struct tps6598x *tps, u32 val)
 {
 	__le32 v = cpu_to_le32(val);
 	int ret;
 
-	ret = tps6598x_block_write(tps, CD321X_REG_DATA_CONTROL, &v, sizeof(v));
+	ret = tps6598x_block_write(tps, CD321X_REG_0X50, &v, sizeof(v));
 	if (ret)
-		dev_warn(tps->dev, "failed to write data control 0x%x: %d\n",
+		dev_warn(tps->dev, "failed to write 0x%x to register 0x50: %d\n",
 			 val, ret);
 }
 
 /*
  * After a session in DP alt mode, the controller reports the cable power
  * path "in" and the session's data status once the partner is gone, and
- * then gives the next partner no VBUS. macOS puts the port into system power
- * state 2 on every disconnect and back into S0 on the next connect; do the
- * same, in its order. A failure here only warns: the cable state above is
- * already applied, and a later event still reaches the port.
+ * then gives the next partner no VBUS. macOS puts a port with nothing
+ * plugged in into system power state 2 (on disconnect, and at boot for an
+ * empty port) and back into S0 on the next connect; do the same.
+ * switch_power_state() reads the state before and after SSPS (macOS only
+ * after) and skips a state already set. A failure only warns: the cable
+ * state above is already applied, and a later event still reaches the port.
  */
-static void cd321x_unplug_sleep(struct tps6598x *tps)
+static void cd321x_port_sleep(struct cd321x *cd321x)
 {
+	struct tps6598x *tps = &cd321x->tps;
 	int ret;
 
-	cd321x_write_data_control(tps, CD321X_DATA_CONTROL_HPD_IRQ_ACK);
+	cd321x_write_0x50(tps, CD321X_0X50_BIT13);
 	ret = tps->data->switch_power_state(tps, CD321X_SYSTEM_POWER_STATE_UNPLUGGED);
 	if (ret)
 		dev_warn(tps->dev, "failed to enter the unplugged power state: %d\n",
 			 ret);
-	cd321x_write_data_control(tps, CD321X_DATA_CONTROL_HPD_IRQ_ACK);
-	cd321x_write_data_control(tps, 0);
+	else
+		cd321x->port_power = CD321X_PORT_ASLEEP;
+	cd321x_write_0x50(tps, CD321X_0X50_BIT13);
+	cd321x_write_0x50(tps, 0);
 }
 
-static void cd321x_plug_wake(struct tps6598x *tps)
+static void cd321x_port_wake(struct cd321x *cd321x)
 {
+	struct tps6598x *tps = &cd321x->tps;
 	int ret;
 
 	ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 	if (ret)
 		dev_warn(tps->dev, "failed to return to S0 on connect: %d\n", ret);
+	else
+		cd321x->port_power = CD321X_PORT_AWAKE;
 }
 
 static void cd321x_update_work(struct work_struct *work)
@@ -829,8 +838,9 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If the plug is disconnected, we are done */
 	if (!new_connected) {
-		if (old_connected || (st.status_changed & TPS_STATUS_PLUG_PRESENT))
-			cd321x_unplug_sleep(tps);
+		/* also an empty port at probe, and a disconnect retried */
+		if (cd321x->port_power != CD321X_PORT_ASLEEP)
+			cd321x_port_sleep(cd321x);
 		return;
 	}
 
@@ -838,7 +848,12 @@ static void cd321x_update_work(struct work_struct *work)
 	if (!tps->partner) {
 		struct typec_partner_desc desc = { };
 
-		cd321x_plug_wake(tps);
+		/* unplugged and plugged again within one debounce */
+		if (partner_changed &&
+		    (st.status_changed & TPS_STATUS_PLUG_PRESENT) &&
+		    cd321x->port_power != CD321X_PORT_ASLEEP)
+			cd321x_port_sleep(cd321x);
+		cd321x_port_wake(cd321x);
 
 		desc.usb_pd = is_pd;
 		desc.accessory = TYPEC_ACCESSORY_NONE; /* XXX: handle accessories */

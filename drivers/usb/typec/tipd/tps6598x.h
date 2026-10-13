@@ -373,8 +373,16 @@ struct cd321x_status {
 	struct tps6598x_usb4_status_reg usb4_status;
 };
 
+/* CD321x port power, as last set by the driver (UNKNOWN after probe) */
+enum cd321x_port_power {
+	CD321X_PORT_UNKNOWN,
+	CD321X_PORT_AWAKE,
+	CD321X_PORT_ASLEEP,
+};
+
 struct cd321x {
 	struct tps6598x tps;
+	enum cd321x_port_power port_power;
 
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
 	struct tps6598x_intel_vid_status_reg intel_vid_status;

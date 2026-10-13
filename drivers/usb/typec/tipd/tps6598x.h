@@ -308,6 +308,7 @@ struct tipd_data {
 	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
+	void (*probe_unplugged)(struct tps6598x *tps);
 };
 
 struct tps6598x {

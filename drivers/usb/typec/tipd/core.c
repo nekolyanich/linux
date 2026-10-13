@@ -766,6 +766,15 @@ static void cd321x_port_wake(struct cd321x *cd321x)
 	}
 }
 
+/* At probe, with nothing plugged in: no cable work runs before an event. */
+static void cd321x_probe_unplugged(struct tps6598x *tps)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	guard(mutex)(&tps->lock);
+	cd321x_port_sleep(cd321x);
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1926,6 +1935,8 @@ int tipd_init(struct tps6598x *tps)
 		ret = tps->data->connect(tps, status);
 		if (ret)
 			dev_err(tps->dev, "failed to register partner\n");
+	} else if (tps->data->probe_unplugged) {
+		tps->data->probe_unplugged(tps);
 	}
 
 	if (tps->irq) {
@@ -2057,6 +2068,7 @@ static const struct tipd_data tipd_cd321x_data = {
 	.read_power_status = tps6598x_read_power_status,
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
+	.probe_unplugged = cd321x_probe_unplugged,
 	.connect = cd321x_connect,
 };
 

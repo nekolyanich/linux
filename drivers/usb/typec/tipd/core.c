@@ -1730,7 +1730,11 @@ static int cd321x_init(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
-	/* also a re-initialisation on resume */
+	/*
+	 * Also a re-initialisation on resume, where the cable work (on
+	 * system_wq, not frozen) may run: take the lock it holds.
+	 */
+	guard(mutex)(&tps->lock);
 	cd321x->port_power = CD321X_PORT_UNKNOWN;
 	return 0;
 }

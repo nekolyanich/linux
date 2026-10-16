@@ -33,7 +33,7 @@ const CRC: usize = 0x16;
 const REVISION: usize = 0x1a;
 const PAYLOAD: usize = HEADER_SIZE;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Key {
     pub(crate) kind: u8,
     pub(crate) uuid: [u8; 16],
@@ -110,6 +110,8 @@ pub(crate) struct Store {
     /// called the newer, so the store stays read-only.
     conflicting_records: usize,
     repaired_records: usize,
+    /// Set with `xart_guard`: refuses writes to records Linux did not create.
+    guard: Option<crate::xart_guard::Guard>,
 }
 
 fn le32(bytes: &[u8], off: usize) -> u32 {
@@ -207,6 +209,7 @@ impl Store {
             duplicate_records: 0,
             conflicting_records: 0,
             repaired_records: 0,
+            guard: None,
         };
         store.scan()?;
         // Serving an empty or unrelated 6 MiB mapping is the failure mode that
@@ -408,6 +411,10 @@ impl Store {
             return Err(EINVAL);
         }
 
+        if let Some(guard) = self.guard.as_mut() {
+            guard.check(key, true)?;
+        }
+
         let old = self.find(key);
         // A new key skips the first free slot; a replacement reuses it.
         let fresh = self.find_free(usize::from(old.is_none())).ok_or(ENOSPC)?;
@@ -466,6 +473,9 @@ impl Store {
         if !self.writes_enabled {
             return Err(EROFS);
         }
+        if let Some(guard) = self.guard.as_mut() {
+            guard.check(key, false)?;
+        }
         // Every slot of the key goes, the shadowed older ones (a write whose
         // old slot could not be cleared) first and the newest last: a crash
         // part-way leaves the newest, so the key reads as before the delete.
@@ -500,6 +510,23 @@ impl Store {
     /// extent writable.
     pub(crate) fn writes_enabled(&self) -> bool {
         self.writes_enabled
+    }
+
+    /// Every live record's key, for the guard's view of what predates it.
+    pub(crate) fn live_keys(&self) -> Result<KVec<Key>> {
+        let mut keys = KVec::new();
+        for slot in self.slots.iter().filter(|slot| slot.used) {
+            keys.push(slot.key, GFP_KERNEL)?;
+        }
+        Ok(keys)
+    }
+
+    /// From now on, refuses the enclave's writes to records Linux did not
+    /// create. See [`crate::xart_guard`].
+    pub(crate) fn set_guard(&mut self, level: u8) -> Result<()> {
+        let keys = self.live_keys()?;
+        self.guard = Some(crate::xart_guard::Guard::open(level, keys));
+        Ok(())
     }
 
     /// Byte offset of the APFS-resolved gigalocker extent in the container.

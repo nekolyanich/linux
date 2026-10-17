@@ -239,6 +239,11 @@ struct apple_dart {
 
 	dma_addr_t dma_min;
 	dma_addr_t dma_max;
+	/*
+	 * apple,dma-offset: added to every IOVA before translation, for masters that
+	 * issue DMA above the DART input they see (the T602x SEP: BIT(40)).
+	 */
+	dma_addr_t dma_offset;
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
@@ -287,6 +292,7 @@ struct apple_dart_domain {
 
 	bool finalized;
 	u64 mask;
+	dma_addr_t dma_offset;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 
@@ -699,7 +705,8 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	if (!ops)
 		return 0;
 
-	return ops->iova_to_phys(ops, iova & dart_domain->mask);
+	return ops->iova_to_phys(ops, (iova + dart_domain->dma_offset) &
+				 dart_domain->mask);
 }
 
 static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -713,8 +720,9 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 	if (!ops)
 		return -ENODEV;
 
-	return ops->map_pages(ops, iova & dart_domain->mask, paddr, pgsize,
-			      pgcount, prot, gfp, mapped);
+	return ops->map_pages(ops, (iova + dart_domain->dma_offset) &
+			      dart_domain->mask, paddr, pgsize, pgcount, prot,
+			      gfp, mapped);
 }
 
 static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
@@ -725,8 +733,8 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
 
-	return ops->unmap_pages(ops, iova & dart_domain->mask, pgsize, pgcount,
-				gather);
+	return ops->unmap_pages(ops, (iova + dart_domain->dma_offset) &
+				dart_domain->mask, pgsize, pgcount, gather);
 }
 
 static void
@@ -777,13 +785,18 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
-	u32 ias = min_t(u32, dart->ias, fls64(cfg->dma_max));
 	dma_addr_t dma_max = cfg->dma_max;
+	u64 translated_max;
+	u32 ias;
 	int ret = 0;
 	int i, j;
 
 	if (dart->pgsize > PAGE_SIZE)
 		return -EINVAL;
+	/* the page tables cover the IOVAs as the DART sees them, offset included */
+	if (check_add_overflow((u64)dma_max, (u64)dart->dma_offset, &translated_max))
+		return -ERANGE;
+	ias = min_t(u32, dart->ias, fls64(translated_max));
 
 	mutex_lock(&dart_domain->init_lock);
 
@@ -853,6 +866,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	dart_domain->domain.geometry.aperture_start = cfg->dma_min;
 	dart_domain->domain.geometry.aperture_end = dma_max;
 	dart_domain->domain.geometry.force_aperture = true;
+	dart_domain->dma_offset = dart->dma_offset;
 
 	dart_domain->finalized = true;
 
@@ -1534,6 +1548,24 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 		dev_info(&pdev->dev, "Limiting DMA range to %pad..%pad\n",
 				&dart->dma_min, &dart->dma_max);
+	}
+
+	dart->dma_offset = 0;
+	ret = of_property_read_u64(dev->of_node, "apple,dma-offset",
+				   &dart->dma_offset);
+	if (ret == -EINVAL) {
+		dart->dma_offset = 0;
+		ret = 0;
+	} else if (ret) {
+		goto err_clk_disable;
+	} else if (dart->dma_offset > DMA_BIT_MASK(dart->ias) ||
+		   dart->dma_max > DMA_BIT_MASK(dart->ias) - dart->dma_offset) {
+		dev_err(dev, "Invalid DMA offset for ias=%u\n", dart->ias);
+		ret = -EINVAL;
+		goto err_clk_disable;
+	} else {
+		dev_info(dev, "DMA range %pad..%pad at DART offset %pad\n",
+			 &dart->dma_min, &dart->dma_max, &dart->dma_offset);
 	}
 
 	if (dart->num_streams > DART_MAX_STREAMS) {

@@ -534,7 +534,7 @@ impl SepData {
         self.sks_seal(&op, &body)
     }
 
-    fn sks_req_copy_keybag(&self, handle: crate::sks::KeyBagHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_copy_keybag(&self, handle: crate::sks::KeyBagHandle) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag();
         let mut body = image::Body::new();
         body.put_u32(0)?;
@@ -554,7 +554,7 @@ impl SepData {
     }
 
     /// `0x03` load key bag.
-    fn sks_req_load_keybag(&self, wrapped: &[u8]) -> Result<SksRequest> {
+    pub(crate) fn sks_req_load_keybag(&self, wrapped: &[u8]) -> Result<SksRequest> {
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -774,6 +774,18 @@ impl SepData {
     pub(crate) fn sks_send(&self, req: Result<SksRequest>) -> Option<SksOutcome> {
         match req {
             Ok(r) => self.sks_exchange(r.name, r.msg, &r.img),
+            Err(_) => None,
+        }
+    }
+
+    /// As [`Self::sks_send`], waiting at least `floor_ms` for the reply.
+    pub(crate) fn sks_send_patient(
+        &self,
+        req: Result<SksRequest>,
+        floor_ms: time::Msecs,
+    ) -> Option<SksOutcome> {
+        match req {
+            Ok(r) => self.sks_exchange_patient(r.name, r.msg, &r.img, floor_ms, true),
             Err(_) => None,
         }
     }

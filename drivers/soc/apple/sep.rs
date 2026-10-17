@@ -18,6 +18,7 @@ mod dt;
 mod fv;
 mod hwrng;
 mod image;
+mod key;
 mod keybag;
 mod keybag_identity;
 mod pm;
@@ -36,6 +37,7 @@ mod sks;
 mod store;
 mod transfer;
 mod trusted;
+mod userbag;
 mod xarm;
 mod xart_apfs;
 mod xart_store;
@@ -673,6 +675,10 @@ struct SepData {
 
     #[pin]
     bio_dev: Mutex<Option<shim::BioChardev>>,
+    #[pin]
+    key_dev: Mutex<Option<key::KeyChardev>>,
+    #[pin]
+    user_bags: Mutex<userbag::UserBags>,
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -889,6 +895,8 @@ impl SepData {
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
+                key_dev <- new_mutex!(None),
+                user_bags <- new_mutex!(userbag::UserBags::new()),
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -2137,6 +2145,8 @@ impl SepData {
         self.unregister_fv_kernel();
 
         let dev = self.bio_dev.lock().take();
+        drop(dev);
+        let dev = self.key_dev.lock().take();
         drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);

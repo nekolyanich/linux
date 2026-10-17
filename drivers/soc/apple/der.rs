@@ -158,3 +158,23 @@ pub(crate) fn octet_string_body(tlv: &[u8]) -> Option<&[u8]> {
         _ => None,
     }
 }
+
+/// A non-negative DER INTEGER that fits a u32.
+pub(crate) fn integer_u32(tlv: &[u8]) -> Option<u32> {
+    let body = match take_tlv(tlv) {
+        Some((TAG_INTEGER, body, [])) => body,
+        _ => return None,
+    };
+    // Negative, or empty.
+    if body.first()? & 0x80 != 0 {
+        return None;
+    }
+    let digits = match body {
+        [0, rest @ ..] if !rest.is_empty() => rest,
+        _ => body,
+    };
+    if digits.len() > 4 {
+        return None;
+    }
+    Some(digits.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b)))
+}

@@ -183,6 +183,15 @@ int sep_bio_capable_admin(void);
 __u64 sep_bio_monotonic_ns(void);
 __u64 sep_bio_boottime_ns(void);
 
+/* -- key_shim.c --------------------------------------------------------- */
+
+void *sep_key_register(const char *name, unsigned short mode, void *ctx,
+		       void *(*f_open)(void *, u32, int *),
+		       void (*f_release)(void *, void *),
+		       long (*f_ioctl)(void *, void *, unsigned int,
+				       unsigned long));
+void sep_key_unregister(void *dev);
+
 /* -- trusted_shim.c ---------------------------------------------------- */
 
 /*

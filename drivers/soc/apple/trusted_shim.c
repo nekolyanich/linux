@@ -85,7 +85,7 @@ static struct trusted_key_ops sep_tk_ops = {
 	.exit		= tk_exit,
 };
 
-static struct trusted_key_source sep_tk_source = {
+static struct trusted_key_source sep_tk_source __maybe_unused = {
 	.name	= sep_tk_name,
 	.ops	= &sep_tk_ops,
 };
@@ -103,12 +103,15 @@ int sep_tk_register(sep_tk_init_fn init, sep_tk_seal_fn seal,
 	rs_unseal = unseal;
 	rs_random = random;
 	rs_exit   = exit;
-	return register_trusted_key_source(&sep_tk_source);
+	/*
+	 * fairydust: the trusted-key core has no register_trusted_key_source()
+	 * (aurora's keys: trusted change is not ported): no "applesep" source.
+	 */
+	return -ENODEV;
 }
 
 void sep_tk_unregister(void)
 {
-	unregister_trusted_key_source(&sep_tk_source);
 	rs_init   = NULL;
 	rs_seal   = NULL;
 	rs_unseal = NULL;
@@ -122,12 +125,11 @@ void sep_tk_unregister(void)
  */
 int sep_tk_register_key_type(void)
 {
-	return register_key_type(&key_type_trusted);
+	return -ENODEV;
 }
 
 void sep_tk_unregister_key_type(void)
 {
-	unregister_key_type(&key_type_trusted);
 }
 
 /* Compile-time facts the Rust side bounds-checks against. */

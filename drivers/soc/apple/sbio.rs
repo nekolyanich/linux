@@ -1410,7 +1410,30 @@ impl SepData {
 
         // The match uses the plain 0x23->0x06->0x65 pipeline, with no SCRD step.
 
-        let outcome = self.verify_one_image();
+        // A rejected image (partial contact, a bad frame, an assessment the
+        // enclave refused) ends neither the verify nor, through libfprint's
+        // generic error, the user's attempt: ask them to hold still and take
+        // another image on the sensor that is already up.
+        let mut outcome = self.verify_one_image();
+        let mut images = 1;
+        while matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY))
+            && images < VERIFY_IMAGES
+            && bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
+        {
+            if bio::capture_guide(
+                &mut self.bio_session.lock(),
+                self.capture_epoch.load(Relaxed),
+                bio::Guidance::HoldStill,
+            ) {
+                self.bio_wake();
+            }
+            self.pace_between_captures();
+            outcome = self.verify_one_image();
+            images += 1;
+        }
+        if images > 1 {
+            dev_info!(self.dev, "verify: {} images taken for this verify\n", images);
+        }
         let _ = sensor::idle();
         sensor::power(false);
         self.note_capture_end();
@@ -1542,8 +1565,37 @@ impl SepData {
         }
         drop(capture);
 
-        let Some(assessment) = self.sbio_verify_step(&crate::sbio::sbio_image_assessment()) else {
-            return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        // A status answer to the assessment (seen: 0x130, mostly on a capture
+        // started with the finger already down) rejects this image, not the
+        // verify: report a retry, as for an image unusable for matching, so
+        // userspace asks for another touch instead of failing the attempt.
+        let op = crate::sbio::sbio_image_assessment();
+        let assessment = match self.sbio_transfer(&op) {
+            Ok(done) => match done.status.answered() {
+                Some(err) if err as u16 == crate::sbio::SBIO_STATUS_OK => done.payload,
+                Some(_) => {
+                    dev_warn!(
+                        self.dev,
+                        "verify: {} answered status {}: image rejected, asking for another touch\n",
+                        op.name(),
+                        done.status
+                    );
+                    return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+                }
+                None => {
+                    dev_err!(
+                        self.dev,
+                        "verify: {} answered status {}\n",
+                        op.name(),
+                        done.status
+                    );
+                    return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                }
+            },
+            Err(e) => {
+                dev_err!(self.dev, "verify: {} transfer failed ({:?})\n", op.name(), e);
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
         };
         if assessment.len() <= crate::sbio::ASSESS_USABLE_MATCH {
             dev_err!(

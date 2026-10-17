@@ -384,6 +384,8 @@ static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TOO_MANY);
 
 const ENROL_STATUS_RETRY: u32 = 5;
+// Images one verify takes at most when the enclave rejects one as unusable.
+const VERIFY_IMAGES: u32 = 3;
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);

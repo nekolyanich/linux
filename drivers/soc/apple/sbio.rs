@@ -1436,14 +1436,19 @@ impl SepData {
             && images < VERIFY_IMAGES
             && bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
         {
-            if bio::capture_guide(
-                &mut self.bio_session.lock(),
-                self.capture_epoch.load(Relaxed),
-                bio::Guidance::HoldStill,
-            ) {
+            // macOS takes the next image 25-140 ms after a discarded one, with
+            // the finger still down; only a second discard tells the user.
+            if images > 1
+                && bio::capture_guide(
+                    &mut self.bio_session.lock(),
+                    self.capture_epoch.load(Relaxed),
+                    bio::Guidance::HoldStill,
+                )
+            {
                 self.bio_wake();
             }
-            self.pace_between_captures();
+            let _ = sensor::idle();
+            let _ = self.await_sensor_state(sensor::STATE_IDLE, c"idle, before the next image");
             outcome = self.verify_one_image();
             images += 1;
         }

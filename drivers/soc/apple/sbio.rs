@@ -1451,11 +1451,8 @@ impl SepData {
             dev_info!(self.dev, "verify: {} images taken for this verify\n", images);
         }
         let _ = sensor::idle();
-        // Left up for the next verify of this open; powered down here only if
-        // the device was closed meanwhile (bio_release saw this worker running).
-        if !bio::is_open(&self.bio_session.lock()) {
-            self.power_down_sensor();
-        }
+        // Left up for the next verify, across closes of /dev/sep-bio (macOS
+        // registers it once per boot); sleep_prepare powers it down.
         self.note_capture_end();
 
         let definitive = matches!(
@@ -2976,14 +2973,7 @@ impl SepData {
     }
 
     pub(crate) fn bio_release(&self) {
-        {
-            let mut session = self.bio_session.lock();
-            bio::release(&mut session);
-            // A running worker powers the sensor down itself when it ends.
-            if !bio::worker_running(&session) {
-                self.power_down_sensor();
-            }
-        }
+        bio::release(&mut self.bio_session.lock());
         if let Some(dev) = self.bio_dev.lock().as_ref() {
             dev.wake();
         }

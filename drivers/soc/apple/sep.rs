@@ -720,10 +720,10 @@ struct SepData {
     // Enrol and verify work items between `capture_begin` and `capture_end`.
     captures_running: Atomic<u32>,
 
-    // The sensor is up, registered and idle from a verify: the next verify of
-    // the same open takes its image without bringing it up again (macOS
-    // registers it once per boot). Cleared when it is powered down: on the
-    // last close of /dev/sep-bio, before sleep, after an enrolment.
+    // The sensor is up, registered and idle from a verify: the next verify
+    // takes its image without bringing it up again (macOS registers it once
+    // per boot). Cleared when it is powered down: before sleep, after an
+    // enrolment.
     sensor_online: Atomic<bool>,
 
     // Signalled when an enrol or verify work item has stopped.

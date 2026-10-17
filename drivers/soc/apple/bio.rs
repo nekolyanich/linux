@@ -1027,13 +1027,3 @@ pub(crate) fn open(session: &mut Session) -> Result<()> {
 pub(crate) fn release(session: &mut Session) {
     session.reset();
 }
-
-/// /dev/sep-bio is open.
-pub(crate) fn is_open(session: &Session) -> bool {
-    session.open
-}
-
-/// An enrol or verify work item has not stopped yet.
-pub(crate) fn worker_running(session: &Session) -> bool {
-    session.worker_epoch.is_some()
-}

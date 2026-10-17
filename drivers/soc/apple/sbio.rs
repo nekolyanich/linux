@@ -1401,12 +1401,15 @@ impl SepData {
         self.settle_before_capture();
 
         // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
-        if !self.bring_sensor_online() {
+        // A sensor a previous verify of this open left up is used as it is.
+        let warm = self.sensor_online.load(Relaxed);
+        if !warm && !self.bring_sensor_online() {
             dev_err!(self.dev, "verify: the sensor did not come back online\n");
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
             return;
         }
+        self.sensor_online.store(true, Relaxed);
 
         // The match uses the plain 0x23->0x06->0x65 pipeline, with no SCRD step.
 
@@ -1415,6 +1418,19 @@ impl SepData {
         // generic error, the user's attempt: ask them to hold still and take
         // another image on the sensor that is already up.
         let mut outcome = self.verify_one_image();
+        if warm
+            && matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR))
+            && bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
+        {
+            // The kept-up sensor did not take the capture: bring it up afresh
+            // once, as every verify did before.
+            dev_info!(self.dev, "verify: the sensor left up did not capture; bringing it up again\n");
+            self.sensor_online.store(false, Relaxed);
+            if self.bring_sensor_online() {
+                self.sensor_online.store(true, Relaxed);
+                outcome = self.verify_one_image();
+            }
+        }
         let mut images = 1;
         while matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY))
             && images < VERIFY_IMAGES
@@ -1435,7 +1451,11 @@ impl SepData {
             dev_info!(self.dev, "verify: {} images taken for this verify\n", images);
         }
         let _ = sensor::idle();
-        sensor::power(false);
+        // Left up for the next verify of this open; powered down here only if
+        // the device was closed meanwhile (bio_release saw this worker running).
+        if !bio::is_open(&self.bio_session.lock()) {
+            self.power_down_sensor();
+        }
         self.note_capture_end();
 
         let definitive = matches!(
@@ -1757,6 +1777,7 @@ impl SepData {
 
         let _ = sensor::idle();
         sensor::power(false);
+        self.sensor_online.store(false, Relaxed);
         self.note_capture_end();
 
         if let Some(result) = outcome {
@@ -2955,9 +2976,24 @@ impl SepData {
     }
 
     pub(crate) fn bio_release(&self) {
-        bio::release(&mut self.bio_session.lock());
+        {
+            let mut session = self.bio_session.lock();
+            bio::release(&mut session);
+            // A running worker powers the sensor down itself when it ends.
+            if !bio::worker_running(&session) {
+                self.power_down_sensor();
+            }
+        }
         if let Some(dev) = self.bio_dev.lock().as_ref() {
             dev.wake();
+        }
+    }
+
+    /// Powers down a sensor a verify left up.
+    fn power_down_sensor(&self) {
+        if self.sensor_online.xchg(false, Relaxed) {
+            let _ = sensor::idle();
+            sensor::power(false);
         }
     }
 
@@ -3052,6 +3088,8 @@ impl SepData {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
             waited += 10;
         }
+        // Nothing is capturing: a sensor left up does not stay powered across sleep.
+        self.power_down_sensor();
         Ok(())
     }
 

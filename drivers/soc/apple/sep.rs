@@ -720,6 +720,12 @@ struct SepData {
     // Enrol and verify work items between `capture_begin` and `capture_end`.
     captures_running: Atomic<u32>,
 
+    // The sensor is up, registered and idle from a verify: the next verify of
+    // the same open takes its image without bringing it up again (macOS
+    // registers it once per boot). Cleared when it is powered down: on the
+    // last close of /dev/sep-bio, before sleep, after an enrolment.
+    sensor_online: Atomic<bool>,
+
     // Signalled when an enrol or verify work item has stopped.
     #[pin]
     worker_gone: CondVar,
@@ -902,6 +908,7 @@ impl SepData {
                 suspending: Atomic::new(false),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
+                sensor_online: Atomic::new(false),
                 worker_gone <- new_condvar!("SepData::worker_gone"),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),

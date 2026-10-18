@@ -1398,6 +1398,11 @@ static const struct component_ops dcp_comp_ops = {
 	.unbind	= dcp_comp_unbind,
 };
 
+static void dcp_leave_switch(void *data)
+{
+	dp_switch_remove_dcp(data);
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
 	enum dcp_firmware_version fw_compat;
@@ -1478,9 +1483,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		if (of_property_read_u32(dev->of_node, "mux-index", &dcp->xbar_index))
 			return dev_err_probe(dev, -EINVAL,
 					     "dp-switch DCP without mux-index\n");
-		ret = dp_switch_add_dcp(dcp);
-		if (ret)
-			return dev_err_probe(dev, ret, "dp-switch is full\n");
 	}
 	/* selected after connectTo, see dcp_dptx_connect() */
 	if (dcp->dptx_tunneled &&
@@ -1568,15 +1570,25 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		}
 	}
 
+	/*
+	 * Join the display switch last, once nothing above can fail or defer:
+	 * the switch keeps a pointer to this devm allocation until the action
+	 * removes it.
+	 */
+	if (dcp->dp_switch) {
+		ret = dp_switch_add_dcp(dcp);
+		if (ret)
+			return dev_err_probe(dev, ret, "dp-switch is full\n");
+		ret = devm_add_action_or_reset(dev, dcp_leave_switch, dcp);
+		if (ret)
+			return ret;
+	}
+
 	return component_add(&pdev->dev, &dcp_comp_ops);
 }
 
 static void dcp_platform_remove(struct platform_device *pdev)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-	if (dcp && dcp->dp_switch)
-		dp_switch_remove_dcp(dcp);
 	component_del(&pdev->dev, &dcp_comp_ops);
 
 	destroy_piodma_device(dcp);

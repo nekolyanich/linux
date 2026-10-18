@@ -29,6 +29,11 @@
  * is enrolled anew, its operations fail with EKEYREVOKED. Gated keys need the
  * opener's fingers in the enclave: INFO's SEP_KEY_INFO_BIOMETRY says whether
  * this uid can have them.
+ *
+ * Every enrolled finger, whoever enrolled it through /dev/sep-bio, lives under
+ * one SEP user, 1000, and only uid 1000 has gated keys: any enrolled finger
+ * credits uid 1000's gated keys. On a machine with several people's fingers
+ * enrolled, a gated key proves "an enrolled finger", not "this person's".
  */
 
 #pragma once

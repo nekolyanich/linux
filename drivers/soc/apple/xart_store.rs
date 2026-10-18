@@ -101,8 +101,9 @@ pub(crate) struct Store {
     /// Records under a key this driver does not know: someone else's (a newer
     /// macOS, another format), never written over or beside.
     foreign_records: usize,
-    /// Malformed records with no valid copy of their key: maybe the only copy
-    /// of something, so never cleared, and the store stays read-only.
+    /// Malformed records with no valid copy of their key, or with a length no
+    /// record of ours has: maybe the only copy of something, so never cleared,
+    /// and the store stays read-only.
     unbacked_records: usize,
     duplicate_records: usize,
     /// Duplicates at one revision with different contents: no record can be
@@ -263,10 +264,14 @@ impl Store {
                 self.foreign_records += 1;
                 continue;
             }
-            let valid = (1..=MAX_VALUE).contains(&len)
-                && crc32_ieee(&raw[PAYLOAD..PAYLOAD + len.min(MAX_VALUE)]) == crc;
-
-            if !valid {
+            if !(1..=MAX_VALUE).contains(&len) {
+                // Not a torn write of ours (we never write such a length), and
+                // maybe a record this driver cannot read: never cleared.
+                self.malformed_records += 1;
+                self.unbacked_records += 1;
+                continue;
+            }
+            if crc32_ieee(&raw[PAYLOAD..PAYLOAD + len]) != crc {
                 self.malformed_records += 1;
                 malformed.push(key, GFP_KERNEL)?;
                 continue;
@@ -298,7 +303,7 @@ impl Store {
             }
         }
 
-        self.unbacked_records = malformed.iter().filter(|k| self.find(k).is_none()).count();
+        self.unbacked_records += malformed.iter().filter(|k| self.find(k).is_none()).count();
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
         Ok(())
     }

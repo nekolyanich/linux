@@ -106,7 +106,8 @@ struct sep_bio_delete {
  * Device attestation of key possession: the enclave signs 'challenge' with the
  * machine ref-key (ECDSA-P256 over the challenge as the pre-computed digest) and
  * returns the DER signature and public point. The private key never leaves the
- * enclave.
+ * enclave. Needs CAP_SYS_ADMIN: the challenge is signed as it is, with no
+ * domain separation yet.
  */
 struct sep_bio_attest {
   __u32 sig_len;                              /* out: DER signature length */

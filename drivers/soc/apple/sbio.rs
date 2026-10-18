@@ -3284,6 +3284,14 @@ impl SepData {
     }
 
     fn bio_attest(&self, arg: usize) -> Result<bio::Handled> {
+        // The machine ref key signs any 32 bytes here, raw, as the digest. It
+        // is the trusted-keys seal key too, and nothing separates what it
+        // signs here from what else may come to trust its signature: root
+        // only. TODO: domain separation (sign a hash of a fixed context
+        // string and the challenge, or a key of its own for attestation).
+        if !shim::capable_admin() {
+            return Err(EPERM);
+        }
         let user = kernel::uaccess::UserPtr::from_addr(arg);
         let req: bio::Attest =
             kernel::uaccess::UserSlice::new(user, core::mem::size_of::<bio::Attest>())

@@ -17,6 +17,7 @@
 #include <linux/fs_struct.h>
 #include <linux/magic.h>
 #include <linux/mount.h>
+#include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
@@ -186,6 +187,12 @@ static int rename_into(struct file *dir, struct file *tmpf, const char *name)
  * next boot (an initramfs, or /var/lib not mounted yet), and for the driver's
  * keybags a record that does not last orphans what it names.
  */
+/*
+ * One replace at a time, driver-wide: two of one path would share the tmp,
+ * and one could truncate it while the other renames it into place.
+ */
+static DEFINE_MUTEX(sep_store_replace_lock);
+
 int sep_store_replace(const char *path, const void *buf, size_t len)
 {
 	const struct cred *old;
@@ -195,6 +202,7 @@ int sep_store_replace(const char *path, const void *buf, size_t len)
 	struct path root;
 	char *dpath, *tmp;
 	unsigned long magic;
+	bool rename_tried = false;
 	int err;
 
 	name = strrchr(path, '/');
@@ -209,6 +217,7 @@ int sep_store_replace(const char *path, const void *buf, size_t len)
 	}
 	name++;
 
+	mutex_lock(&sep_store_replace_lock);
 	task_lock(&init_task);
 	get_fs_root(init_task.fs, &root);
 	task_unlock(&init_task);
@@ -233,9 +242,12 @@ int sep_store_replace(const char *path, const void *buf, size_t len)
 	err = write_all(tmpf, buf, len);
 	if (!err)
 		err = vfs_fsync(tmpf, 0);
-	if (!err)
+	if (!err) {
+		/* From here the tmp's dentry may be the live file: never truncated. */
+		rename_tried = true;
 		err = rename_into(dir, tmpf, name);
-	if (err)
+	}
+	if (err && !rename_tried)
 		/* Best effort: the leftover may hold a secret. */
 		vfs_truncate(&tmpf->f_path, 0);
 	filp_close(tmpf, NULL);
@@ -257,6 +269,7 @@ out_dir:
 out_creds:
 	revert_creds(old);
 	path_put(&root);
+	mutex_unlock(&sep_store_replace_lock);
 out_free:
 	if (kern)
 		put_cred(kern);

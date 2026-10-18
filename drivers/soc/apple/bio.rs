@@ -426,6 +426,8 @@ pub(crate) struct Session {
     token: Option<ResultToken>,
     /// The /dev/sep-key file whose AUTH holds the session, if one does.
     key_auth: Option<u64>,
+    /// That AUTH's opener: uid and task name, for the `touch` attribute.
+    key_auth_who: Option<(u32, [u8; 16])>,
 }
 
 impl Session {
@@ -439,6 +441,7 @@ impl Session {
             enrol_stage_unseen: false,
             token: None,
             key_auth: None,
+            key_auth_who: None,
         }
     }
 
@@ -450,6 +453,7 @@ impl Session {
         self.enrol_stage_unseen = false;
         self.token = None;
         self.key_auth = None;
+        self.key_auth_who = None;
     }
 
     fn start_worker(&mut self) -> Result<()> {
@@ -968,10 +972,29 @@ pub(crate) enum KeyAuthState {
 /// A /dev/sep-key AUTH takes the session as an open of /dev/sep-bio does
 /// (EBUSY while that is open or a capture is still on its way out), for the
 /// file `owner`, until [`release`].
-pub(crate) fn key_auth_open(session: &mut Session, owner: u64) -> Result<()> {
+pub(crate) fn key_auth_open(session: &mut Session, owner: u64, uid: u32, comm: [u8; 16]) -> Result<()> {
     open(session)?;
     session.key_auth = Some(owner);
+    session.key_auth_who = Some((uid, comm));
     Ok(())
+}
+
+/// What the `touch` attribute shows for the session.
+pub(crate) enum TouchState {
+    Idle,
+    Verify { guide: Guidance, key: Option<(u32, [u8; 16])> },
+    Enrol { guide: Guidance },
+}
+
+pub(crate) fn touch_state(session: &Session) -> TouchState {
+    match &session.op {
+        Op::Verify { terminal: None, guidance, .. } => TouchState::Verify {
+            guide: *guidance,
+            key: session.key_auth_who,
+        },
+        Op::Enrol { terminal: None, guidance, .. } => TouchState::Enrol { guide: *guidance },
+        _ => TouchState::Idle,
+    }
 }
 
 /// Then starts the verify on it, if `owner` still holds it (a remove resets

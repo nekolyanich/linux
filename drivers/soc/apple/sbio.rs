@@ -288,10 +288,19 @@ impl SepData {
         self.bio_wake();
     }
 
-    fn bio_wake(&self) {
+    /// Wakes /dev/sep-bio's pollers and updates the `touch` attribute. Never
+    /// called with `bio_session` held.
+    pub(crate) fn bio_wake(&self) {
         if let Some(dev) = self.bio_dev.lock().as_ref() {
             dev.wake();
         }
+        self.touch_update();
+    }
+
+    /// The `touch` attribute from the session as it is now.
+    pub(crate) fn touch_update(&self) {
+        let state = bio::touch_state(&self.bio_session.lock());
+        crate::touch::publish(state);
     }
 
     pub(crate) fn attach_sensor(&self) {
@@ -2994,9 +3003,7 @@ impl SepData {
 
     pub(crate) fn bio_release(&self) {
         bio::release(&mut self.bio_session.lock());
-        if let Some(dev) = self.bio_dev.lock().as_ref() {
-            dev.wake();
-        }
+        self.bio_wake();
     }
 
     /// Powers down a sensor a verify left up.
@@ -3264,6 +3271,9 @@ impl SepData {
 
         if handled.wake {
             self.bio_wake();
+        } else if handled.start_verify || handled.start_enrol {
+            // a capture starts: the sensor waits for a finger from now
+            self.touch_update();
         }
         Ok(handled)
     }

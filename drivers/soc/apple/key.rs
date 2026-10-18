@@ -729,9 +729,7 @@ impl SepData {
             };
             auth.pending = false;
             if woke {
-                if let Some(dev) = self.bio_dev.lock().as_ref() {
-                    dev.wake();
-                }
+                self.bio_wake();
             }
         }
         self.key_auth_forget(auth);
@@ -774,7 +772,7 @@ impl SepData {
             if self.shutting_down.load(Relaxed) {
                 return Err(ENODEV);
             }
-            crate::bio::key_auth_open(&mut session, file.id)?;
+            crate::bio::key_auth_open(&mut session, file.id, file.uid, crate::touch::current_comm())?;
         }
         let give_back = |sep: &SepData| crate::bio::release(&mut sep.bio_session.lock());
         if let Err(e) = self.prepare_bio_open() {
@@ -824,6 +822,8 @@ impl SepData {
             let _ = self.scrd_command(&crate::scrd::scrd_context_destroy(&acm));
             return Err(e);
         }
+        // the sensor waits for this file's finger from now
+        self.touch_update();
         *auth = AuthState {
             acm: Some(acm),
             pending: true,
@@ -862,9 +862,7 @@ impl SepData {
             };
             if let Some((state, at)) = outcome {
                 auth.pending = false;
-                if let Some(dev) = self.bio_dev.lock().as_ref() {
-                    dev.wake();
-                }
+                self.bio_wake();
                 match state {
                     crate::bio::KeyAuthState::Matched => {
                         // from the match, not from this poll

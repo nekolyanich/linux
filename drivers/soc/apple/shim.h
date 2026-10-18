@@ -228,4 +228,10 @@ unsigned char *sep_tk_blob_ptr(struct trusted_key_payload *p);
 unsigned int sep_tk_blob_len(const struct trusted_key_payload *p);
 void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 
+/* touch_shim.c */
+int sep_touch_register(struct device *dev);
+void sep_touch_unregister(void);
+void sep_touch_set(const char *line, size_t len);
+size_t sep_current_comm(char *buf, size_t cap);
+
 #endif /* SEP_SHIM_H */

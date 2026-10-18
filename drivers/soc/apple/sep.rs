@@ -34,6 +34,7 @@ mod sensor;
 mod shim;
 mod shmem;
 mod sks;
+mod touch;
 mod store;
 mod transfer;
 mod trusted;
@@ -2148,6 +2149,7 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        touch::unregister();
         pm::unregister();
         // Release any capture start still held for a resume that will not be
         // reported now.
@@ -2414,6 +2416,9 @@ impl platform::Driver for SepDriver {
         // from "pending" on. Diagnostics are not worth failing the probe for.
         if let Err(e) = diag::register(dev, data.profile, data.xart_writable()) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
+        }
+        if let Err(e) = touch::register(dev) {
+            dev_warn!(dev, "touch attribute: {:?}\n", e);
         }
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);

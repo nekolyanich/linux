@@ -101,36 +101,76 @@ void *sep_store_open_block(const char *path, int writable)
 }
 
 /*
- * The temporary of sep_store_replace(): created fresh, or a leftover of an
- * earlier replace cut short, which is reused only if it still looks like one
- * (a root-only regular file with no other link) and is emptied first.
+ * Removes the leftover tmp @tmpname from @dir by name: only a regular file,
+ * and never the same inode as the target @name (on 9p a rename that took
+ * effect on the server but reported an error leaves the tmp's name on the
+ * live file). Returns 0 once it is gone, or an error.
  */
-static struct file *open_tmp(const struct path *root, const char *tmp)
+static int unlink_tmp(struct file *dir, const char *tmpname, const char *name)
 {
-	const int flags = O_WRONLY | O_NOFOLLOW | O_LARGEFILE;
-	struct inode *inode;
+	struct mnt_idmap *idmap = mnt_idmap(dir->f_path.mnt);
+	struct dentry *parent = dir->f_path.dentry;
+	struct dentry *d, *t;
+	struct inode *di, *ti;
+	int err;
+
+	err = mnt_want_write(dir->f_path.mnt);
+	if (err)
+		return err;
+	d = start_removing(idmap, parent, &QSTR(tmpname));
+	if (IS_ERR(d)) {
+		err = PTR_ERR(d);
+		goto out_drop;
+	}
+	di = d_inode(d);
+	if (!d_is_reg(d)) {
+		err = -EEXIST;
+		goto out_end;
+	}
+	/* The parent is locked: the target cannot change meanwhile. */
+	t = lookup_noperm(&QSTR(name), parent);
+	if (IS_ERR(t)) {
+		err = PTR_ERR(t);
+		goto out_end;
+	}
+	ti = d_inode(t);
+	if (ti && (ti == di || (ti->i_sb == di->i_sb && ti->i_ino == di->i_ino)))
+		err = -EEXIST;
+	dput(t);
+	if (err)
+		goto out_end;
+	err = security_path_unlink(&dir->f_path, d);
+	if (!err)
+		err = vfs_unlink(idmap, d_inode(parent), d, NULL);
+out_end:
+	end_removing(d);
+out_drop:
+	mnt_drop_write(dir->f_path.mnt);
+	if (err)
+		pr_err("apple-sep: cannot remove the leftover %s (%d)\n", tmpname, err);
+	return err;
+}
+
+/*
+ * The temporary of sep_store_replace(), always created fresh (O_EXCL): a
+ * leftover of an earlier replace cut short is removed first. Its owner and
+ * mode are not checked, as legacy 9p reports every file as uid -2.
+ */
+static struct file *open_tmp(const struct path *root, struct file *dir,
+			     const char *tmp, const char *tmpname,
+			     const char *name)
+{
+	const int flags = O_WRONLY | O_NOFOLLOW | O_LARGEFILE | O_CREAT | O_EXCL;
 	struct file *f;
 	int err;
 
-	f = file_open_root(root, tmp, flags | O_CREAT | O_EXCL, 0600);
+	f = file_open_root(root, tmp, flags, 0600);
 	if (PTR_ERR_OR_ZERO(f) != -EEXIST)
 		return f;
-
-	f = file_open_root(root, tmp, flags, 0);
-	if (IS_ERR(f))
-		return f;
-	inode = file_inode(f);
-	if (!S_ISREG(inode->i_mode) || !uid_eq(inode->i_uid, GLOBAL_ROOT_UID) ||
-	    inode->i_nlink != 1 || (inode->i_mode & 0077)) {
-		filp_close(f, NULL);
-		return ERR_PTR(-EEXIST);
-	}
-	err = vfs_truncate(&f->f_path, 0);
-	if (err) {
-		filp_close(f, NULL);
+	err = unlink_tmp(dir, tmpname, name);
+	if (err)
 		return ERR_PTR(err);
-	}
-	return f;
+	return file_open_root(root, tmp, flags, 0600);
 }
 
 static int write_all(struct file *f, const void *buf, size_t len)
@@ -250,7 +290,7 @@ int sep_store_replace(const char *path, const void *buf, size_t len,
 		goto out_dir;
 	}
 
-	tmpf = open_tmp(&root, tmp);
+	tmpf = open_tmp(&root, dir, tmp, strrchr(tmp, '/') + 1, name);
 	if (IS_ERR(tmpf)) {
 		err = PTR_ERR(tmpf);
 		goto out_dir;

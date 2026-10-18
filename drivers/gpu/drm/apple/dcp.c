@@ -256,10 +256,9 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
+	/* dcp_hotplug() drops the EDID, under mode_config.mutex */
 	if (dcp->connector) {
 		dcp->connector->connected = 0;
-		drm_edid_free(dcp->connector->drm_edid);
-		dcp->connector->drm_edid = NULL;
 		schedule_work(&dcp->connector->hotplug_wq);
 	}
 	complete(&dcp->start_done);

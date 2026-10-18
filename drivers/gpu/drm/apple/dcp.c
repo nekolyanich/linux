@@ -1422,6 +1422,16 @@ static void dcp_leave_switch(void *data)
 	dp_switch_remove_dcp(data);
 }
 
+/* the crossbar outlives appledrm: a route left selected blocks the next probe */
+static void dcp_deselect_fixed_xbar(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->fixed_xbar_selected)
+		mux_control_deselect(dcp->fixed_xbar);
+	dcp->fixed_xbar_selected = false;
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
 	enum dcp_firmware_version fw_compat;
@@ -1565,7 +1575,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+			dcp->fixed_xbar = dcp->xbar;
 			dcp->fixed_xbar_selected = !ret;
+			/* after dcp_leave_switch(), which may select it again */
+			ret = devm_add_action_or_reset(dev, dcp_deselect_fixed_xbar,
+						       dcp);
+			if (ret)
+				return ret;
 
 			/*
 			 * Switch atcphy to DP-only. should move to a Macbook Pro

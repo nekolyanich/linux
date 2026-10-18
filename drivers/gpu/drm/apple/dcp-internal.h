@@ -282,6 +282,7 @@ struct apple_dcp {
 		u32 dptx_phy, dptx_core, dptx_die;
 	} fixed;
 	/* the fixed port's crossbar route, selected at probe */
+	struct mux_control *fixed_xbar;
 	bool fixed_xbar_selected;
 	/* DP IN of a USB4 router: no local phy, the stream is tunnelled */
 	bool dptx_tunneled;

@@ -239,9 +239,16 @@ const IOC_AUTH: u32 = _IOW::<Auth>(MAGIC, 0x06);
 const IOC_AUTH_POLL: u32 = _IOR::<AuthPoll>(MAGIC, 0x07);
 const IOC_AUTH_CANCEL: u32 = _IO(MAGIC, 0x08);
 
-/// A struct's byte image, read from and written back to userspace.
+/// A struct's byte image, read from and written back to userspace. It holds
+/// an ECDH secret on its way out, so it is wiped when dropped.
 struct Image {
     bytes: KVec<u8>,
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.bytes);
+    }
 }
 
 impl Image {

@@ -204,10 +204,17 @@ fn write(
     shim::replace_file(path.as_cstr(), rec)
 }
 
-/// What the enclave answered an operation on the user's bag.
+/// What the enclave answered an operation on a bag: for an ECDH, the shared
+/// secret, so the body is wiped when dropped.
 pub(crate) struct OpReply {
     pub(crate) status: i8,
     pub(crate) body: KVec<u8>,
+}
+
+impl Drop for OpReply {
+    fn drop(&mut self) {
+        image::wipe(&mut self.body);
+    }
 }
 
 impl SepData {

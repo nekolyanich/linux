@@ -190,10 +190,11 @@ static int write_all(struct file *f, const void *buf, size_t len)
 
 /*
  * Renames @tmpf's dentry, which must sit in @dir, to @name in @dir; @flags
- * is 0 or RENAME_NOREPLACE.
+ * is 0 or RENAME_NOREPLACE. *@called says whether vfs_rename() ran: until it
+ * does the tmp is still only the tmp.
  */
 static int rename_into(struct file *dir, struct file *tmpf, const char *name,
-		       unsigned int flags)
+		       unsigned int flags, bool *called)
 {
 	struct renamedata rd = {
 		.mnt_idmap = mnt_idmap(dir->f_path.mnt),
@@ -219,8 +220,10 @@ static int rename_into(struct file *dir, struct file *tmpf, const char *name,
 		rd.flags = 0;
 		err = security_path_rename(&dir->f_path, rd.old_dentry,
 					   &dir->f_path, rd.new_dentry, 0);
-		if (!err)
+		if (!err) {
+			*called = true;
 			err = vfs_rename(&rd);
+		}
 		end_renaming(&rd);
 	}
 	mnt_drop_write(dir->f_path.mnt);
@@ -258,7 +261,7 @@ int sep_store_replace(const char *path, const void *buf, size_t len,
 	struct path root;
 	char *dpath, *tmp;
 	unsigned long magic;
-	bool rename_tried = false;
+	bool rename_called = false;
 	int err;
 
 	name = strrchr(path, '/');
@@ -298,16 +301,17 @@ int sep_store_replace(const char *path, const void *buf, size_t len,
 	err = write_all(tmpf, buf, len);
 	if (!err)
 		err = vfs_fsync(tmpf, 0);
-	if (!err) {
-		/* From here the tmp's dentry may be the live file: never truncated. */
-		rename_tried = true;
+	if (!err)
 		err = rename_into(dir, tmpf, name,
-				  noreplace ? RENAME_NOREPLACE : 0);
-	}
-	if (err && !rename_tried)
-		/* Best effort: the leftover may hold a secret. */
-		vfs_truncate(&tmpf->f_path, 0);
+				  noreplace ? RENAME_NOREPLACE : 0, &rename_called);
 	filp_close(tmpf, NULL);
+	/*
+	 * A failed replace removes its tmp, which may hold a secret, unless
+	 * vfs_rename() ran: then its name may be the live file's (9p), and the
+	 * next replace sorts it out with the same inode check.
+	 */
+	if (err && !rename_called)
+		unlink_tmp(dir, strrchr(tmp, '/') + 1, name);
 	/*
 	 * The rename is done, so the new record is the file now: a directory
 	 * that cannot be synced (9p's has no fsync and answers -EINVAL) is

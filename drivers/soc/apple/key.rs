@@ -704,6 +704,13 @@ impl SepData {
         let acm = self.key_acm_create()?;
         let started = {
             let mut session = self.bio_session.lock();
+            // As an open of /dev/sep-bio: the last capture may still be on
+            // its way out.
+            if let Err(e) = self.wait_for_worker_exit(&mut session, true) {
+                drop(session);
+                let _ = self.scrd_command(&crate::scrd::scrd_context_destroy(&acm));
+                return Err(e);
+            }
             let index = self.bio_index.lock();
             let mut ctx = crate::bio::Context {
                 session: &mut session,

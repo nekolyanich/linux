@@ -3040,7 +3040,7 @@ impl SepData {
     /// so an open or a start straight after either would be refused with
     /// EBUSY, which the caller cannot tell from a device in use. If it has
     /// not stopped in time, the caller refuses as before.
-    fn wait_for_worker_exit(
+    pub(crate) fn wait_for_worker_exit(
         &self,
         session: &mut MutexGuard<'_, bio::Session>,
         opening: bool,

@@ -974,8 +974,12 @@ pub(crate) fn key_auth_open(session: &mut Session, owner: u64) -> Result<()> {
     Ok(())
 }
 
-/// Then starts the verify on it; the caller queues the work item.
-pub(crate) fn key_auth_begin(ctx: &mut Context<'_>) -> Result<()> {
+/// Then starts the verify on it, if `owner` still holds it (a remove resets
+/// the session meanwhile); the caller queues the work item.
+pub(crate) fn key_auth_begin(ctx: &mut Context<'_>, owner: u64) -> Result<()> {
+    if !ctx.session.open || ctx.session.key_auth != Some(owner) {
+        return Err(ENODEV);
+    }
     require_sensor(ctx.sensor_present)?;
     if ctx.index.total() == 0 {
         return Err(crate::key::errno::nokey());

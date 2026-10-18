@@ -3015,6 +3015,9 @@ impl SepData {
         let mut session = self.bio_session.lock();
         if self.suspending.load(Relaxed) {
             let woke = bio::abort_capture(&mut session);
+            if woke {
+                self.key_auth_settle(&mut session);
+            }
             drop(session);
             if woke {
                 self.bio_wake();
@@ -3075,7 +3078,12 @@ impl SepData {
         let woke = {
             let mut session = self.bio_session.lock();
             self.suspending.store(true, Relaxed);
-            bio::abort_capture(&mut session)
+            let woke = bio::abort_capture(&mut session);
+            if woke {
+                // a /dev/sep-key AUTH gives the sensor back here too
+                self.key_auth_settle(&mut session);
+            }
+            woke
         };
         if woke {
             dev_info!(

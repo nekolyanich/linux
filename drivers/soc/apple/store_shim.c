@@ -320,9 +320,13 @@ int sep_store_replace(const char *path, const void *buf, size_t len,
 	if (!err) {
 		int serr = vfs_fsync(dir, 0);
 
-		if (serr)
-			pr_warn_ratelimited("apple-sep: %s: directory sync failed (%d); the file is replaced\n",
+		/* -EINVAL, -EOPNOTSUPP: this filesystem has no directory sync */
+		if (serr == -EINVAL || serr == -EOPNOTSUPP)
+			pr_warn_ratelimited("apple-sep: %s: no directory sync (%d); the file is replaced\n",
 					    dpath, serr);
+		else if (serr)
+			pr_err_ratelimited("apple-sep: %s: directory sync failed (%d); the file is replaced\n",
+					   dpath, serr);
 	}
 
 out_dir:

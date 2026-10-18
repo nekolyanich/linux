@@ -137,7 +137,10 @@ fn read(uid: u32) -> Result<Option<StoredBag>> {
     let path = BagPath::new(uid)?;
     let f = match shim::StoreFile::open_readonly(path.as_cstr()) {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        // Only a missing file is "no bag": any other failure to open says
+        // nothing about whether one exists.
+        Err(e) if e == ENOENT => return Ok(None),
+        Err(e) => return Err(e),
     };
     let size = f.size()? as usize;
     if size == 0 {

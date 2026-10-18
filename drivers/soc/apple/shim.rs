@@ -6,7 +6,6 @@
 use kernel::prelude::*;
 
 extern "C" {
-    fn sep_store_open(path: *const c_char) -> *mut c_void;
     fn sep_store_open_host(path: *const c_char, created: *mut bool) -> *mut c_void;
     fn sep_store_open_trunc(path: *const c_char) -> *mut c_void;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
@@ -48,17 +47,8 @@ fn result_of(ret: c_long) -> Result<usize> {
 }
 
 impl StoreFile {
-    pub(crate) fn open(path: &CStr) -> Result<StoreFile> {
-        // SAFETY: `path` is NUL-terminated; the shim returns NULL on failure.
-        let handle = unsafe { sep_store_open(path.as_char_ptr()) };
-        if handle.is_null() {
-            return Err(ENOENT);
-        }
-        Ok(StoreFile { handle })
-    }
-
-    /// Opens the file like [`StoreFile::open`], and also reports whether this
-    /// call created it.
+    /// Opens the file, creating it (mode 0600) if absent, and reports whether
+    /// this call created it.
     pub(crate) fn open_host(path: &CStr) -> Result<(StoreFile, bool)> {
         let mut created = false;
         // SAFETY: `path` is NUL-terminated and `created` is valid for writes
@@ -71,30 +61,31 @@ impl StoreFile {
     }
 
     pub(crate) fn open_trunc(path: &CStr) -> Result<StoreFile> {
-        // SAFETY: `path` is NUL-terminated; the shim returns NULL on failure.
-        let handle = unsafe { sep_store_open_trunc(path.as_char_ptr()) };
-        if handle.is_null() {
-            return Err(ENOENT);
-        }
+        // SAFETY: `path` is NUL-terminated; the shim returns a live file or an
+        // error pointer.
+        let handle =
+            kernel::error::from_err_ptr(unsafe { sep_store_open_trunc(path.as_char_ptr()) })?;
         Ok(StoreFile { handle })
     }
 
+    /// Opens an existing file read-only. `ENOENT` means the file is missing;
+    /// any other error means it could not be opened, and says nothing about
+    /// whether it exists.
     pub(crate) fn open_readonly(path: &CStr) -> Result<StoreFile> {
-        // SAFETY: `path` is NUL-terminated; the shim returns NULL on failure.
-        let handle = unsafe { sep_store_open_ro(path.as_char_ptr()) };
-        if handle.is_null() {
-            return Err(ENOENT);
-        }
+        // SAFETY: `path` is NUL-terminated; the shim returns a live file or an
+        // error pointer.
+        let handle =
+            kernel::error::from_err_ptr(unsafe { sep_store_open_ro(path.as_char_ptr()) })?;
         Ok(StoreFile { handle })
     }
 
     pub(crate) fn open_block(path: &CStr, writable: bool) -> Result<StoreFile> {
         // SAFETY: `path` is NUL-terminated; the shim opens read-only unless
-        // explicitly asked to write, and rejects writes to a read-only device.
-        let handle = unsafe { sep_store_open_block(path.as_char_ptr(), c_int::from(writable)) };
-        if handle.is_null() {
-            return Err(ENODEV);
-        }
+        // explicitly asked to write, rejects writes to a read-only device, and
+        // returns a live file or an error pointer.
+        let handle = kernel::error::from_err_ptr(unsafe {
+            sep_store_open_block(path.as_char_ptr(), c_int::from(writable))
+        })?;
         Ok(StoreFile { handle })
     }
 

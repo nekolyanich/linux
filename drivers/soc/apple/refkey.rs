@@ -177,22 +177,34 @@ impl SepData {
             return;
         }
 
-        if let Ok(f) = shim::StoreFile::open_readonly(path) {
-            let sz = f.size().unwrap_or(0);
-            if (1..=8192).contains(&sz) {
-                let mut blob: KVec<u8> = KVec::new();
-                if blob.resize(sz as usize, 0u8, GFP_KERNEL).is_ok()
-                    && f.read_exact(0, &mut blob).is_ok()
-                    && self.cache_machine_refkey(blob)
-                {
-                    return;
-                }
+        match shim::StoreFile::open_readonly(path) {
+            Err(e) if e == ENOENT => {}
+            Err(e) => {
+                // Cannot tell whether one exists: never create over it.
+                dev_err!(
+                    self.dev,
+                    "sks: cannot open the machine ref-key ({:?}); not creating one\n",
+                    e
+                );
+                return;
             }
-            dev_err!(
-                self.dev,
-                "sks: existing machine ref-key is unreadable or invalid; refusing replacement\n"
-            );
-            return;
+            Ok(f) => {
+                let sz = f.size().unwrap_or(0);
+                if (1..=8192).contains(&sz) {
+                    let mut blob: KVec<u8> = KVec::new();
+                    if blob.resize(sz as usize, 0u8, GFP_KERNEL).is_ok()
+                        && f.read_exact(0, &mut blob).is_ok()
+                        && self.cache_machine_refkey(blob)
+                    {
+                        return;
+                    }
+                }
+                dev_err!(
+                    self.dev,
+                    "sks: existing machine ref-key is unreadable or invalid; refusing replacement\n"
+                );
+                return;
+            }
         }
 
         let Some(blob) = self.sks_create_refkey(handle, secret) else {
@@ -202,9 +214,13 @@ impl SepData {
             );
             return;
         };
-        let Ok(f) = shim::StoreFile::open(path) else {
-            dev_err!(self.dev, "sks: could not persist machine ref-key\n");
-            return;
+        // O_EXCL: a file that appeared meanwhile is never overwritten.
+        let f = match shim::StoreFile::open_host(path) {
+            Ok((f, true)) => f,
+            Ok((_, false)) | Err(_) => {
+                dev_err!(self.dev, "sks: could not persist machine ref-key\n");
+                return;
+            }
         };
         if f.write_all(0, &blob).is_err() || f.sync().is_err() {
             dev_err!(self.dev, "sks: machine ref-key persistence failed\n");

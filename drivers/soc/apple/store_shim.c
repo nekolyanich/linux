@@ -43,17 +43,16 @@ static struct file *open_as_kernel(const char *path, int flags, umode_t mode)
 	return f;
 }
 
-/* Opens the store, creating if absent. Mode 0600: the file is the driver's own. */
-void *sep_store_open(const char *path)
-{
-	struct file *f = open_as_kernel(path, O_RDWR | O_CREAT | O_LARGEFILE, 0600);
-
-	return IS_ERR(f) ? NULL : f;
-}
+/*
+ * Every open below returns an error pointer, never NULL: callers tell a missing
+ * file (-ENOENT) from one they could not open (EIO, ENOMEM, an LSM denial),
+ * and only the first may ever be taken for "nothing stored".
+ */
 
 /*
- * As sep_store_open(), but reports whether this call created the file, so that
- * only a new file is ever initialised. Returns an error pointer on failure.
+ * Opens the store, creating it (mode 0600, the driver's own) if absent, and
+ * reports whether this call created the file, so that only a new file is ever
+ * initialised.
  */
 void *sep_store_open_host(const char *path, bool *created)
 {
@@ -74,20 +73,16 @@ void *sep_store_open_host(const char *path, bool *created)
  */
 void *sep_store_open_trunc(const char *path)
 {
-	struct file *f = open_as_kernel(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
-
-	return IS_ERR(f) ? NULL : f;
+	return open_as_kernel(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
 }
 
 /*
- * Opens an existing file read-only, NULL if absent. O_RDONLY and no O_CREAT so
- * the seed cannot be created, truncated or written by mistake.
+ * Opens an existing file read-only, ERR_PTR(-ENOENT) if absent. O_RDONLY and
+ * no O_CREAT so the seed cannot be created, truncated or written by mistake.
  */
 void *sep_store_open_ro(const char *path)
 {
-	struct file *f = open_as_kernel(path, O_RDONLY | O_LARGEFILE, 0);
-
-	return IS_ERR(f) ? NULL : f;
+	return open_as_kernel(path, O_RDONLY | O_LARGEFILE, 0);
 }
 
 void *sep_store_open_block(const char *path, int writable)
@@ -97,11 +92,11 @@ void *sep_store_open_block(const char *path, int writable)
 					0);
 
 	if (IS_ERR(f))
-		return NULL;
+		return f;
 	if (!S_ISBLK(file_inode(f)->i_mode) ||
 	    (writable && bdev_read_only(file_bdev(f)))) {
 		filp_close(f, NULL);
-		return NULL;
+		return ERR_PTR(-ENODEV);
 	}
 	return f;
 }

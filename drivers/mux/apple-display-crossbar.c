@@ -163,8 +163,8 @@ static void apple_dpxbar_dpin_wait(struct apple_dpxbar *dpxbar,
 	u32 val;
 	int ret;
 
-	ret = readl_poll_timeout_atomic(dpin + DPIN_EN_STAT, val,
-					(val & 1) == want, 1, 50000);
+	ret = readl_poll_timeout(dpin + DPIN_EN_STAT, val, (val & 1) == want,
+				 10, 50000);
 	if (ret)
 		dev_warn(dpxbar->dev, "dpin enable status stuck at %#x (want %u)\n",
 			 val, want);
@@ -364,19 +364,27 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 			      state << apple_dpxbar_t602x_out[index].sel_shift[1]);
 		udelay(10);
 
-		if (dpin) {
-			writel(0, dpin + DPIN_EN);
-			apple_dpxbar_dpin_wait(dpxbar, dpin, 0);
-		}
-
+		/* claimed now; a dpin's route stays held back until it is off */
 		dpxbar->selected_dispext[index] = state;
-		if (dpin)
-			dpxbar->route_pending[index] = true;
-		else
+		if (!dpin)
 			apple_dpxbar_t602x_route(dpxbar, index);
 	}
 
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
+
+	/*
+	 * The dpin registers are this output's alone, which the mux core's
+	 * per-control lock serializes: wait for its enable to drop sleeping,
+	 * without the spinlock.
+	 */
+	if (enable && dpin) {
+		writel(0, dpin + DPIN_EN);
+		apple_dpxbar_dpin_wait(dpxbar, dpin, 0);
+
+		spin_lock_irqsave(&dpxbar->lock, flags);
+		dpxbar->route_pending[index] = true;
+		spin_unlock_irqrestore(&dpxbar->lock, flags);
+	}
 
 	if (enable)
 		dev_info(dpxbar->dev, "Switched %s to dispext%u,%u%s\n",

@@ -1401,7 +1401,16 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		dcp->clk = NULL;
 	}
 
-	/* the next bind links new ones and brings the DPTX ports up afresh */
+	/*
+	 * the next bind links new ones and brings the DPTX ports up afresh; a
+	 * pending dcp_hotplug() must not outlive the connector
+	 */
+	if (dcp->connector)
+		cancel_work_sync(&dcp->connector->hotplug_wq);
+	if (dcp->connector_fixed)
+		cancel_work_sync(&dcp->connector_fixed->hotplug_wq);
+	if (dcp->connector_switch)
+		cancel_work_sync(&dcp->connector_switch->hotplug_wq);
 	dcp->connector = NULL;
 	dcp->connector_fixed = NULL;
 	dcp->connector_switch = NULL;

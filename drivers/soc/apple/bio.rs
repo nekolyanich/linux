@@ -426,8 +426,8 @@ pub(crate) struct Session {
     token: Option<ResultToken>,
     /// The /dev/sep-key file whose AUTH holds the session, if one does.
     key_auth: Option<u64>,
-    /// That AUTH's opener: uid and task name, for the `touch` attribute.
-    key_auth_who: Option<(u32, [u8; 16])>,
+    /// That AUTH's caller: uid, pid and task name, for the `touch` attribute.
+    key_auth_who: Option<(u32, crate::touch::Caller)>,
 }
 
 impl Session {
@@ -972,17 +972,22 @@ pub(crate) enum KeyAuthState {
 /// A /dev/sep-key AUTH takes the session as an open of /dev/sep-bio does
 /// (EBUSY while that is open or a capture is still on its way out), for the
 /// file `owner`, until [`release`].
-pub(crate) fn key_auth_open(session: &mut Session, owner: u64, uid: u32, comm: [u8; 16]) -> Result<()> {
+pub(crate) fn key_auth_open(
+    session: &mut Session,
+    owner: u64,
+    uid: u32,
+    caller: crate::touch::Caller,
+) -> Result<()> {
     open(session)?;
     session.key_auth = Some(owner);
-    session.key_auth_who = Some((uid, comm));
+    session.key_auth_who = Some((uid, caller));
     Ok(())
 }
 
 /// What the `touch` attribute shows for the session.
 pub(crate) enum TouchState {
     Idle,
-    Verify { guide: Guidance, key: Option<(u32, [u8; 16])> },
+    Verify { guide: Guidance, key: Option<(u32, crate::touch::Caller)> },
     Enrol { guide: Guidance },
 }
 

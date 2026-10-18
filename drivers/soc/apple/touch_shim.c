@@ -6,13 +6,19 @@
  * finger-gated key waits). One line:
  *
  *   idle
- *   verify sep-key uid=<uid> comm=<opener> guidance=<g>   a /dev/sep-key AUTH
- *   verify sep-bio guidance=<g>                           a verify through /dev/sep-bio
+ *   verify sep-key uid=<uid> pid=<pid> comm=<comm> guidance=<g>   a /dev/sep-key AUTH
+ *   verify sep-bio guidance=<g>                   a verify through /dev/sep-bio
  *   enrol sep-bio guidance=<g>
  *
- * <g> is none, place, lift-and-move or hold-still. Readable by everyone; poll()
- * on it wakes (POLLPRI) on every change. The Rust side composes the line from
- * the Touch ID session and stores it here; a read takes only this spinlock.
+ * <g> is none, place, lift-and-move or hold-still. <uid> and <pid> (the
+ * thread group id in the initial pid namespace) are the AUTH caller's; <comm>
+ * is its task name, which the task chose itself: escaped so that it holds no
+ * space, '=', backslash or non-printable byte (each becomes \xNN), so it
+ * cannot forge a field, and the line always ends in " guidance=<g>".
+ *
+ * Readable by everyone; poll() on it wakes (POLLPRI) on every change. The Rust
+ * side composes the line from the Touch ID session and stores it here; a read
+ * takes only this spinlock.
  */
 #include <linux/device.h>
 #include <linux/sched.h>
@@ -21,7 +27,7 @@
 #include <linux/sysfs.h>
 #include "shim.h"
 
-#define SEP_TOUCH_MAX 128
+#define SEP_TOUCH_MAX 192
 
 static DEFINE_SPINLOCK(sep_touch_lock);
 static char sep_touch_line[SEP_TOUCH_MAX] = "idle";
@@ -90,4 +96,10 @@ size_t sep_current_comm(char *buf, size_t cap)
 	get_task_comm(comm, current);
 	strscpy(buf, comm, cap);
 	return strnlen(buf, cap);
+}
+
+/* Its process id, as the initial pid namespace sees it. */
+int sep_current_tgid(void)
+{
+	return task_tgid_nr(current);
 }

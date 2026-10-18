@@ -772,7 +772,7 @@ impl SepData {
             if self.shutting_down.load(Relaxed) {
                 return Err(ENODEV);
             }
-            crate::bio::key_auth_open(&mut session, file.id, file.uid, crate::touch::current_comm())?;
+            crate::bio::key_auth_open(&mut session, file.id, file.uid, crate::touch::current_caller())?;
         }
         let give_back = |sep: &SepData| crate::bio::release(&mut sep.bio_session.lock());
         if let Err(e) = self.prepare_bio_open() {

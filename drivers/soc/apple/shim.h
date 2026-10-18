@@ -232,5 +232,7 @@ int sep_touch_register(struct device *dev);
 void sep_touch_unregister(void);
 void sep_touch_set(const char *line, size_t len);
 size_t sep_current_comm(char *buf, size_t cap);
+int sep_current_tgid(void);
+size_t sep_current_comm(char *buf, size_t cap);
 
 #endif /* SEP_SHIM_H */

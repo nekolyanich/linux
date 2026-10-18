@@ -382,7 +382,7 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 	 * macOS takes the crossbar route down around every link (re)train and
 	 * routes it again at SetLinkRate.
 	 */
-	if (dcp->switch_active && dcp->xbar_selected)
+	if (dcp->switch_active && READ_ONCE(dcp->xbar_selected))
 		apple_dpxbar_link_down(dcp->xbar);
 
 	dptx->phy_ops.dp.set_lanes = 0;
@@ -434,8 +434,8 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 			dev_warn(dcp->dev, "link rate %#x: tunnel clock failed: %d\n",
 				 link_rate, ret);
 	}
-	if ((dcp->dptx_tunneled || dcp->switch_active) && dcp->xbar_selected &&
-	    link_rate)
+	if ((dcp->dptx_tunneled || dcp->switch_active) &&
+	    READ_ONCE(dcp->xbar_selected) && link_rate)
 		apple_dpxbar_finish(dcp->xbar);
 
 	switch (link_rate) {

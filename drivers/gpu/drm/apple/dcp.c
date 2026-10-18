@@ -370,7 +370,7 @@ static void dcp_dptx_xbar_select(struct apple_dcp *dcp)
 	if (ret)
 		dev_warn(dcp->dev, "dp-xbar select failed: %d\n", ret);
 	else
-		dcp->xbar_selected = true;
+		WRITE_ONCE(dcp->xbar_selected, true);
 }
 
 static bool dcp_has_dptx(struct apple_dcp *dcp)
@@ -495,7 +495,7 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	}
 	if (dcp->xbar_selected) {
 		mux_control_deselect(dcp->xbar);
-		dcp->xbar_selected = false;
+		WRITE_ONCE(dcp->xbar_selected, false);
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 
@@ -550,7 +550,7 @@ int dcp_switch_connect(struct apple_dcp *dcp, u32 die, u32 atc, u32 port)
 	dcp->fixed.dptx_core = dcp->dptx_core;
 	dcp->fixed.dptx_die = dcp->dptx_die;
 	dcp->switch_active = true;
-	dcp->xbar_selected = false;
+	WRITE_ONCE(dcp->xbar_selected, false);
 
 	dcp->dptx_tunneled = port != APPLE_DP_SWITCH_DPPHY;
 	dcp->dptx_core = port;

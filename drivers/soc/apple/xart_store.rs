@@ -433,14 +433,19 @@ impl Store {
         self.revision = revision;
 
         if let Some(old) = old {
-            // The new record already wins on revision. If the old one cannot
-            // be cleared it stays a duplicate on disk, for the next repair,
-            // and is kept in use here so no write lands on it.
-            if let Err(e) = self.delete_slot(old) {
-                self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
-                return Err(e);
+            // The new record is durable and wins on revision, so the write has
+            // happened: failing it now would tell the enclave its state was not
+            // saved when it was. An old slot that cannot be cleared stays a
+            // shadowed duplicate on disk, for the next repair, and in use here
+            // so that no write lands on it.
+            match self.delete_slot(old) {
+                Ok(()) => self.slots[old] = Slot::FREE,
+                Err(e) => pr_warn!(
+                    "apple-sep: xART: clearing the replaced slot {} failed ({:?}); it stays, shadowed\n",
+                    old,
+                    e
+                ),
             }
-            self.slots[old] = Slot::FREE;
         }
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
         Ok(())

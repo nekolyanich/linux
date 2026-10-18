@@ -266,8 +266,8 @@ void dp_switch_unbind_dcp(struct apple_dcp *dcp)
 
 void dp_switch_remove_dcp(struct apple_dcp *dcp)
 {
-	flush_work(&dp_switch_resume_work_item);
-	flush_work(&dp_switch_work_item);
+	bool last;
+
 	mutex_lock(&dp_switch.lock);
 	for (int i = 0; i < DP_SWITCH_DFPS; i++) {
 		if (dp_switch.dfp[i].dcp == dcp) {
@@ -278,9 +278,20 @@ void dp_switch_remove_dcp(struct apple_dcp *dcp)
 	for (int i = 0; i < DP_SWITCH_UFPS; i++)
 		if (dp_switch.ufp[i] == dcp)
 			dp_switch.ufp[i] = NULL;
-	if (!dp_switch_nr_ufps()) {
+	last = !dp_switch_nr_ufps();
+	if (last) {
 		apple_dp_switch_unregister();
 		unregister_pm_notifier(&dp_switch_pm_nb);
 	}
 	mutex_unlock(&dp_switch.lock);
+
+	/*
+	 * Nothing schedules them any more; the resume work schedules the
+	 * other one, so it goes first. A pass for the remaining DCPs needs no
+	 * waiting for: it runs under the lock and no longer sees this one.
+	 */
+	if (last) {
+		cancel_work_sync(&dp_switch_resume_work_item);
+		cancel_work_sync(&dp_switch_work_item);
+	}
 }

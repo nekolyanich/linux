@@ -45,28 +45,41 @@ pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
     shim::replace_file(path, &rec)
 }
 
-pub(crate) fn read(kind: u8) -> Option<KVec<u8>> {
-    let path = path_for(kind)?;
-    let file = shim::StoreFile::open_readonly(path).ok()?;
-    let size = file.size().ok()?;
+/// The stored catacomb: `None` only when its file is missing. A file that
+/// cannot be opened or read, or that does not check out, is an error: "cannot
+/// tell" must never read as "nothing stored".
+pub(crate) fn read(kind: u8) -> Result<Option<KVec<u8>>> {
+    let path = path_for(kind).ok_or(EINVAL)?;
+    let file = match shim::StoreFile::open_readonly(path) {
+        Ok(f) => f,
+        Err(e) if e == ENOENT => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let size = file.size()?;
     if size < HEADER as u64 {
-        return None;
+        return Err(EINVAL);
     }
     let mut head = [0u8; HEADER];
-    file.read_exact(0, &mut head).ok()?;
+    file.read_exact(0, &mut head)?;
     if head[..MAGIC.len()] != MAGIC {
-        return None;
+        return Err(EINVAL);
     }
     let len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
     let crc = u16::from_le_bytes([head[12], head[13]]);
     if len == 0 || len > MAX_CATACOMB || size != (HEADER + len) as u64 {
-        return None;
+        return Err(EINVAL);
     }
-    let mut blob: KVec<u8> = KVec::with_capacity(len, GFP_KERNEL).ok()?;
-    blob.resize(len, 0, GFP_KERNEL).ok()?;
-    file.read_exact(HEADER as u64, &mut blob).ok()?;
+    let mut blob: KVec<u8> = KVec::with_capacity(len, GFP_KERNEL)?;
+    blob.resize(len, 0, GFP_KERNEL)?;
+    file.read_exact(HEADER as u64, &mut blob)?;
     if crc16_ccitt_false(&blob) != crc {
-        return None;
+        return Err(EINVAL);
     }
-    Some(blob)
+    Ok(Some(blob))
+}
+
+/// Whether a valid catacomb of `kind` is stored; false also when that cannot
+/// be told, for the checks that require one.
+pub(crate) fn present(kind: u8) -> bool {
+    matches!(read(kind), Ok(Some(_)))
 }

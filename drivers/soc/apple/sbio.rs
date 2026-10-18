@@ -435,7 +435,7 @@ impl SepData {
                 dev_err!(self.dev, "enrol: opt-in fresh-context owner export failed\n");
                 return false;
             }
-            if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+            if !crate::catacomb::present(PRIVATE_TYPE_CATACOMB_OWNER) {
                 dev_err!(self.dev, "enrol: opt-in fresh context has no owner file\n");
                 return false;
             }
@@ -521,9 +521,10 @@ impl SepData {
             return;
         }
         if self.templates_restored.load(Relaxed)
-            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some()
-            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_MASTER).is_none()
-            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_USER).is_none()
+            // an owner file that cannot be read may exist: never export over it
+            || !matches!(crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER), Ok(None))
+            || !crate::catacomb::present(PRIVATE_TYPE_CATACOMB_MASTER)
+            || !crate::catacomb::present(PRIVATE_TYPE_CATACOMB_USER)
         {
             dev_warn!(self.dev, "owner-probe: preconditions not met; no context selected\n");
             return;
@@ -800,8 +801,14 @@ impl SepData {
 
     fn read_stored(&self, kind: u8, _what: &CStr) -> Option<KVec<u8>> {
         if crate::catacomb::is_kind(kind) {
-            if let Some(blob) = crate::catacomb::read(kind) {
-                return Some(blob);
+            match crate::catacomb::read(kind) {
+                Ok(Some(blob)) => return Some(blob),
+                // only a missing file falls back to the host store
+                Ok(None) => {}
+                Err(e) => {
+                    dev_err!(self.dev, "catacomb {}: its file is unreadable or invalid ({:?})\n", kind, e);
+                    return None;
+                }
             }
         }
         match self.with_host_store(|store| store.read(&store::Key::root(kind))) {
@@ -862,7 +869,7 @@ impl SepData {
             }
             if (who.value() == user.value()
                 || who.value() == crate::sbio::CatacombUser::MASTER.value())
-                && crate::catacomb::read(kind).is_none()
+                && !crate::catacomb::present(kind)
             {
                 dev_err!(self.dev, "enrol: {} has no durable host file\n", what);
                 return false;
@@ -876,7 +883,7 @@ impl SepData {
     }
 
     fn save_all_components_user_first(&self, user: crate::sbio::UserId) -> bool {
-        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+        if !crate::catacomb::present(PRIVATE_TYPE_CATACOMB_OWNER) {
             dev_err!(self.dev, "enrol: opt-in completion has no owner Catacomb file\n");
             return false;
         }
@@ -915,7 +922,7 @@ impl SepData {
             if !self.save_catacomb(who, kind, what) {
                 return false;
             }
-            if crate::catacomb::read(kind).is_none() {
+            if !crate::catacomb::present(kind) {
                 dev_err!(self.dev, "enrol: opt-in {} has no durable host file\n", what);
                 return false;
             }
@@ -971,7 +978,7 @@ impl SepData {
                 dev_err!(self.dev, "verify: {} persistence failed\n", what);
                 return false;
             }
-            if crate::catacomb::read(kind).is_none() {
+            if !crate::catacomb::present(kind) {
                 dev_err!(self.dev, "verify: {} has no durable host file\n", what);
                 return false;
             }

@@ -164,14 +164,41 @@ impl SepData {
         (pub_raw.len() == refkey_seal::POINT_LEN).then_some(pub_raw)
     }
 
-    pub(crate) fn sks_machine_refkey(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
+    fn machine_refkey_path() -> &'static CStr {
         const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/aurora-sep-refkey.bin";
         const MACHINE_REFKEY_V2_PATH: &CStr = c"/var/lib/aurora-sep-refkey-v2.bin";
-        let path = if *crate::module_parameters::refkey_v2.value() != 0 {
+        if *crate::module_parameters::refkey_v2.value() != 0 {
             MACHINE_REFKEY_V2_PATH
         } else {
             MACHINE_REFKEY_PATH
+        }
+    }
+
+    /// Whether `public` is the machine ref key's (the trusted-keys seal key,
+    /// in the identity bag): from the cache, else from its file, with no
+    /// enclave operation. An error when that cannot be told.
+    pub(crate) fn is_machine_refkey(&self, public: &[u8]) -> Result<bool> {
+        if let Some(mk) = self.machine_refkey.lock().as_ref() {
+            return Ok(mk.pub_raw.as_slice() == public);
+        }
+        let f = match shim::StoreFile::open_readonly(Self::machine_refkey_path()) {
+            Ok(f) => f,
+            Err(e) if e == ENOENT => return Ok(false),
+            Err(e) => return Err(e),
         };
+        let sz = f.size()?;
+        if !(1..=8192).contains(&sz) {
+            return Err(EIO);
+        }
+        let mut blob: KVec<u8> = KVec::new();
+        blob.resize(sz as usize, 0u8, GFP_KERNEL)?;
+        f.read_exact(0, &mut blob)?;
+        let pubv = Self::refkey_pub(&blob).ok_or(EIO)?;
+        Ok(pubv == public)
+    }
+
+    pub(crate) fn sks_machine_refkey(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
+        let path = Self::machine_refkey_path();
 
         if self.machine_refkey.lock().is_some() {
             return;

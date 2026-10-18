@@ -494,7 +494,7 @@ impl SepData {
                 (b"kt", RV::Integer(kt)),
                 (b"o", RV::Utf8(b"oc")),
             ])?;
-            self.key_identity_op(&der)?
+            self.key_identity_op(&der, None)?
         } else {
             let der = crate::der::encode_refkey_set(&[
                 (b"bc", RV::Integer(class)),
@@ -519,7 +519,7 @@ impl SepData {
     fn key_sign(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
         // blob_len, data_len, sig_len, sep_status
         let blob = blob_in(img, 0)?;
-        let (_kt, kind, _) = parse_blob(blob)?;
+        let (_kt, kind, public) = parse_blob(blob)?;
         if !kind.signs() {
             return Err(errno::opnotsupp());
         }
@@ -537,7 +537,7 @@ impl SepData {
                 (b"rk", RV::Der(blob)),
             ])?;
             // spent also when the reply is lost after the request went out
-            let r = self.key_identity_op(&der);
+            let r = self.key_identity_op(&der, Some(public));
             self.key_credit_used(file, r.as_ref().map_or(-1, |r| r.status));
             r?
         } else {
@@ -563,7 +563,7 @@ impl SepData {
     fn key_ecdh(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
         // blob_len, peer_len, secret_len, sep_status
         let blob = blob_in(img, 0)?;
-        let (_kt, kind, _) = parse_blob(blob)?;
+        let (_kt, kind, public) = parse_blob(blob)?;
         if !kind.derives() {
             return Err(errno::opnotsupp());
         }
@@ -581,7 +581,7 @@ impl SepData {
                 (b"rk", RV::Der(blob)),
             ])?;
             // spent also when the reply is lost after the request went out
-            let r = self.key_identity_op(&der);
+            let r = self.key_identity_op(&der, Some(public));
             self.key_credit_used(file, r.as_ref().map_or(-1, |r| r.status));
             r?
         } else {
@@ -984,7 +984,17 @@ impl SepData {
 
     /// One PERFORM_OPERATION on the identity bag (designated to [`BIO_USER`]),
     /// loaded and unlocked for it and unloaded after, as the machine ref key's.
-    fn key_identity_op(&self, der: &[u8]) -> Result<OpReply> {
+    /// `rk_pub` is the public key of the ref key the operation sends: never
+    /// the machine ref key's, which lives in this bag too and seals the
+    /// trusted keys (an `ock` with it would hand out their wrapping secret).
+    /// The gate in the blob's `ed` is the caller's to claim, so it is no guard.
+    fn key_identity_op(&self, der: &[u8], rk_pub: Option<&[u8]>) -> Result<OpReply> {
+        if let Some(public) = rk_pub {
+            if self.is_machine_refkey(public)? {
+                dev_warn!(self.dev, "sep-key: refused an operation with the machine ref key\n");
+                return Err(EPERM);
+            }
+        }
         let _bag = self.identity_bag_lock.lock();
         let crate::keybag::State::Present(stored) = crate::keybag::read(crate::keybag::Slot::Identity)? else {
             return Err(ENODEV);

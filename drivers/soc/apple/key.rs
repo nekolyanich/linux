@@ -738,9 +738,11 @@ impl SepData {
         auth.last = AUTH_IDLE;
     }
 
-    /// Whether this uid can have gated keys.
+    /// Whether this uid can have gated keys. Not whether the sensor is up yet:
+    /// before the first /dev/sep-bio open of a boot it is not, and create and
+    /// AUTH bring Touch ID up themselves.
     fn key_bio_ready(&self, file: &KeyFile) -> bool {
-        file.uid as i32 == BIO_USER && crate::sensor::is_bound() && !self.touchid_failed.load(Relaxed)
+        file.uid as i32 == BIO_USER && !self.touchid_failed.load(Relaxed)
     }
 
     /// SEP_KEY_AUTH: a fresh context and a verify that credits it. True when

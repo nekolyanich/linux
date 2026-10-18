@@ -330,15 +330,13 @@ fn write_record(
     head[OFF_UUID..OFF_UUID + UUID_LEN].copy_from_slice(uuid);
     head[OFF_SECRET_LEN..OFF_SECRET_LEN + 4].copy_from_slice(&(secret.len() as u32).to_le_bytes());
 
-    let file = shim::StoreFile::open_trunc(slot.path())?;
-    // Body first, then the header that vouches for it: a crash between leaves a
-    // bad checksum, which `read` refuses — the safe side.
-    if !wrapped.is_empty() {
-        file.write_all(HEADER as u64, wrapped)?;
-    }
-    if !secret.is_empty() {
-        file.write_all((HEADER + wrapped.len()) as u64, secret)?;
-    }
-    file.write_all(0, &head)?;
-    file.sync()
+    // The whole record goes in one atomic replace: a crash keeps the previous
+    // record or leaves the new one, so the only copy is never torn.
+    let mut rec = crate::Secret(KVec::new());
+    rec.0
+        .reserve(HEADER + wrapped.len() + secret.len(), GFP_KERNEL)?;
+    rec.0.extend_from_slice(&head, GFP_KERNEL)?;
+    rec.0.extend_from_slice(wrapped, GFP_KERNEL)?;
+    rec.0.extend_from_slice(secret, GFP_KERNEL)?;
+    shim::replace_file(slot.path(), &rec)
 }

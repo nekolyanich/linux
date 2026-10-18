@@ -38,12 +38,11 @@ pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
     head[8..12].copy_from_slice(&(blob.len() as u32).to_le_bytes());
     head[12..14].copy_from_slice(&crc16_ccitt_false(blob).to_le_bytes());
 
-    let file = shim::StoreFile::open_trunc(path)?;
-    file.write_all(0, &head)?;
-    if !blob.is_empty() {
-        file.write_all(HEADER as u64, blob)?;
-    }
-    file.sync()
+    let mut rec = KVec::with_capacity(HEADER + blob.len(), GFP_KERNEL)?;
+    rec.extend_from_slice(&head, GFP_KERNEL)?;
+    rec.extend_from_slice(blob, GFP_KERNEL)?;
+    // Atomic: a crash keeps the previous catacomb or leaves the new one.
+    shim::replace_file(path, &rec)
 }
 
 pub(crate) fn read(kind: u8) -> Option<KVec<u8>> {

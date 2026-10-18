@@ -42,7 +42,6 @@ void sep_hwrng_unregister(void *mem);
 /* -- store_shim.c ------------------------------------------------------- */
 
 void *sep_store_open_host(const char *path, bool *created);
-void *sep_store_open_trunc(const char *path);
 void *sep_store_open_ro(const char *path);
 void *sep_store_open_block(const char *path, int writable);
 void sep_store_close(void *handle);
@@ -51,6 +50,7 @@ long sep_store_read(void *handle, long long off, void *buf, size_t len);
 long sep_store_write(void *handle, long long off, const void *buf,
 			    size_t len);
 int sep_store_sync(void *handle);
+int sep_store_replace(const char *path, const void *buf, size_t len);
 
 /* -- sha_shim.c --------------------------------------------------------- */
 

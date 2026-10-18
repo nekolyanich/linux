@@ -7,7 +7,6 @@ use kernel::prelude::*;
 
 extern "C" {
     fn sep_store_open_host(path: *const c_char, created: *mut bool) -> *mut c_void;
-    fn sep_store_open_trunc(path: *const c_char) -> *mut c_void;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
     fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_close(handle: *mut c_void);
@@ -15,6 +14,7 @@ extern "C" {
     fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize) -> c_long;
     fn sep_store_write(handle: *mut c_void, off: i64, buf: *const c_void, len: usize) -> c_long;
     fn sep_store_sync(handle: *mut c_void) -> c_int;
+    fn sep_store_replace(path: *const c_char, buf: *const c_void, len: usize) -> c_int;
     fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
 }
 
@@ -24,6 +24,21 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
     // bytes (via `get_random_bytes`) and retains no reference to the buffer.
     let ret = unsafe { sep_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
     kernel::error::to_result(ret)
+}
+
+/// Replaces the whole file at `path` with `contents`, atomically: written to
+/// `<path>.tmp`, synced, renamed over `path`, the directory synced. A crash or
+/// an error leaves the previous file or the new one, never a torn mix.
+pub(crate) fn replace_file(path: &CStr, contents: &[u8]) -> Result<()> {
+    // SAFETY: `path` is NUL-terminated and `contents` is valid for reads of
+    // its length for the duration of the call; the shim keeps neither.
+    kernel::error::to_result(unsafe {
+        sep_store_replace(
+            path.as_char_ptr(),
+            contents.as_ptr().cast::<c_void>(),
+            contents.len(),
+        )
+    })
 }
 
 /// Backing-store file handle.
@@ -58,14 +73,6 @@ impl StoreFile {
             kernel::error::from_err_ptr(sep_store_open_host(path.as_char_ptr(), &mut created))?
         };
         Ok((StoreFile { handle }, created))
-    }
-
-    pub(crate) fn open_trunc(path: &CStr) -> Result<StoreFile> {
-        // SAFETY: `path` is NUL-terminated; the shim returns a live file or an
-        // error pointer.
-        let handle =
-            kernel::error::from_err_ptr(unsafe { sep_store_open_trunc(path.as_char_ptr()) })?;
-        Ok(StoreFile { handle })
     }
 
     /// Opens an existing file read-only. `ENOENT` means the file is missing;

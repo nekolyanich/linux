@@ -84,6 +84,9 @@ pub(crate) struct Store {
     writes_enabled: bool,
     valid_records: usize,
     malformed_records: usize,
+    /// Records under a key this driver does not know: someone else's (a newer
+    /// macOS, another format), never written over or beside.
+    foreign_records: usize,
     duplicate_records: usize,
     repaired_records: usize,
 }
@@ -178,6 +181,7 @@ impl Store {
             writes_enabled: false,
             valid_records: 0,
             malformed_records: 0,
+            foreign_records: 0,
             duplicate_records: 0,
             repaired_records: 0,
         };
@@ -189,12 +193,17 @@ impl Store {
         if store.find(&Key::root(1)).is_none() || store.find(&Key::root(2)).is_none() {
             return Err(ENODATA);
         }
-        if arm_writes && (store.malformed_records != 0 || store.duplicate_records != 0) {
-            return Err(EIO);
-        }
-        store.writes_enabled = arm_writes;
-        if arm_writes {
-            store.repair_disk()?;
+        // A foreign record keeps the store read-only: its slot reads as free,
+        // and a write could land on it. Reads are still served.
+        store.writes_enabled = arm_writes && store.foreign_records == 0;
+        // Torn slots (a bad CRC or length under a known key) and the losers of
+        // a revision-resolved duplicate are what an interrupted write leaves:
+        // clear them. A repair that fails leaves the store read-only.
+        if store.writes_enabled
+            && (store.malformed_records != 0 || store.duplicate_records != 0)
+            && store.repair_disk().is_err()
+        {
+            store.writes_enabled = false;
         }
         Ok(store)
     }
@@ -221,8 +230,11 @@ impl Store {
             let len = le32(&raw, LENGTH) as usize;
             let crc = le32(&raw, CRC);
             let revision = le64(&raw, REVISION);
-            let valid = valid_key(&key)
-                && (1..=MAX_VALUE).contains(&len)
+            if !valid_key(&key) {
+                self.foreign_records += 1;
+                continue;
+            }
+            let valid = (1..=MAX_VALUE).contains(&len)
                 && crc32_ieee(&raw[PAYLOAD..PAYLOAD + len.min(MAX_VALUE)]) == crc;
 
             if !valid {
@@ -258,6 +270,8 @@ impl Store {
 
     /// Removes malformed records and duplicate losers only after the mapping
     /// has passed its complete read-only scan and both root records exist.
+    /// Only a slot under a known key is cleared; every write stays inside the
+    /// validated extent (`slot < slots.len()`).
     fn repair_disk(&mut self) -> Result<()> {
         let mut header = KVec::with_capacity(DELETE_SIZE, GFP_KERNEL)?;
         header.resize(DELETE_SIZE, 0, GFP_KERNEL)?;
@@ -268,7 +282,13 @@ impl Store {
             }
             self.file
                 .read_block_exact(self.base + Self::slot_offset(idx), &mut header)?;
-            if header[KEY_KIND] != 0 {
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(&header[KEY_UUID..KEY_UUID + 16]);
+            let key = Key {
+                kind: header[KEY_KIND],
+                uuid,
+            };
+            if key.kind != 0 && valid_key(&key) {
                 self.delete_slot(idx)?;
                 self.repaired_records += 1;
             }
@@ -378,7 +398,13 @@ impl Store {
         self.revision = revision;
 
         if let Some(old) = old {
-            let _ = self.delete_slot(old);
+            // The new record already wins on revision. If the old one cannot
+            // be cleared it stays a duplicate on disk, for the next repair,
+            // and is kept in use here so no write lands on it.
+            if let Err(e) = self.delete_slot(old) {
+                self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
+                return Err(e);
+            }
             self.slots[old] = Slot::FREE;
         }
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
@@ -412,12 +438,13 @@ impl Store {
         self.base
     }
 
-    pub(crate) fn summary(&self) -> (usize, usize, u64, usize, usize, usize, bool) {
+    pub(crate) fn summary(&self) -> (usize, usize, u64, usize, usize, usize, usize, bool) {
         (
             self.slots.len(),
             self.valid_records,
             self.revision,
             self.malformed_records,
+            self.foreign_records,
             self.duplicate_records,
             self.repaired_records,
             self.writes_enabled,

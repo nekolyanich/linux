@@ -813,17 +813,18 @@ impl SepData {
         let xart_start = *module_parameters::xart_start_sector.value();
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(store) => {
-                let (slots, records, revision, malformed, duplicates, repaired, writable) =
+                let (slots, records, revision, malformed, foreign, duplicates, repaired, writable) =
                     store.summary();
                 let base = store.base();
                 dev_info!(
                     dev,
-                    "xART: APFS-resolved .gl extent (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
+                    "xART: APFS-resolved .gl extent (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} foreign, {} duplicate, {} repaired; writes {}\n",
                     base,
                     slots,
                     records,
                     revision,
                     malformed,
+                    foreign,
                     duplicates,
                     repaired,
                     if writable { "ENABLED" } else { "disabled" }
@@ -1465,7 +1466,7 @@ impl SepData {
         {
             dev_warn!(
                 self.dev,
-                "xART: refused the enclave's write (op 0x{:02x}): writes are disabled (xart_writes=0)\n",
+                "xART: refused the enclave's write (op 0x{:02x}): writes are disabled (xart_writes=0, or the store is read-only)\n",
                 req.opcode
             );
         }

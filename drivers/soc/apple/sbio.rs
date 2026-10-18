@@ -1210,10 +1210,10 @@ impl SepData {
         }
         diag::keystore_open();
         if *module_parameters::provision_keybag.value() != 0 {
-            if *module_parameters::xart_writes.value() == 0 {
+            if !self.xart_writable() {
                 dev_err!(
                     self.dev,
-                    "bringup: provision_keybag=1 requires xart_writes=1\n"
+                    "bringup: provision_keybag=1 requires a writable xART store (xart_writes=1)\n"
                 );
                 return;
             }

@@ -176,8 +176,10 @@ pub(crate) fn stored(uid: u32) -> bool {
     matches!(read(uid), Ok(Some(_)))
 }
 
+/// Stores the record with one atomic replace of the user's file, so a crash
+/// keeps the empty claim file or leaves the whole record, never a torn one.
 fn write(
-    f: &shim::StoreFile,
+    path: &BagPath,
     uid: u32,
     uuid: &[u8; UUID_LEN],
     secret: &[u8],
@@ -199,8 +201,7 @@ fn write(
     rec.extend_from_slice(wrapped, GFP_KERNEL)?;
     let crc = record_crc(rec);
     rec[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_le_bytes());
-    f.write_all(0, rec)?;
-    f.sync()
+    shim::replace_file(path.as_cstr(), rec)
 }
 
 /// What the enclave answered an operation on the user's bag.
@@ -279,6 +280,7 @@ impl SepData {
         if !created && file.size()? != 0 {
             return Err(EEXIST);
         }
+        drop(file);
         // Wiped on every way out.
         let mut secret = Secret(KVec::new());
         secret.0.resize(crate::SKS_SECRET_LEN, 0, GFP_KERNEL)?;
@@ -340,7 +342,7 @@ impl SepData {
             let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), PATIENCE_MS);
             return Err(EIO);
         };
-        if let Err(e) = write(&file, uid, &uuid, &secret, &wrapped) {
+        if let Err(e) = write(&path, uid, &uuid, &secret, &wrapped) {
             dev_err!(self.dev, "sep-key: storing uid {}'s bag failed: {:?}\n", uid, e);
             let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), PATIENCE_MS);
             return Err(e);

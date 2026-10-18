@@ -3126,7 +3126,6 @@ impl SepData {
 
     /// The system has resumed, or the suspend was aborted.
     pub(crate) fn sleep_finished(&self) {
-        self.user_bags_forget();
         let _session = self.bio_session.lock();
         self.suspending.store(false, Relaxed);
         self.sleep_over.notify_all();

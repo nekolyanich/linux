@@ -427,25 +427,31 @@ impl SepData {
         Ok(())
     }
 
-    /// The system is about to sleep: unload every loaded bag and forget its
-    /// handle while the enclave still knows them. A handle kept across a sleep
-    /// or an enclave reset may name another bag by then; the next operation
-    /// loads the user's bag again.
+    /// The system is about to sleep: unload every loaded bag while the
+    /// enclave still knows them, so no handle is carried across the sleep; the
+    /// next operation loads the user's bag again. A handle whose unload got no
+    /// answer is kept: it is not known to be released, and an enclave that
+    /// forgot it answers it stale, which loads the bag again.
     pub(crate) fn user_bags_sleep(&self) {
         let mut bags = self.user_bags.lock();
         for bag in bags.list.iter_mut() {
-            if let Some(h) = bag.handle.take() {
-                let _ = self.sks_send_patient(self.sks_req_unload_keybag(h), PATIENCE_MS);
+            let Some(h) = bag.handle else {
+                continue;
+            };
+            match self.sks_send_patient(self.sks_req_unload_keybag(h), PATIENCE_MS) {
+                Some(out) if out.reply.status == 0 => bag.handle = None,
+                Some(out) => dev_warn!(
+                    self.dev,
+                    "sep-key: unloading uid {}'s bag before sleep: status {}\n",
+                    bag.uid,
+                    out.reply.status
+                ),
+                None => dev_warn!(
+                    self.dev,
+                    "sep-key: unloading uid {}'s bag before sleep: no answer\n",
+                    bag.uid
+                ),
             }
-        }
-    }
-
-    /// The system has resumed: forget every handle (a bag loaded after
-    /// [`Self::user_bags_sleep`] stays loaded in the enclave, if it still is,
-    /// but is never named again).
-    pub(crate) fn user_bags_forget(&self) {
-        for bag in self.user_bags.lock().list.iter_mut() {
-            bag.handle = None;
         }
     }
 

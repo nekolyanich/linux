@@ -660,8 +660,10 @@ impl SepData {
             crate::sbio::ComponentAction::AlreadyActive => RestoreOutcome::AlreadyActive,
             crate::sbio::ComponentAction::Unsupported => RestoreOutcome::Failed,
             crate::sbio::ComponentAction::Load => {
-                let Some(blob) = self.read_stored(kind, what) else {
-                    return RestoreOutcome::NoStoredFile;
+                let blob = match self.read_stored(kind, what) {
+                    Ok(Some(blob)) => blob,
+                    Ok(None) => return RestoreOutcome::NoStoredFile,
+                    Err(_) => return RestoreOutcome::Failed,
                 };
 
                 let at = crate::sbio::SBIO_SAVED_USER_ID_AT;
@@ -778,8 +780,10 @@ impl SepData {
     }
 
     fn restore_lockout(&self) -> RestoreOutcome {
-        let Some(blob) = self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") else {
-            return RestoreOutcome::NoStoredFile;
+        let blob = match self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") {
+            Ok(Some(blob)) => blob,
+            Ok(None) => return RestoreOutcome::NoStoredFile,
+            Err(_) => return RestoreOutcome::Failed,
         };
         let Some(request) = crate::sbio::SbioLoadLockout::new(&blob) else {
             return RestoreOutcome::Failed;
@@ -799,24 +803,22 @@ impl SepData {
         }
     }
 
-    fn read_stored(&self, kind: u8, _what: &CStr) -> Option<KVec<u8>> {
+    /// The stored record of `kind`: `None` only when none is stored; a file
+    /// or host store that cannot be read is an error, never "none".
+    fn read_stored(&self, kind: u8, _what: &CStr) -> Result<Option<KVec<u8>>> {
         if crate::catacomb::is_kind(kind) {
             match crate::catacomb::read(kind) {
-                Ok(Some(blob)) => return Some(blob),
+                Ok(Some(blob)) => return Ok(Some(blob)),
                 // only a missing file falls back to the host store
                 Ok(None) => {}
                 Err(e) => {
                     dev_err!(self.dev, "catacomb {}: its file is unreadable or invalid ({:?})\n", kind, e);
-                    return None;
+                    return Err(e);
                 }
             }
         }
-        match self.with_host_store(|store| store.read(&store::Key::root(kind))) {
-            Some(Ok(Some(blob))) => Some(blob),
-            Some(Ok(None)) => None,
-            Some(Err(_)) => None,
-            None => None,
-        }
+        self.with_host_store(|store| store.read(&store::Key::root(kind)))
+            .unwrap_or(Err(ENODEV))
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {

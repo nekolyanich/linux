@@ -304,6 +304,8 @@ impl SepData {
     }
 
     pub(crate) fn attach_sensor(&self) {
+        // A sensor attached now is not up, whatever an earlier one was.
+        self.sensor_online.store(false, Relaxed);
         if let Err(e) = sensor::register_driver() {
             dev_err!(
                 self.dev,
@@ -3007,7 +3009,7 @@ impl SepData {
     }
 
     /// Powers down a sensor a verify left up.
-    fn power_down_sensor(&self) {
+    pub(crate) fn power_down_sensor(&self) {
         if self.sensor_online.xchg(false, Relaxed) {
             let _ = sensor::idle();
             sensor::power(false);

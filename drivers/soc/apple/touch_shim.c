@@ -54,19 +54,31 @@ static const struct attribute_group sep_touch_group = {
 	.attrs = sep_touch_attrs,
 };
 
+static void sep_touch_reset(void)
+{
+	spin_lock(&sep_touch_lock);
+	strscpy(sep_touch_line, "idle", sizeof(sep_touch_line));
+	spin_unlock(&sep_touch_lock);
+}
+
 /* devres removes the attribute when the driver unbinds. */
 int sep_touch_register(struct device *dev)
 {
-	int ret = devm_device_add_group(dev, &sep_touch_group);
+	int ret;
+
+	sep_touch_reset();
+	ret = devm_device_add_group(dev, &sep_touch_group);
 
 	if (!ret)
 		WRITE_ONCE(sep_touch_kobj, &dev->kobj);
 	return ret;
 }
 
+/* Nothing waits for a finger once the driver goes: the line reads idle. */
 void sep_touch_unregister(void)
 {
 	WRITE_ONCE(sep_touch_kobj, NULL);
+	sep_touch_reset();
 }
 
 /* Stores the line and wakes pollers if it changed. */

@@ -2185,6 +2185,8 @@ impl SepData {
             );
         }
 
+        // A sensor a verify left up is idled first, then the line goes off.
+        self.power_down_sensor();
         sensor::power(false);
         sensor::unregister_driver();
         self.release_firmware_mapping();

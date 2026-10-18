@@ -679,6 +679,14 @@ struct SepData {
     key_dev: Mutex<Option<key::KeyChardev>>,
     #[pin]
     user_bags: Mutex<userbag::UserBags>,
+    /// The ACM context a /dev/sep-key AUTH's verify credits; set only while
+    /// that AUTH holds the Touch ID session, so no other verify can credit it.
+    #[pin]
+    key_auth_acm: Mutex<Option<[u8; scrd::SCRD_ACM_HANDLE_LEN]>>,
+    /// Serialises /dev/sep-key's operations on the identity keybag, which each
+    /// load, unlock and unload.
+    #[pin]
+    key_identity_lock: Mutex<()>,
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -897,6 +905,8 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
                 user_bags <- new_mutex!(userbag::UserBags::new()),
+                key_auth_acm <- new_mutex!(None),
+                key_identity_lock <- new_mutex!(()),
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),

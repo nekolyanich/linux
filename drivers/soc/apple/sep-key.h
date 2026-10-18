@@ -11,6 +11,20 @@
  *
  * Every ioctl copies its struct back, also when it fails with the enclave's
  * refusal: sep_status is the enclave's own status then.
+ *
+ * A key created with SEP_KEY_CREATE_BIOMETRY is gated by a finger: the
+ * enclave signs or derives with it only within a context a match has
+ * credited. SEP_KEY_AUTH starts a Touch ID verify for this file (the sensor is
+ * busy for /dev/sep-bio meanwhile, and the other way round: EBUSY),
+ * SEP_KEY_AUTH_POLL reports it, and on a match the file holds a credit: one
+ * operation by default, or every operation within window_s seconds. The
+ * credit ends after its operation, at the window's end, on SEP_KEY_AUTH_CANCEL,
+ * on a new SEP_KEY_AUTH and when the file is closed. Without a credit an
+ * operation on a gated key fails with EACCES. A gated key outlives adding and
+ * deleting fingers while one stays enrolled; once every finger is gone and one
+ * is enrolled anew, its operations fail with EKEYREVOKED. Gated keys need the
+ * opener's fingers in the enclave: INFO's SEP_KEY_INFO_BIOMETRY says whether
+ * this uid can have them.
  */
 
 #pragma once
@@ -18,7 +32,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_KEY_IFACE_VERSION 1
+#define SEP_KEY_IFACE_VERSION 2
 
 #define SEP_KEY_BLOB_MAX   1024 /* the enclave's stored set {rk={..}}, ~260 B */
 #define SEP_KEY_PUB_MAX    97   /* P-384 04||X||Y */
@@ -41,6 +55,14 @@ enum {
 /* sep_key_info.flags */
 #define SEP_KEY_INFO_BAG_STORED 1u /* this uid has a keybag */
 #define SEP_KEY_INFO_BAG_LOADED 2u /* and it is loaded in the enclave now */
+#define SEP_KEY_INFO_BIOMETRY   4u /* this uid can create finger-gated keys */
+#define SEP_KEY_INFO_CREDIT     8u /* this file holds an AUTH credit now */
+
+/* sep_key_create.flags */
+#define SEP_KEY_CREATE_BIOMETRY 1u /* sign/ECDH only after a match (SEP_KEY_AUTH) */
+
+/* sep_key_pubkey.flags */
+#define SEP_KEY_PUBKEY_BIOMETRY 1u /* the blob is finger-gated */
 
 struct sep_key_info {
   __u32 version;
@@ -54,7 +76,7 @@ struct sep_key_info {
 struct sep_key_create {
   __u32 type;       /* in: SEP_KEY_* */
   __u32 class;      /* in: 0 or SEP_KEY_CLASS_DEFAULT; nothing else in v1 */
-  __u32 flags;      /* in: 0 (access control comes later) */
+  __u32 flags;      /* in: 0 or SEP_KEY_CREATE_BIOMETRY */
   __s32 sep_status; /* out */
   __u32 blob_len;   /* out */
   __u32 pub_len;    /* out */
@@ -98,10 +120,40 @@ struct sep_key_pubkey {
   __u32 blob_len; /* in */
   __u32 type;     /* out */
   __u32 pub_len;  /* out */
-  __u32 reserved[5];
+  __u32 flags;    /* out: SEP_KEY_PUBKEY_* */
+  __u32 reserved[4];
   __u8  blob[SEP_KEY_BLOB_MAX];
   __u8  pub[SEP_KEY_PUB_MAX];   /* out */
   __u8  pad[3];
+};
+
+/* sep_key_auth.flags */
+#define SEP_KEY_AUTH_WINDOW 1u /* every operation within window_s, not just one */
+
+#define SEP_KEY_AUTH_WINDOW_MAX 300 /* seconds */
+#define SEP_KEY_AUTH_HOLD_S     30  /* how long a one-operation credit waits */
+
+/* sep_key_auth_poll.state */
+enum {
+  SEP_KEY_AUTH_IDLE    = 0, /* no AUTH on this file */
+  SEP_KEY_AUTH_PENDING = 1, /* touch the sensor */
+  SEP_KEY_AUTH_MATCH   = 2, /* the file holds a credit */
+  SEP_KEY_AUTH_NOMATCH = 3, /* not an enrolled finger of this user */
+  SEP_KEY_AUTH_FAILED  = 4, /* not compared: status says why (sep-bio's) */
+};
+
+struct sep_key_auth {
+  __u32 flags;    /* in: 0 or SEP_KEY_AUTH_WINDOW */
+  __u32 window_s; /* in: 1..SEP_KEY_AUTH_WINDOW_MAX with SEP_KEY_AUTH_WINDOW */
+  __u32 reserved[6];
+};
+
+struct sep_key_auth_poll {
+  __u32 state;     /* out: SEP_KEY_AUTH_* */
+  __u32 status;    /* out: with SEP_KEY_AUTH_FAILED */
+  __u32 guidance;  /* out: sep-bio's guidance while pending */
+  __u32 remaining_ms; /* out: with MATCH, how long the credit lasts */
+  __u32 reserved[4];
 };
 
 #define SEP_KEY_IOC_MAGIC 0xB2
@@ -111,3 +163,6 @@ struct sep_key_pubkey {
 #define SEP_KEY_SIGN     _IOWR(SEP_KEY_IOC_MAGIC, 0x03, struct sep_key_sign)
 #define SEP_KEY_ECDH     _IOWR(SEP_KEY_IOC_MAGIC, 0x04, struct sep_key_ecdh)
 #define SEP_KEY_PUBKEY   _IOWR(SEP_KEY_IOC_MAGIC, 0x05, struct sep_key_pubkey)
+#define SEP_KEY_AUTH        _IOW (SEP_KEY_IOC_MAGIC, 0x06, struct sep_key_auth)
+#define SEP_KEY_AUTH_POLL   _IOR (SEP_KEY_IOC_MAGIC, 0x07, struct sep_key_auth_poll)
+#define SEP_KEY_AUTH_CANCEL _IO  (SEP_KEY_IOC_MAGIC, 0x08)

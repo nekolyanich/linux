@@ -1581,6 +1581,12 @@ impl SepData {
             user,
             crate::shim::monotonic_ns(),
         );
+        // A /dev/sep-key AUTH holds the session: its context is credited by
+        // this match.
+        let init = match *self.key_auth_acm.lock() {
+            Some(acm) => init.with_acm_context(&acm),
+            None => init,
+        };
         if self.sbio_verify_step(&init).is_none() {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
@@ -2793,7 +2799,7 @@ impl SepData {
         self.sbio_transfer_raw(op.opcode(), op.name(), op.payload())
     }
 
-    fn sbio_transfer_raw(
+    pub(crate) fn sbio_transfer_raw(
         &self,
         opcode: u16,
         name: &'static CStr,
@@ -3518,7 +3524,8 @@ pub(crate) struct SbioOp {
     name: &'static CStr,
 }
 
-const SBIO_MAX_PAYLOAD: usize = 0x97;
+// 0x97, and the ACM context a matching IMAGE_PROCESSING_INIT may carry.
+const SBIO_MAX_PAYLOAD: usize = 0xa7;
 
 pub(crate) const SBIO_IMAGE_INIT_LEN: usize = 0x97;
 static_assert!(SBIO_IMAGE_INIT_LEN <= SBIO_MAX_PAYLOAD);
@@ -3533,7 +3540,26 @@ const fn pad_payload(src: &[u8]) -> [u8; SBIO_MAX_PAYLOAD] {
     out
 }
 
+const IPI_ACM_FLAGS: usize = 0x00;
+const IPI_ACM_PRESENT: u8 = 0x88;
+const IPI_ACM_LEN: usize = 0x93;
+const IPI_ACM: usize = 0x97;
+static_assert!(IPI_ACM + crate::scrd::SCRD_ACM_HANDLE_LEN == SBIO_MAX_PAYLOAD);
+
 impl SbioOp {
+    /// A matching IMAGE_PROCESSING_INIT that names the ACM context a match
+    /// credits, as macOS 15 sends it for a biometry-gated key: 0x88 at 0 (0 in
+    /// every init without one), u32 16 at 0x93, the handle at 0x97, 167 B. The
+    /// 0x88 alone decides: without it the enclave matches and credits nothing
+    /// (tanabota H2b, 6 of 6 credited with it, 0 of 3 without).
+    pub(crate) fn with_acm_context(mut self, acm: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> SbioOp {
+        self.payload[IPI_ACM_FLAGS] = IPI_ACM_PRESENT;
+        self.payload[IPI_ACM_LEN..IPI_ACM].copy_from_slice(&(acm.len() as u32).to_le_bytes());
+        self.payload[IPI_ACM..IPI_ACM + acm.len()].copy_from_slice(acm);
+        self.payload_len = IPI_ACM + acm.len();
+        self
+    }
+
     pub(crate) fn opcode(&self) -> u16 {
         self.opcode
     }

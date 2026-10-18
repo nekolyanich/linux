@@ -952,6 +952,47 @@ pub(crate) fn abort_capture(session: &mut Session) -> bool {
     true
 }
 
+/// Where a /dev/sep-key AUTH's verify is.
+pub(crate) enum KeyAuthState {
+    Pending(Guidance),
+    Matched,
+    NoMatch,
+    Failed(u32),
+}
+
+/// A /dev/sep-key AUTH: takes the session as an open of /dev/sep-bio does
+/// (EBUSY while that is open or a capture is still on its way out) and starts
+/// a verify on it; the caller queues the verify work item. The session stays
+/// taken until [`release`].
+pub(crate) fn key_auth_start(ctx: &mut Context<'_>) -> Result<()> {
+    require_sensor(ctx.sensor_present)?;
+    if ctx.index.total() == 0 {
+        return Err(crate::key::errno::nokey());
+    }
+    open(ctx.session)?;
+    if let Err(e) = ctx.session.start_worker() {
+        release(ctx.session);
+        return Err(e);
+    }
+    ctx.session.token = None;
+    ctx.session.op = Op::Verify {
+        nonce: [0u8; NONCE_LEN],
+        terminal: None,
+        guidance: Guidance::Place,
+    };
+    Ok(())
+}
+
+pub(crate) fn key_auth_poll(session: &Session) -> KeyAuthState {
+    match &session.op {
+        Op::Verify { terminal: None, guidance, .. } => KeyAuthState::Pending(*guidance),
+        Op::Verify { terminal: Some(VerifyOutcome::Matched(_)), .. } => KeyAuthState::Matched,
+        Op::Verify { terminal: Some(VerifyOutcome::NoMatch), .. } => KeyAuthState::NoMatch,
+        Op::Verify { terminal: Some(VerifyOutcome::Failed(status)), .. } => KeyAuthState::Failed(*status),
+        _ => KeyAuthState::Failed(STATUS_LOCAL),
+    }
+}
+
 /// The ioctls that start a sensor capture.
 pub(crate) fn starts_capture(cmd: u32) -> bool {
     cmd == IOC_ENROL_START || cmd == IOC_VERIFY_START

@@ -3113,6 +3113,8 @@ impl SepData {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
             waited += 10;
         }
+        // No /dev/sep-key credit, nor a match not yet polled, outlives the sleep.
+        self.key_auth_sleep();
         // Nothing is capturing: a sensor left up does not stay powered across sleep.
         self.power_down_sensor();
         Ok(())

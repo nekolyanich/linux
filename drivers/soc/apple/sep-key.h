@@ -19,7 +19,11 @@
  * SEP_KEY_AUTH_POLL reports it, and on a match the file holds a credit: one
  * operation by default, or every operation within window_s seconds. The
  * credit ends after its operation, at the window's end, on SEP_KEY_AUTH_CANCEL,
- * on a new SEP_KEY_AUTH and when the file is closed. Without a credit an
+ * on a new SEP_KEY_AUTH, when the file is closed and when the system sleeps
+ * (also a match not yet polled). The credit belongs to the open file
+ * description, not to a process: whoever shares it (dup, fork, SCM_RIGHTS)
+ * shares the credit, so open the device O_CLOEXEC to keep it from an exec'd
+ * program, and do not pass the fd on while it holds one. Without a credit an
  * operation on a gated key fails with EACCES. A gated key outlives adding and
  * deleting fingers while one stays enrolled; once every finger is gone and one
  * is enrolled anew, its operations fail with EKEYREVOKED. Gated keys need the

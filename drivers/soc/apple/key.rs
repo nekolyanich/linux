@@ -349,8 +349,9 @@ type Acm = [u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
 /// its time, for the owner file's next poll.
 pub(crate) struct KeyAuthShared {
     pub(crate) acm: Option<Acm>,
-    /// (owner file, outcome, boottime): one per finished, not yet polled AUTH.
-    done: KVec<(u64, crate::bio::KeyAuthState, u64)>,
+    /// (owner file, outcome, boottime, sleep epoch): one per finished, not yet
+    /// polled AUTH.
+    done: KVec<(u64, crate::bio::KeyAuthState, u64, u64)>,
 }
 
 impl KeyAuthShared {
@@ -358,15 +359,20 @@ impl KeyAuthShared {
         KeyAuthShared { acm: None, done: KVec::new() }
     }
 
-    fn take(&mut self, owner: u64) -> Option<(crate::bio::KeyAuthState, u64)> {
+    fn take(&mut self, owner: u64) -> Option<(crate::bio::KeyAuthState, u64, u64)> {
         let i = self.done.iter().position(|d| d.0 == owner)?;
-        let (_, state, at) = self.done.remove(i).ok()?;
-        Some((state, at))
+        let (_, state, at, epoch) = self.done.remove(i).ok()?;
+        Some((state, at, epoch))
     }
 }
 
 /// Names each open file, as the owner of the session it takes.
 static NEXT_FILE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Counts system sleeps: a credit is good only in the epoch it was given in,
+/// so none survives a suspend. A file's own state is reached only from its
+/// callbacks, so its context is destroyed at its next callback or its close.
+static SLEEP_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// A file's AUTH: the context it made, whether its verify still runs, and the
 /// credit a match gave.
@@ -379,6 +385,8 @@ struct AuthState {
     window_s: u32,
     /// The credit: until this boottime, for one op or (window) every op.
     credit_until_ns: Option<u64>,
+    /// The [`SLEEP_EPOCH`] the credit was given in.
+    credit_epoch: u64,
     /// The last verify's end, for AUTH_POLL after it.
     last: u32,
     last_status: u32,
@@ -387,6 +395,10 @@ struct AuthState {
 impl AuthState {
     fn credit_left_ns(&self) -> Option<u64> {
         let until = self.credit_until_ns?;
+        if self.credit_epoch != SLEEP_EPOCH.load(core::sync::atomic::Ordering::Acquire) {
+            // the system slept since the match
+            return None;
+        }
         let now = crate::shim::boottime_ns();
         (now < until).then(|| until - now)
     }
@@ -706,7 +718,21 @@ impl SepData {
         shared.acm = None;
         let _ = shared.take(owner);
         // On no memory the outcome is lost: the owner's poll reports a failure.
-        let _ = shared.done.push((owner, state, crate::shim::boottime_ns()), GFP_KERNEL);
+        let epoch = SLEEP_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+        let _ = shared
+            .done
+            .push((owner, state, crate::shim::boottime_ns(), epoch), GFP_KERNEL);
+    }
+
+    /// The system is about to sleep (after every capture has stopped): every
+    /// credit ends, those given and those of a match not yet polled, as on
+    /// SEP_KEY_AUTH_CANCEL. The files' contexts go at their next callback.
+    pub(crate) fn key_auth_sleep(&self) {
+        let mut session = self.bio_session.lock();
+        // A verify that ended unfiled is filed now, in the epoch that ends.
+        self.key_auth_settle(&mut session);
+        let _shared = self.key_auth.lock();
+        SLEEP_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     }
 
     /// Ends the file's AUTH: a verify still running is cancelled and its
@@ -830,6 +856,7 @@ impl SepData {
             window,
             window_s,
             credit_until_ns: None,
+            credit_epoch: 0,
             last: AUTH_PENDING,
             last_status: 0,
         };
@@ -855,12 +882,12 @@ impl SepData {
                     Some(kept) => Some(kept),
                     None if crate::bio::key_auth_owner(&session) != Some(file.id) => {
                         // neither running nor kept: lost (a driver reset)
-                        Some((crate::bio::KeyAuthState::Failed(0), 0))
+                        Some((crate::bio::KeyAuthState::Failed(0), 0, 0))
                     }
                     None => None,
                 }
             };
-            if let Some((state, at)) = outcome {
+            if let Some((state, at, epoch)) = outcome {
                 auth.pending = false;
                 self.bio_wake();
                 match state {
@@ -868,6 +895,7 @@ impl SepData {
                         // from the match, not from this poll
                         let s = if auth.window { auth.window_s } else { AUTH_HOLD_S };
                         auth.credit_until_ns = Some(at + u64::from(s) * 1_000_000_000);
+                        auth.credit_epoch = epoch;
                         auth.last = AUTH_MATCH;
                     }
                     crate::bio::KeyAuthState::NoMatch => {

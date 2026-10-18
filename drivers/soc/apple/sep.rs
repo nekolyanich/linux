@@ -813,22 +813,29 @@ impl SepData {
         let xart_start = *module_parameters::xart_start_sector.value();
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(store) => {
-                let (slots, records, revision, malformed, foreign, duplicates, repaired, writable) =
-                    store.summary();
+                let s = store.summary();
                 let base = store.base();
                 dev_info!(
                     dev,
-                    "xART: APFS-resolved .gl extent (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} foreign, {} duplicate, {} repaired; writes {}\n",
+                    "xART: APFS-resolved .gl extent (base {:#x}); {} slots, {} live records, max revision {}, {} malformed ({} without a valid copy), {} foreign, {} duplicate ({} conflicting), {} repaired; writes {}\n",
                     base,
-                    slots,
-                    records,
-                    revision,
-                    malformed,
-                    foreign,
-                    duplicates,
-                    repaired,
-                    if writable { "ENABLED" } else { "disabled" }
+                    s.slots,
+                    s.records,
+                    s.revision,
+                    s.malformed,
+                    s.unbacked,
+                    s.foreign,
+                    s.duplicates,
+                    s.conflicting,
+                    s.repaired,
+                    if s.writable { "ENABLED" } else { "disabled" }
                 );
+                if xart_writes && !s.writable {
+                    dev_warn!(
+                        dev,
+                        "xART: xart_writes=1 but the store stays read-only: a foreign record, a malformed one with no valid copy, a conflicting duplicate, or a failed repair; nothing was cleared that has no valid copy\n"
+                    );
+                }
                 Some(store)
             }
             Err(e) => {

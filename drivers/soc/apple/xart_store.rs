@@ -75,6 +75,20 @@ impl Slot {
     }
 }
 
+/// What a scan of the store found, for the probe log.
+pub(crate) struct Summary {
+    pub(crate) slots: usize,
+    pub(crate) records: usize,
+    pub(crate) revision: u64,
+    pub(crate) malformed: usize,
+    pub(crate) unbacked: usize,
+    pub(crate) foreign: usize,
+    pub(crate) duplicates: usize,
+    pub(crate) conflicting: usize,
+    pub(crate) repaired: usize,
+    pub(crate) writable: bool,
+}
+
 pub(crate) struct Store {
     file: shim::StoreFile,
     /// Byte offset of the APFS-resolved gigalocker extent in the container.
@@ -87,7 +101,13 @@ pub(crate) struct Store {
     /// Records under a key this driver does not know: someone else's (a newer
     /// macOS, another format), never written over or beside.
     foreign_records: usize,
+    /// Malformed records with no valid copy of their key: maybe the only copy
+    /// of something, so never cleared, and the store stays read-only.
+    unbacked_records: usize,
     duplicate_records: usize,
+    /// Duplicates at one revision with different contents: no record can be
+    /// called the newer, so the store stays read-only.
+    conflicting_records: usize,
     repaired_records: usize,
 }
 
@@ -182,7 +202,9 @@ impl Store {
             valid_records: 0,
             malformed_records: 0,
             foreign_records: 0,
+            unbacked_records: 0,
             duplicate_records: 0,
+            conflicting_records: 0,
             repaired_records: 0,
         };
         store.scan()?;
@@ -193,12 +215,18 @@ impl Store {
         if store.find(&Key::root(1)).is_none() || store.find(&Key::root(2)).is_none() {
             return Err(ENODATA);
         }
-        // A foreign record keeps the store read-only: its slot reads as free,
-        // and a write could land on it. Reads are still served.
-        store.writes_enabled = arm_writes && store.foreign_records == 0;
-        // Torn slots (a bad CRC or length under a known key) and the losers of
-        // a revision-resolved duplicate are what an interrupted write leaves:
-        // clear them. A repair that fails leaves the store read-only.
+        // A foreign record, a malformed one with no valid copy, or two
+        // different records at one revision keep the store read-only: their
+        // slots read as free, and a write could land on them. Reads are still
+        // served.
+        store.writes_enabled = arm_writes
+            && store.foreign_records == 0
+            && store.unbacked_records == 0
+            && store.conflicting_records == 0;
+        // A torn slot whose key has a valid copy (an interrupted replacement)
+        // and the losers of a revision-resolved duplicate are what an
+        // interrupted write leaves: clear them. A repair that fails leaves the
+        // store read-only.
         if store.writes_enabled
             && (store.malformed_records != 0 || store.duplicate_records != 0)
             && store.repair_disk().is_err()
@@ -215,6 +243,7 @@ impl Store {
     fn scan(&mut self) -> Result<()> {
         let mut raw = KVec::with_capacity(SLOT_SIZE, GFP_KERNEL)?;
         raw.resize(SLOT_SIZE, 0, GFP_KERNEL)?;
+        let mut malformed: KVec<Key> = KVec::new();
 
         for idx in 0..self.slots.len() {
             self.file
@@ -239,6 +268,7 @@ impl Store {
 
             if !valid {
                 self.malformed_records += 1;
+                malformed.push(key, GFP_KERNEL)?;
                 continue;
             }
 
@@ -253,6 +283,10 @@ impl Store {
 
             if let Some(old) = self.find(&key) {
                 self.duplicate_records += 1;
+                let o = self.slots[old];
+                if revision == o.revision && (len as u32 != o.len || crc != o.crc) {
+                    self.conflicting_records += 1;
+                }
                 // Equal revisions keep the later physical slot: the forward
                 // scan resolves a tie to the last writer.
                 if revision >= self.slots[old].revision {
@@ -264,14 +298,15 @@ impl Store {
             }
         }
 
+        self.unbacked_records = malformed.iter().filter(|k| self.find(k).is_none()).count();
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
         Ok(())
     }
 
     /// Removes malformed records and duplicate losers only after the mapping
     /// has passed its complete read-only scan and both root records exist.
-    /// Only a slot under a known key is cleared; every write stays inside the
-    /// validated extent (`slot < slots.len()`).
+    /// Only a slot under a known key with a valid copy elsewhere is cleared;
+    /// every write stays inside the validated extent (`slot < slots.len()`).
     fn repair_disk(&mut self) -> Result<()> {
         let mut header = KVec::with_capacity(DELETE_SIZE, GFP_KERNEL)?;
         header.resize(DELETE_SIZE, 0, GFP_KERNEL)?;
@@ -288,7 +323,7 @@ impl Store {
                 kind: header[KEY_KIND],
                 uuid,
             };
-            if key.kind != 0 && valid_key(&key) {
+            if key.kind != 0 && valid_key(&key) && self.find(&key).is_some() {
                 self.delete_slot(idx)?;
                 self.repaired_records += 1;
             }
@@ -438,17 +473,19 @@ impl Store {
         self.base
     }
 
-    pub(crate) fn summary(&self) -> (usize, usize, u64, usize, usize, usize, usize, bool) {
-        (
-            self.slots.len(),
-            self.valid_records,
-            self.revision,
-            self.malformed_records,
-            self.foreign_records,
-            self.duplicate_records,
-            self.repaired_records,
-            self.writes_enabled,
-        )
+    pub(crate) fn summary(&self) -> Summary {
+        Summary {
+            slots: self.slots.len(),
+            records: self.valid_records,
+            revision: self.revision,
+            malformed: self.malformed_records,
+            unbacked: self.unbacked_records,
+            foreign: self.foreign_records,
+            duplicates: self.duplicate_records,
+            conflicting: self.conflicting_records,
+            repaired: self.repaired_records,
+            writable: self.writes_enabled,
+        }
     }
 }
 

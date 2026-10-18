@@ -461,10 +461,34 @@ impl Store {
         if !self.writes_enabled {
             return Err(EROFS);
         }
-        self.delete_slot(idx)?;
-        self.slots[idx] = Slot::FREE;
+        // Every slot of the key goes, the shadowed older ones (a write whose
+        // old slot could not be cleared) first and the newest last: a crash
+        // part-way leaves the newest, so the key reads as before the delete.
+        // An older slot that cannot be cleared stops the delete before the
+        // newest, which would otherwise bring it back.
+        loop {
+            let oldest = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|&(i, slot)| i != idx && slot.matches(key))
+                .min_by_key(|&(i, slot)| (slot.revision, i))
+                .map(|(i, _)| i);
+            let Some(old) = oldest else {
+                break;
+            };
+            if let Err(e) = self.delete_slot(old) {
+                self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
+                return Err(e);
+            }
+            self.slots[old] = Slot::FREE;
+        }
+        let done = self.delete_slot(idx);
+        if done.is_ok() {
+            self.slots[idx] = Slot::FREE;
+        }
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
-        Ok(true)
+        done.map(|()| true)
     }
 
     /// Whether this store accepts writes: `xart_writes=1` and APFS proved the

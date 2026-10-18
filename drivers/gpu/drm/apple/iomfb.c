@@ -242,10 +242,13 @@ void dcp_hotplug(struct work_struct *work)
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, dcp->valid_mode, dcp->nr_modes);
 
+	/* against dcp_get_modes() and dcp_forget_edid(), on other workers */
+	mutex_lock(&connector->base.dev->mode_config.mutex);
 	if (!connector->connected) {
 		drm_edid_free(connector->drm_edid);
 		connector->drm_edid = NULL;
 	}
+	mutex_unlock(&connector->base.dev->mode_config.mutex);
 
 	/*
 	 * DCP defers link training until we set a display mode. But we set

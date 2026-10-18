@@ -615,11 +615,13 @@ void dcp_switch_disconnect(struct apple_dcp *dcp)
 	if (dcp->xbar) {
 		int ret;
 
-		mux_control_deselect(dcp->xbar);
+		if (dcp->fixed_xbar_selected)
+			mux_control_deselect(dcp->xbar);
 		ret = mux_control_select(dcp->xbar, dcp->xbar_index);
 		if (ret)
 			dev_warn(dcp->dev, "dp-switch: fixed route reselect failed: %d\n",
 				 ret);
+		dcp->fixed_xbar_selected = !ret;
 	}
 
 	/* HDMI plugged in while the switch had this DCP */
@@ -1559,6 +1561,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
+			dcp->fixed_xbar_selected = !ret;
 
 			/*
 			 * Switch atcphy to DP-only. should move to a Macbook Pro

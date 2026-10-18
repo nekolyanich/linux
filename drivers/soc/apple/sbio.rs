@@ -1336,7 +1336,7 @@ impl SepData {
         }
     }
 
-    fn prepare_bio_open(&self) -> Result<()> {
+    pub(crate) fn prepare_bio_open(&self) -> Result<()> {
         if let Err(e) = self.activate_touchid() {
             self.touchid_failed.store(true, Relaxed);
             diag::touchid(false);
@@ -1355,7 +1355,7 @@ impl SepData {
     // undone and every verify refused until reboot. The restore itself is
     // still a valid candidate, so bring the sensor up once more and let
     // complete_bringup() finish the proof before refusing.
-    fn retry_restore_proof(&self) {
+    pub(crate) fn retry_restore_proof(&self) {
         if self.templates_restored.load(Relaxed)
             || !self.cold_restore_candidate.load(Relaxed)
             || self.device_view_synced.load(Relaxed)
@@ -1583,7 +1583,8 @@ impl SepData {
         );
         // A /dev/sep-key AUTH holds the session: its context is credited by
         // this match.
-        let init = match *self.key_auth_acm.lock() {
+        let acm = self.key_auth.lock().acm;
+        let init = match acm {
             Some(acm) => init.with_acm_context(&acm),
             None => init,
         };
@@ -3155,9 +3156,18 @@ impl SepData {
     }
 
     fn finish_verify(&self, outcome: bio::VerifyOutcome, token_bytes: [u8; bio::TOKEN_LEN]) {
-        let filed = bio::verify_finish(
-            &mut self.bio_session.lock(), self.capture_epoch.load(Relaxed), outcome, token_bytes,
-        );
+        let filed = {
+            let mut session = self.bio_session.lock();
+            let filed = bio::verify_finish(
+                &mut session, self.capture_epoch.load(Relaxed), outcome, token_bytes,
+            );
+            if filed {
+                // A /dev/sep-key AUTH gives the session back at once, the
+                // outcome and its time kept for its poll.
+                self.key_auth_settle(&mut session);
+            }
+            filed
+        };
         if filed {
             self.bio_wake();
         }

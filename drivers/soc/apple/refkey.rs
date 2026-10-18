@@ -232,6 +232,7 @@ impl SepData {
         if !self.sks_ready() {
             return Err(ENODEV);
         }
+        let _bag = self.identity_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };
@@ -263,6 +264,7 @@ impl SepData {
             b.extend_from_slice(&mk.blob, GFP_KERNEL)?;
             b
         };
+        let _bag = self.identity_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };
@@ -332,6 +334,7 @@ impl SepData {
             p.extend_from_slice(&mk.pub_raw, GFP_KERNEL)?;
             (b, p)
         };
+        let _bag = self.identity_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };

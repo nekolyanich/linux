@@ -344,6 +344,23 @@ fn reply_blob(r: &OpReply) -> Result<&[u8]> {
 
 type Acm = [u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
 
+/// Driver-wide AUTH state (`SepData::key_auth`, taken after `bio_session`):
+/// the context the running verify credits, and a finished AUTH's outcome with
+/// its time, for the owner file's next poll.
+pub(crate) struct KeyAuthShared {
+    pub(crate) acm: Option<Acm>,
+    done: Option<(u64, crate::bio::KeyAuthState, u64)>,
+}
+
+impl KeyAuthShared {
+    pub(crate) fn new() -> KeyAuthShared {
+        KeyAuthShared { acm: None, done: None }
+    }
+}
+
+/// Names each open file, as the owner of the session it takes.
+static NEXT_FILE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 /// A file's AUTH: the context it made, whether its verify still runs, and the
 /// credit a match gave.
 #[derive(Default)]
@@ -372,6 +389,7 @@ impl AuthState {
 /// its AUTH.
 pub(crate) struct KeyFile {
     uid: u32,
+    id: u64,
     // Every callback for a file runs under the shim's device mutex
     // (key_shim.c), so one at a time: that is the only access.
     auth: core::cell::UnsafeCell<AuthState>,
@@ -381,6 +399,7 @@ impl KeyFile {
     fn new(uid: u32) -> KeyFile {
         KeyFile {
             uid,
+            id: NEXT_FILE.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             auth: core::cell::UnsafeCell::new(AuthState::default()),
         }
     }
@@ -491,9 +510,10 @@ impl SepData {
                 (b"o", RV::Utf8(b"osgn")),
                 (b"rk", RV::Der(blob)),
             ])?;
-            let r = self.key_identity_op(&der)?;
-            self.key_credit_used(file, r.status);
-            r
+            // spent also when the reply is lost after the request went out
+            let r = self.key_identity_op(&der);
+            self.key_credit_used(file, r.as_ref().map_or(-1, |r| r.status));
+            r?
         } else {
             let der = crate::der::encode_refkey_set(&[
                 (b"d", RV::Octets(data)),
@@ -534,9 +554,10 @@ impl SepData {
                 (b"pub", RV::Octets(peer)),
                 (b"rk", RV::Der(blob)),
             ])?;
-            let r = self.key_identity_op(&der)?;
-            self.key_credit_used(file, r.status);
-            r
+            // spent also when the reply is lost after the request went out
+            let r = self.key_identity_op(&der);
+            self.key_credit_used(file, r.as_ref().map_or(-1, |r| r.status));
+            r?
         } else {
             let der = crate::der::encode_refkey_set(&[
                 (b"o", RV::Utf8(b"ock")),
@@ -662,31 +683,65 @@ impl SepData {
         }
     }
 
-    /// Gives the Touch ID session back after the file's verify ended or was
-    /// cancelled.
-    fn key_auth_release_session(&self, auth: &mut AuthState, cancel: bool) {
-        {
-            let mut session = self.bio_session.lock();
-            if cancel {
-                let _ = crate::bio::abort_capture(&mut session);
-            }
-            crate::bio::release(&mut session);
-            *self.key_auth_acm.lock() = None;
+    /// A /dev/sep-key AUTH's verify ended (under `bio_session`): give the
+    /// session back and keep the outcome, with when it came, for the owner's
+    /// poll. A client that never polls cannot hold the sensor.
+    pub(crate) fn key_auth_settle(&self, session: &mut crate::bio::Session) {
+        let Some(owner) = crate::bio::key_auth_owner(session) else {
+            return;
+        };
+        let state = crate::bio::key_auth_poll(session);
+        if matches!(state, crate::bio::KeyAuthState::Pending(_)) {
+            return;
         }
-        auth.pending = false;
-        if let Some(dev) = self.bio_dev.lock().as_ref() {
-            dev.wake();
-        }
+        crate::bio::release(session);
+        let mut shared = self.key_auth.lock();
+        shared.acm = None;
+        shared.done = Some((owner, state, crate::shim::boottime_ns()));
     }
 
-    /// Whether this uid can have gated keys now.
+    /// Ends the file's AUTH: a verify still running is cancelled and its
+    /// session given back; a kept outcome is dropped.
+    fn key_auth_abandon(&self, file: &KeyFile, auth: &mut AuthState) {
+        if auth.pending {
+            let woke = {
+                let mut session = self.bio_session.lock();
+                let ours = crate::bio::key_auth_owner(&session) == Some(file.id);
+                if ours {
+                    let _ = crate::bio::abort_capture(&mut session);
+                    crate::bio::release(&mut session);
+                }
+                let mut shared = self.key_auth.lock();
+                if ours {
+                    shared.acm = None;
+                }
+                if shared.done.as_ref().is_some_and(|d| d.0 == file.id) {
+                    shared.done = None;
+                }
+                ours
+            };
+            auth.pending = false;
+            if woke {
+                if let Some(dev) = self.bio_dev.lock().as_ref() {
+                    dev.wake();
+                }
+            }
+        }
+        self.key_auth_forget(auth);
+        auth.last = AUTH_IDLE;
+    }
+
+    /// Whether this uid can have gated keys.
     fn key_bio_ready(&self, file: &KeyFile) -> bool {
-        file.uid as i32 == BIO_USER && self.templates_restored.load(Relaxed)
+        file.uid as i32 == BIO_USER && crate::sensor::is_bound() && !self.touchid_failed.load(Relaxed)
     }
 
     /// SEP_KEY_AUTH: a fresh context and a verify that credits it. True when
     /// the caller must queue the verify work item.
     fn key_auth_start(&self, file: &KeyFile, img: &Image) -> Result<bool> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
         if file.uid as i32 != BIO_USER {
             return Err(errno::opnotsupp());
         }
@@ -701,16 +756,34 @@ impl SepData {
             return Err(EBUSY);
         }
         self.key_auth_forget(auth);
-        let acm = self.key_acm_create()?;
-        let started = {
+
+        // The session, as an open of /dev/sep-bio takes it (and only then the
+        // Touch ID activation an open does).
+        {
             let mut session = self.bio_session.lock();
-            // As an open of /dev/sep-bio: the last capture may still be on
-            // its way out.
-            if let Err(e) = self.wait_for_worker_exit(&mut session, true) {
-                drop(session);
-                let _ = self.scrd_command(&crate::scrd::scrd_context_destroy(&acm));
+            self.wait_for_worker_exit(&mut session, true)?;
+            if self.shutting_down.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            crate::bio::key_auth_open(&mut session, file.id)?;
+        }
+        let give_back = |sep: &SepData| crate::bio::release(&mut sep.bio_session.lock());
+        if let Err(e) = self.prepare_bio_open() {
+            give_back(self);
+            return Err(e);
+        }
+        // A restore proof left undone is redone here, before the context: it
+        // sends SCRD INITIALIZE, which would end a context made earlier.
+        self.retry_restore_proof();
+        let acm = match self.key_acm_create() {
+            Ok(acm) => acm,
+            Err(e) => {
+                give_back(self);
                 return Err(e);
             }
+        };
+        let begun = {
+            let mut session = self.bio_session.lock();
             let index = self.bio_index.lock();
             let mut ctx = crate::bio::Context {
                 session: &mut session,
@@ -718,13 +791,19 @@ impl SepData {
                 sensor_present: crate::sensor::is_bound(),
                 live_identity_count: None,
             };
-            let r = crate::bio::key_auth_start(&mut ctx);
-            if r.is_ok() {
-                *self.key_auth_acm.lock() = Some(acm);
+            let r = crate::bio::key_auth_begin(&mut ctx);
+            drop(index);
+            match r {
+                Ok(()) => {
+                    let mut shared = self.key_auth.lock();
+                    shared.acm = Some(acm);
+                    shared.done = None;
+                }
+                Err(_) => crate::bio::release(&mut session),
             }
             r
         };
-        if let Err(e) = started {
+        if let Err(e) = begun {
             let _ = self.scrd_command(&crate::scrd::scrd_context_destroy(&acm));
             return Err(e);
         }
@@ -745,25 +824,50 @@ impl SepData {
         let auth = unsafe { file.auth() };
         let mut guidance = 0u32;
         if auth.pending {
-            let state = crate::bio::key_auth_poll(&self.bio_session.lock());
-            match state {
-                crate::bio::KeyAuthState::Pending(g) => guidance = g as u32,
-                crate::bio::KeyAuthState::Matched => {
-                    self.key_auth_release_session(auth, false);
-                    let s = if auth.window { auth.window_s } else { AUTH_HOLD_S };
-                    auth.credit_until_ns = Some(crate::shim::boottime_ns() + u64::from(s) * 1_000_000_000);
-                    auth.last = AUTH_MATCH;
+            let outcome = {
+                let mut session = self.bio_session.lock();
+                if crate::bio::key_auth_owner(&session) == Some(file.id) {
+                    match crate::bio::key_auth_poll(&session) {
+                        crate::bio::KeyAuthState::Pending(g) => guidance = g as u32,
+                        // ended without the worker filing it (a suspend)
+                        _ => self.key_auth_settle(&mut session),
+                    }
                 }
-                crate::bio::KeyAuthState::NoMatch => {
-                    self.key_auth_release_session(auth, false);
-                    self.key_auth_forget(auth);
-                    auth.last = AUTH_NOMATCH;
+                let mut shared = self.key_auth.lock();
+                match shared.done {
+                    Some((owner, state, at)) if owner == file.id => {
+                        shared.done = None;
+                        Some((state, at))
+                    }
+                    _ if crate::bio::key_auth_owner(&session) != Some(file.id) => {
+                        // neither running nor kept: lost (a driver reset)
+                        Some((crate::bio::KeyAuthState::Failed(0), 0))
+                    }
+                    _ => None,
                 }
-                crate::bio::KeyAuthState::Failed(status) => {
-                    self.key_auth_release_session(auth, false);
-                    self.key_auth_forget(auth);
-                    auth.last = AUTH_FAILED;
-                    auth.last_status = status;
+            };
+            if let Some((state, at)) = outcome {
+                auth.pending = false;
+                if let Some(dev) = self.bio_dev.lock().as_ref() {
+                    dev.wake();
+                }
+                match state {
+                    crate::bio::KeyAuthState::Matched => {
+                        // from the match, not from this poll
+                        let s = if auth.window { auth.window_s } else { AUTH_HOLD_S };
+                        auth.credit_until_ns = Some(at + u64::from(s) * 1_000_000_000);
+                        auth.last = AUTH_MATCH;
+                    }
+                    crate::bio::KeyAuthState::NoMatch => {
+                        self.key_auth_forget(auth);
+                        auth.last = AUTH_NOMATCH;
+                    }
+                    crate::bio::KeyAuthState::Failed(_) | crate::bio::KeyAuthState::Pending(_) => {
+                        let status = if let crate::bio::KeyAuthState::Failed(st) = state { st } else { 0 };
+                        self.key_auth_forget(auth);
+                        auth.last = AUTH_FAILED;
+                        auth.last_status = status;
+                    }
                 }
             }
         }
@@ -793,11 +897,7 @@ impl SepData {
         // SAFETY: a shim callback for this file.
         let auth = unsafe { file.auth() };
         let had = auth.pending || auth.acm.is_some();
-        if auth.pending {
-            self.key_auth_release_session(auth, true);
-        }
-        self.key_auth_forget(auth);
-        auth.last = AUTH_IDLE;
+        self.key_auth_abandon(file, auth);
         if had { Ok(()) } else { Err(ENOENT) }
     }
 
@@ -838,7 +938,7 @@ impl SepData {
     /// One PERFORM_OPERATION on the identity bag (designated to [`BIO_USER`]),
     /// loaded and unlocked for it and unloaded after, as the machine ref key's.
     fn key_identity_op(&self, der: &[u8]) -> Result<OpReply> {
-        let _one = self.key_identity_lock.lock();
+        let _bag = self.identity_bag_lock.lock();
         let crate::keybag::State::Present(stored) = crate::keybag::read(crate::keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };
@@ -885,6 +985,8 @@ impl SepData {
     /// The `ed` of a gated create: `{acl={ock,osgn,okd={cbio={pbioc}}, odel,oa=true}}`,
     /// macOS's any-biometry key (H1).
     fn key_gated_ed(&self) -> Result<KVec<u8>> {
+        // op33 needs Touch ID up, as a /dev/sep-bio open brings it
+        self.prepare_bio_open()?;
         let pbioc = self.key_pbioc()?;
         let inner = crate::der::encode_refkey_set(&[(b"pbioc", RV::Octets(&pbioc))])?;
         let cbio = crate::der::encode_refkey_set(&[(b"cbio", RV::Der(&inner))])?;

@@ -424,6 +424,8 @@ pub(crate) struct Session {
     unseen: bool,
     enrol_stage_unseen: bool,
     token: Option<ResultToken>,
+    /// The /dev/sep-key file whose AUTH holds the session, if one does.
+    key_auth: Option<u64>,
 }
 
 impl Session {
@@ -436,6 +438,7 @@ impl Session {
             unseen: false,
             enrol_stage_unseen: false,
             token: None,
+            key_auth: None,
         }
     }
 
@@ -446,6 +449,7 @@ impl Session {
         self.unseen = false;
         self.enrol_stage_unseen = false;
         self.token = None;
+        self.key_auth = None;
     }
 
     fn start_worker(&mut self) -> Result<()> {
@@ -953,6 +957,7 @@ pub(crate) fn abort_capture(session: &mut Session) -> bool {
 }
 
 /// Where a /dev/sep-key AUTH's verify is.
+#[derive(Clone, Copy)]
 pub(crate) enum KeyAuthState {
     Pending(Guidance),
     Matched,
@@ -960,20 +965,22 @@ pub(crate) enum KeyAuthState {
     Failed(u32),
 }
 
-/// A /dev/sep-key AUTH: takes the session as an open of /dev/sep-bio does
-/// (EBUSY while that is open or a capture is still on its way out) and starts
-/// a verify on it; the caller queues the verify work item. The session stays
-/// taken until [`release`].
-pub(crate) fn key_auth_start(ctx: &mut Context<'_>) -> Result<()> {
+/// A /dev/sep-key AUTH takes the session as an open of /dev/sep-bio does
+/// (EBUSY while that is open or a capture is still on its way out), for the
+/// file `owner`, until [`release`].
+pub(crate) fn key_auth_open(session: &mut Session, owner: u64) -> Result<()> {
+    open(session)?;
+    session.key_auth = Some(owner);
+    Ok(())
+}
+
+/// Then starts the verify on it; the caller queues the work item.
+pub(crate) fn key_auth_begin(ctx: &mut Context<'_>) -> Result<()> {
     require_sensor(ctx.sensor_present)?;
     if ctx.index.total() == 0 {
         return Err(crate::key::errno::nokey());
     }
-    open(ctx.session)?;
-    if let Err(e) = ctx.session.start_worker() {
-        release(ctx.session);
-        return Err(e);
-    }
+    ctx.session.start_worker()?;
     ctx.session.token = None;
     ctx.session.op = Op::Verify {
         nonce: [0u8; NONCE_LEN],
@@ -981,6 +988,11 @@ pub(crate) fn key_auth_start(ctx: &mut Context<'_>) -> Result<()> {
         guidance: Guidance::Place,
     };
     Ok(())
+}
+
+/// The file whose AUTH holds the session.
+pub(crate) fn key_auth_owner(session: &Session) -> Option<u64> {
+    session.key_auth
 }
 
 pub(crate) fn key_auth_poll(session: &Session) -> KeyAuthState {

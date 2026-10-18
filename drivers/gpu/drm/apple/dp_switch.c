@@ -108,7 +108,7 @@ static void dp_switch_work(struct work_struct *work)
 		dfp_decode(i, &die, &atc, &port);
 		dev_info(dfp->dcp->dev, "dp-switch: releasing atc%u %s\n",
 			 atc, dp_switch_port_names[port]);
-		dcp_switch_disconnect(dfp->dcp);
+		dcp_switch_disconnect(dfp->dcp, false);
 		dfp->dcp = NULL;
 		freed = true;
 	}
@@ -133,7 +133,7 @@ static void dp_switch_work(struct work_struct *work)
 		ret = dcp_switch_connect(dcp, die, atc, port);
 		if (ret) {
 			dev_warn(dcp->dev, "dp-switch: connect failed: %d\n", ret);
-			dcp_switch_disconnect(dcp);
+			dcp_switch_disconnect(dcp, false);
 			dfp->dcp = NULL;
 		}
 	}
@@ -166,7 +166,7 @@ static void dp_switch_resume_work(struct work_struct *work)
 		dfp_decode(i, &die, &atc, &port);
 		dev_info(dfp->dcp->dev, "dp-switch: replugging atc%u %s after sleep\n",
 			 atc, dp_switch_port_names[port]);
-		dcp_switch_disconnect(dfp->dcp);
+		dcp_switch_disconnect(dfp->dcp, false);
 		dfp->dcp = NULL;
 		released = true;
 	}
@@ -255,7 +255,7 @@ void dp_switch_unbind_dcp(struct apple_dcp *dcp)
 	mutex_lock(&dp_switch.lock);
 	for (int i = 0; i < DP_SWITCH_DFPS; i++) {
 		if (dp_switch.dfp[i].dcp == dcp) {
-			dcp_switch_disconnect(dcp);
+			dcp_switch_disconnect(dcp, true);
 			dp_switch.dfp[i].dcp = NULL;
 		}
 	}
@@ -271,7 +271,7 @@ void dp_switch_remove_dcp(struct apple_dcp *dcp)
 	mutex_lock(&dp_switch.lock);
 	for (int i = 0; i < DP_SWITCH_DFPS; i++) {
 		if (dp_switch.dfp[i].dcp == dcp) {
-			dcp_switch_disconnect(dcp);
+			dcp_switch_disconnect(dcp, true);
 			dp_switch.dfp[i].dcp = NULL;
 		}
 	}

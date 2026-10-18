@@ -573,7 +573,11 @@ int dcp_switch_connect(struct apple_dcp *dcp, u32 die, u32 atc, u32 port)
 	return dcp_dptx_connect(dcp, 0);
 }
 
-void dcp_switch_disconnect(struct apple_dcp *dcp)
+/*
+ * teardown: the DCP is being unbound or removed, so a fixed HDMI sink waits
+ * for the next bind instead of being connected (and waited for) here.
+ */
+void dcp_switch_disconnect(struct apple_dcp *dcp, bool teardown)
 {
 	struct phy *phy = dcp->dptx_tunneled ? dcp->tunnel_phy : dcp->phy;
 
@@ -625,7 +629,7 @@ void dcp_switch_disconnect(struct apple_dcp *dcp)
 	}
 
 	/* HDMI plugged in while the switch had this DCP */
-	if (dcp_hdmi_connected(dcp))
+	if (!teardown && dcp_hdmi_connected(dcp))
 		dcp_dptx_connect(dcp, 0);
 }
 

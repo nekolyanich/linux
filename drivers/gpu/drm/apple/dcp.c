@@ -1347,6 +1347,10 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 
+	/* the DRM device and its connectors go away after this unbind */
+	if (dcp->dp_switch)
+		dp_switch_unbind_dcp(dcp);
+
 	typec_mux_put(dcp->typec_mux);
 
 	if (dcp->avep) {
@@ -1390,6 +1394,15 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->clk) {
 		devm_clk_put(dev, dcp->clk);
 		dcp->clk = NULL;
+	}
+
+	/* the next bind links new ones and brings the DPTX ports up afresh */
+	dcp->connector = NULL;
+	dcp->connector_fixed = NULL;
+	dcp->connector_switch = NULL;
+	for (int i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
+		dcp->dptxport[i].enabled = false;
+		dcp->dptxport[i].connected = false;
 	}
 }
 

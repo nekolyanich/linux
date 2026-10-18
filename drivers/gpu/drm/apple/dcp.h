@@ -77,6 +77,7 @@ bool dcp_switch_available(struct apple_dcp *dcp);
 void dp_switch_kick(void);
 int dp_switch_add_dcp(struct apple_dcp *dcp);
 void dp_switch_remove_dcp(struct apple_dcp *dcp);
+void dp_switch_unbind_dcp(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);

@@ -245,6 +245,25 @@ int dp_switch_add_dcp(struct apple_dcp *dcp)
 	return ret;
 }
 
+/*
+ * From the DCP's component unbind, while its DPTX endpoint and the DRM
+ * objects are still there: take its sinks off it, and keep ufp_pick() away
+ * from it until its DPTX endpoint comes back with the next bind and kicks.
+ */
+void dp_switch_unbind_dcp(struct apple_dcp *dcp)
+{
+	mutex_lock(&dp_switch.lock);
+	for (int i = 0; i < DP_SWITCH_DFPS; i++) {
+		if (dp_switch.dfp[i].dcp == dcp) {
+			dcp_switch_disconnect(dcp);
+			dp_switch.dfp[i].dcp = NULL;
+		}
+	}
+	for (int i = 0; i < ARRAY_SIZE(dcp->dptxport); i++)
+		dcp->dptxport[i].enabled = false;
+	mutex_unlock(&dp_switch.lock);
+}
+
 void dp_switch_remove_dcp(struct apple_dcp *dcp)
 {
 	flush_work(&dp_switch_resume_work_item);

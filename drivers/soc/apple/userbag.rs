@@ -428,18 +428,18 @@ impl SepData {
     }
 
     /// The system is about to sleep: unload every loaded bag while the
-    /// enclave still knows them, so no handle is carried across the sleep; the
-    /// next operation loads the user's bag again. A handle whose unload got no
-    /// answer is kept: it is not known to be released, and an enclave that
-    /// forgot it answers it stale, which loads the bag again.
+    /// enclave still knows them, and forget every handle whatever the unload
+    /// answered. A handle kept across a sleep may name another uid's bag by
+    /// then; forgetting one whose unload was lost only leaks that load. The
+    /// next operation loads the user's bag again.
     pub(crate) fn user_bags_sleep(&self) {
         let mut bags = self.user_bags.lock();
         for bag in bags.list.iter_mut() {
-            let Some(h) = bag.handle else {
+            let Some(h) = bag.handle.take() else {
                 continue;
             };
             match self.sks_send_patient(self.sks_req_unload_keybag(h), PATIENCE_MS) {
-                Some(out) if out.reply.status == 0 => bag.handle = None,
+                Some(out) if out.reply.status == 0 => {}
                 Some(out) => dev_warn!(
                     self.dev,
                     "sep-key: unloading uid {}'s bag before sleep: status {}\n",

@@ -14,7 +14,8 @@ extern "C" {
     fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize) -> c_long;
     fn sep_store_write(handle: *mut c_void, off: i64, buf: *const c_void, len: usize) -> c_long;
     fn sep_store_sync(handle: *mut c_void) -> c_int;
-    fn sep_store_replace(path: *const c_char, buf: *const c_void, len: usize) -> c_int;
+    fn sep_store_replace(path: *const c_char, buf: *const c_void, len: usize, noreplace: bool)
+        -> c_int;
     fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
 }
 
@@ -30,6 +31,17 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
 /// `<path>.tmp`, synced, renamed over `path`, the directory synced. A crash or
 /// an error leaves the previous file or the new one, never a torn mix.
 pub(crate) fn replace_file(path: &CStr, contents: &[u8]) -> Result<()> {
+    store_replace(path, contents, false)
+}
+
+/// Creates the file at `path` holding `contents` as [`replace_file`] writes
+/// it, but never over an existing file (`EEXIST`): a crash leaves no file or
+/// the whole one, never a partial one.
+pub(crate) fn create_file(path: &CStr, contents: &[u8]) -> Result<()> {
+    store_replace(path, contents, true)
+}
+
+fn store_replace(path: &CStr, contents: &[u8], noreplace: bool) -> Result<()> {
     // SAFETY: `path` is NUL-terminated and `contents` is valid for reads of
     // its length for the duration of the call; the shim keeps neither.
     kernel::error::to_result(unsafe {
@@ -37,6 +49,7 @@ pub(crate) fn replace_file(path: &CStr, contents: &[u8]) -> Result<()> {
             path.as_char_ptr(),
             contents.as_ptr().cast::<c_void>(),
             contents.len(),
+            noreplace,
         )
     })
 }

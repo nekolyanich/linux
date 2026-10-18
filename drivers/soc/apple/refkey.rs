@@ -241,16 +241,11 @@ impl SepData {
             );
             return;
         };
-        // O_EXCL: a file that appeared meanwhile is never overwritten.
-        let f = match shim::StoreFile::open_host(path) {
-            Ok((f, true)) => f,
-            Ok((_, false)) | Err(_) => {
-                dev_err!(self.dev, "sks: could not persist machine ref-key\n");
-                return;
-            }
-        };
-        if f.write_all(0, &blob).is_err() || f.sync().is_err() {
-            dev_err!(self.dev, "sks: machine ref-key persistence failed\n");
+        // Written whole and renamed into place with no-replace: a file that
+        // appeared meanwhile is never overwritten, and a crash leaves no
+        // partial one to block the next creation.
+        if let Err(e) = shim::create_file(path, &blob) {
+            dev_err!(self.dev, "sks: machine ref-key persistence failed: {:?}\n", e);
             return;
         }
         let _ = self.cache_machine_refkey(blob);

@@ -148,13 +148,18 @@ static int write_all(struct file *f, const void *buf, size_t len)
 	return 0;
 }
 
-/* Renames @tmpf's dentry, which must sit in @dir, to @name in @dir. */
-static int rename_into(struct file *dir, struct file *tmpf, const char *name)
+/*
+ * Renames @tmpf's dentry, which must sit in @dir, to @name in @dir; @flags
+ * is 0 or RENAME_NOREPLACE.
+ */
+static int rename_into(struct file *dir, struct file *tmpf, const char *name,
+		       unsigned int flags)
 {
 	struct renamedata rd = {
 		.mnt_idmap = mnt_idmap(dir->f_path.mnt),
 		.old_parent = dir->f_path.dentry,
 		.new_parent = dir->f_path.dentry,
+		.flags = flags,
 	};
 	int err;
 
@@ -165,6 +170,13 @@ static int rename_into(struct file *dir, struct file *tmpf, const char *name)
 		return err;
 	err = start_renaming_dentry(&rd, 0, tmpf->f_path.dentry, &QSTR(name));
 	if (!err) {
+		/*
+		 * RENAME_NOREPLACE took effect in the lookup: -EEXIST for an
+		 * existing target, and the parent stays locked until the rename,
+		 * so none appears meanwhile. Not passed on: some filesystems
+		 * (9p) refuse every rename flag.
+		 */
+		rd.flags = 0;
 		err = security_path_rename(&dir->f_path, rd.old_dentry,
 					   &dir->f_path, rd.new_dentry, 0);
 		if (!err)
@@ -183,6 +195,9 @@ static int rename_into(struct file *dir, struct file *tmpf, const char *name)
  * leaves the previous file as it was. Once the rename is done the replace has
  * succeeded: a failed directory sync is only logged.
  *
+ * With @noreplace the rename is RENAME_NOREPLACE: a create that never
+ * overwrites, -EEXIST if @path exists, and a crash leaves no partial @path.
+ *
  * Refuses a directory on tmpfs or ramfs: a record there would be gone at the
  * next boot (an initramfs, or /var/lib not mounted yet), and for the driver's
  * keybags a record that does not last orphans what it names.
@@ -193,7 +208,8 @@ static int rename_into(struct file *dir, struct file *tmpf, const char *name)
  */
 static DEFINE_MUTEX(sep_store_replace_lock);
 
-int sep_store_replace(const char *path, const void *buf, size_t len)
+int sep_store_replace(const char *path, const void *buf, size_t len,
+		      bool noreplace)
 {
 	const struct cred *old;
 	struct file *dir, *tmpf;
@@ -245,7 +261,8 @@ int sep_store_replace(const char *path, const void *buf, size_t len)
 	if (!err) {
 		/* From here the tmp's dentry may be the live file: never truncated. */
 		rename_tried = true;
-		err = rename_into(dir, tmpf, name);
+		err = rename_into(dir, tmpf, name,
+				  noreplace ? RENAME_NOREPLACE : 0);
 	}
 	if (err && !rename_tried)
 		/* Best effort: the leftover may hold a secret. */

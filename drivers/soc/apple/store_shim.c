@@ -18,6 +18,7 @@
 #include <linux/magic.h>
 #include <linux/mount.h>
 #include <linux/namei.h>
+#include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/security.h>
 #include <linux/slab.h>
@@ -178,7 +179,8 @@ static int rename_into(struct file *dir, struct file *tmpf, const char *name)
  * go to "<path>.tmp" (mode 0600), which is synced and then renamed over @path,
  * and the directory is synced. A crash or an error at any point leaves either
  * the previous file or the new one, never a torn mix, and a failed replace
- * leaves the previous file as it was.
+ * leaves the previous file as it was. Once the rename is done the replace has
+ * succeeded: a failed directory sync is only logged.
  *
  * Refuses a directory on tmpfs or ramfs: a record there would be gone at the
  * next boot (an initramfs, or /var/lib not mounted yet), and for the driver's
@@ -237,8 +239,18 @@ int sep_store_replace(const char *path, const void *buf, size_t len)
 		/* Best effort: the leftover may hold a secret. */
 		vfs_truncate(&tmpf->f_path, 0);
 	filp_close(tmpf, NULL);
-	if (!err)
-		err = vfs_fsync(dir, 0);
+	/*
+	 * The rename is done, so the new record is the file now: a directory
+	 * that cannot be synced (9p's has no fsync and answers -EINVAL) is
+	 * only less durable, never a failed replace.
+	 */
+	if (!err) {
+		int serr = vfs_fsync(dir, 0);
+
+		if (serr)
+			pr_warn_ratelimited("apple-sep: %s: directory sync failed (%d); the file is replaced\n",
+					    dpath, serr);
+	}
 
 out_dir:
 	filp_close(dir, NULL);

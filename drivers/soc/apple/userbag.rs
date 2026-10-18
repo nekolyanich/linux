@@ -427,6 +427,28 @@ impl SepData {
         Ok(())
     }
 
+    /// The system is about to sleep: unload every loaded bag and forget its
+    /// handle while the enclave still knows them. A handle kept across a sleep
+    /// or an enclave reset may name another bag by then; the next operation
+    /// loads the user's bag again.
+    pub(crate) fn user_bags_sleep(&self) {
+        let mut bags = self.user_bags.lock();
+        for bag in bags.list.iter_mut() {
+            if let Some(h) = bag.handle.take() {
+                let _ = self.sks_send_patient(self.sks_req_unload_keybag(h), PATIENCE_MS);
+            }
+        }
+    }
+
+    /// The system has resumed: forget every handle (a bag loaded after
+    /// [`Self::user_bags_sleep`] stays loaded in the enclave, if it still is,
+    /// but is never named again).
+    pub(crate) fn user_bags_forget(&self) {
+        for bag in self.user_bags.lock().list.iter_mut() {
+            bag.handle = None;
+        }
+    }
+
     /// The user's last file closed: unload the bag.
     pub(crate) fn user_bag_close(&self, bags: &mut UserBags, uid: u32) {
         let Some(i) = bags.list.iter().position(|b| b.uid == uid) else {

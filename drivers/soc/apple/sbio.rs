@@ -3115,6 +3115,8 @@ impl SepData {
         }
         // No /dev/sep-key credit, nor a match not yet polled, outlives the sleep.
         self.key_auth_sleep();
+        // Nor a user bag's handle.
+        self.user_bags_sleep();
         // Nothing is capturing: a sensor left up does not stay powered across sleep.
         self.power_down_sensor();
         Ok(())
@@ -3122,6 +3124,7 @@ impl SepData {
 
     /// The system has resumed, or the suspend was aborted.
     pub(crate) fn sleep_finished(&self) {
+        self.user_bags_forget();
         let _session = self.bio_session.lock();
         self.suspending.store(false, Relaxed);
         self.sleep_over.notify_all();

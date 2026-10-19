@@ -5,8 +5,9 @@
 //! active while devices go down. A J313 that suspended with the lock screen's
 //! capture in flight did not wake. Before the system suspends, end any capture
 //! in progress and hold new ones until it has resumed. The hwrng fill thread
-//! is not frozen either, so entropy requests are held over the same window.
-//! The notifier itself is in `pm_shim.c`; the capture and entropy handling is
+//! is not frozen either, so entropy requests are held over the same window,
+//! and once the driver's own sleep traffic is done every other send is
+//! refused until the resume. The notifier itself is in `pm_shim.c`; the capture and entropy handling is
 //! on [`SepData`].
 
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -49,6 +50,9 @@ trait SleepHolds {
     fn hold_captures(&self) -> Result<()>;
     fn release_captures(&self);
     fn release_entropy(&self);
+    /// Refuses every send to the enclave until [`Self::release_sends`].
+    fn hold_sends(&self);
+    fn release_sends(&self);
 }
 
 impl SleepHolds for SepData {
@@ -64,6 +68,12 @@ impl SleepHolds for SepData {
     fn release_entropy(&self) {
         self.rng_sleep_finished();
     }
+    fn hold_sends(&self) {
+        self.sleep_hold_sends();
+    }
+    fn release_sends(&self) {
+        self.sleep_release_sends();
+    }
 }
 
 /// `entering`: the system is about to sleep; otherwise it has resumed, or
@@ -77,7 +87,12 @@ fn sleep_event(sep: &impl SleepHolds, entering: bool) -> Result<()> {
             sep.release_entropy();
             return Err(error);
         }
+        // Holding captures was the last thing to talk to the enclave. A
+        // message it is sent while devices are suspended is never answered,
+        // and from then on it reads no more of its mailbox.
+        sep.hold_sends();
     } else {
+        sep.release_sends();
         sep.release_captures();
         sep.release_entropy();
     }
@@ -158,6 +173,8 @@ mod tests {
     const HOLD_CAPTURES: u8 = 2;
     const RELEASE_CAPTURES: u8 = 3;
     const RELEASE_ENTROPY: u8 = 4;
+    const HOLD_SENDS: u8 = 5;
+    const RELEASE_SENDS: u8 = 6;
 
     struct Calls {
         made: RefCell<[u8; 8]>,
@@ -197,15 +214,21 @@ mod tests {
         fn release_entropy(&self) {
             self.call(RELEASE_ENTROPY);
         }
+        fn hold_sends(&self) {
+            self.call(HOLD_SENDS);
+        }
+        fn release_sends(&self) {
+            self.call(RELEASE_SENDS);
+        }
     }
 
     #[test]
-    fn going_to_sleep_holds_entropy_then_captures() {
+    fn going_to_sleep_holds_entropy_then_captures_then_sends() {
         let calls = Calls::new(None);
         assert_eq!(sleep_event(&calls, true), Ok(()));
         assert_eq!(
             calls.made(),
-            [HOLD_ENTROPY, HOLD_CAPTURES, 0, 0, 0, 0, 0, 0]
+            [HOLD_ENTROPY, HOLD_CAPTURES, HOLD_SENDS, 0, 0, 0, 0, 0]
         );
     }
 
@@ -230,12 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn waking_releases_captures_then_entropy() {
+    fn waking_releases_sends_then_captures_then_entropy() {
         let calls = Calls::new(None);
         assert_eq!(sleep_event(&calls, false), Ok(()));
         assert_eq!(
             calls.made(),
-            [RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0, 0, 0]
+            [RELEASE_SENDS, RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0, 0]
         );
     }
 }

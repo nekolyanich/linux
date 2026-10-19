@@ -751,6 +751,13 @@ struct SepData {
     // Enrol and verify work items between `capture_begin` and `capture_end`.
     captures_running: Atomic<u32>,
 
+    // From the end of the driver's sleep traffic to the resume, `send()`
+    // refuses: the enclave never answers a message sent while devices are
+    // suspended. Changed and read under the mailbox lock. `sends_refused`
+    // counts the refusals of the current sleep.
+    sends_held: Atomic<bool>,
+    sends_refused: Atomic<u32>,
+
     // The sensor is up, registered and idle from a verify: the next verify
     // takes its image without bringing it up again (macOS registers it once
     // per boot). Cleared when it is powered down: before sleep, after an
@@ -951,6 +958,8 @@ impl SepData {
                 suspending: Atomic::new(false),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
+                sends_held: Atomic::new(false),
+                sends_refused: Atomic::new(0),
                 sensor_online: Atomic::new(false),
                 worker_gone <- new_condvar!("SepData::worker_gone"),
                 rx_work <- new_work!("SepData::rx_work"),
@@ -1149,7 +1158,53 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
-        Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if self.sends_held.load(Relaxed) {
+            // The first one of each sleep is named, so a reply the enclave
+            // asked for in the window can be told from a request of ours.
+            if self.sends_refused.fetch_add(1, Relaxed) == 0 {
+                let f = proto::decode(&msg);
+                dev_warn!(
+                    self.dev,
+                    "sleep: refused a message to the enclave while the system sleeps: ep 0x{:02x} type 0x{:02x} tag 0x{:02x} param 0x{:02x} data 0x{:08x} (msg1 {:#x})\n",
+                    f.ep,
+                    f.ty,
+                    f.tag,
+                    f.param,
+                    f.data_lo,
+                    msg.msg1
+                );
+            }
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
+    /// Going to sleep, after the last message of the driver's own: refuse
+    /// every other send until [`Self::sleep_release_sends`]. Taken under the
+    /// mailbox lock, so a sender already writing finishes first and one
+    /// waiting for the lock is refused.
+    pub(crate) fn sleep_hold_sends(&self) {
+        let _mbox = self.mbox.lock();
+        self.sends_refused.store(0, Relaxed);
+        self.sends_held.store(true, Relaxed);
+    }
+
+    /// The system has resumed, or the suspend was aborted.
+    pub(crate) fn sleep_release_sends(&self) {
+        let refused = {
+            let _mbox = self.mbox.lock();
+            self.sends_held.store(false, Relaxed);
+            self.sends_refused.load(Relaxed)
+        };
+        if refused != 0 {
+            dev_warn!(
+                self.dev,
+                "sleep: refused {} message(s) to the enclave while the system slept\n",
+                refused
+            );
+        }
     }
 
     /// Puts `msg` in the mailbox once the enclave can see what the CPU wrote

@@ -19,6 +19,8 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
 #include <sound/dmaengine_pcm.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -31,7 +33,11 @@
 #include "audio.h"
 #include "parser.h"
 
-#define DCPAUD_ELEMENTS_MAXSIZE		16384
+/*
+ * As macOS 13 asks for. Elements that do not fit come back cut off at the
+ * buffer's end, with a used size of 0.
+ */
+#define DCPAUD_ELEMENTS_MAXSIZE		SZ_256K
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 
 /*
@@ -65,6 +71,8 @@ struct dcp_audio {
 	ktime_t void_start;
 	u64 void_periods;
 	struct delayed_work void_work;
+	/* the stream holds a runtime PM reference, put in sync_stop */
+	bool pm_held;
 	void *elements;
 	void *productattrs;
 
@@ -504,7 +512,10 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
 			return dcpaud_void_start(substream);
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+		if (!dcpaud->pm_held) {
+			WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+			dcpaud->pm_held = true;
+		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
 		if (ret < 0)
@@ -535,9 +546,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		/* the runtime PM reference goes in sync_stop */
 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
 		if (ret < 0)
 			return ret;
 		break;
@@ -547,14 +557,32 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 }
 
 /*
- * ALSA calls this once a stream has stopped, outside the stream lock, before
- * the next hw_params, prepare or hw_free and at close.
+ * ALSA calls this once a stream has stopped (STOP, SUSPEND, or the STOP
+ * that undoes a failed START), before the next hw_params, prepare or
+ * hw_free, at close, at system suspend and at disconnect, outside the
+ * stream lock. The DMA terminate is asynchronous: putting the runtime PM
+ * reference in trigger STOP powered the DPA's domain (ps_dpa*) down while
+ * SIO still ran DMA towards it, and SIO crashed ("Shim DMA unavailable",
+ * the TERMINATE timing out after it). Wait for the terminate first.
  */
 static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	bool held;
 
 	cancel_delayed_work_sync(&dcpaud->void_work);
+	snd_dmaengine_pcm_sync_stop(substream);
+
+	/* START sets it under the stream lock */
+	snd_pcm_stream_lock_irq(substream);
+	held = dcpaud->pm_held;
+	dcpaud->pm_held = false;
+	snd_pcm_stream_unlock_irq(substream);
+
+	if (held) {
+		pm_runtime_mark_last_busy(dcpaud->dev);
+		__pm_runtime_put_autosuspend(dcpaud->dev);
+	}
 
 	return 0;
 }
@@ -842,18 +870,27 @@ static const struct component_ops dcpaud_comp_ops = {
 	.unbind	= dcpaud_comp_unbind,
 };
 
+static void dcpaud_free_elements(void *elements)
+{
+	kvfree(elements);
+}
+
 static int dcpaud_probe(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
+	int ret;
 
 	dcpaud = devm_kzalloc(&pdev->dev, sizeof(*dcpaud), GFP_KERNEL);
 	if (!dcpaud)
 		return -ENOMEM;
 
-	dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
-					GFP_KERNEL);
+	dcpaud->elements = kvzalloc(DCPAUD_ELEMENTS_MAXSIZE, GFP_KERNEL);
 	if (!dcpaud->elements)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(&pdev->dev, dcpaud_free_elements,
+				       dcpaud->elements);
+	if (ret)
+		return ret;
 
 	dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
 					    GFP_KERNEL);

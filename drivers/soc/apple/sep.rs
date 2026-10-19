@@ -2775,7 +2775,7 @@ module! {
         },
         xart_guard: i8 {
             default: -1,
-            description: "-1: the platform's level, 1 on M1 and M2 Macs and 0 on the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
+            description: "-1: the platform's level, 1 on M1 and M2 Macs, 0 on T6020 and the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
         },
         os_uuid_hi: u64 {
             default: 0,

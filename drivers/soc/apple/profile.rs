@@ -288,8 +288,10 @@ pub(crate) const T6020: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
-    // A warm-attach enclave shared with macOS, as on T8112.
-    xart_guard: 1,
+    // Off, as on T8140: on J416s Linux enrolled and kept sep-key bags before
+    // the list existed, so a guarded boot would refuse the enclave's writes to
+    // those records. An explicit xart_guard=1 still turns it on.
+    xart_guard: 0,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor

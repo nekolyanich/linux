@@ -18,8 +18,8 @@
 //!
 //! The parameter's default, -1, takes the platform profile's level: 1 on the
 //! M1 and M2 Macs, whose enclave Linux shares with a macOS install, and 0 on
-//! the MacBook Neo and on T6020, which already hold Linux records from before
-//! the list existed and would otherwise lose write access to them.
+//! the MacBook Neo, which already holds Linux records from before the list
+//! existed and would otherwise lose write access to them.
 //!
 //! The list entry is made durable before the enclave's write reaches the
 //! gigalocker. A crash between the two leaves an entry for a record that was
@@ -458,10 +458,10 @@ mod tests {
         // On where Linux shares the enclave with macOS.
         assert_eq!(level(-1, profile::T8103.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6000.xart_guard), Some(1));
+        assert_eq!(level(-1, profile::T6020.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T8112.xart_guard), Some(1));
-        // Off on the Neo and T6020, whose Linux records predate the list.
+        // Off on the Neo, whose Linux records predate the list.
         assert_eq!(level(-1, profile::T8140.xart_guard), None);
-        assert_eq!(level(-1, profile::T6020.xart_guard), None);
         assert_eq!(level(i8::MIN, 1), Some(1));
     }
 

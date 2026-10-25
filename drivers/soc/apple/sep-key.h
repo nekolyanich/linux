@@ -41,13 +41,15 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_KEY_IFACE_VERSION 2
+#define SEP_KEY_IFACE_VERSION 3
 
 #define SEP_KEY_BLOB_MAX   1024 /* the enclave's stored set {rk={..}}, ~260 B */
 #define SEP_KEY_PUB_MAX    97   /* P-384 04||X||Y */
 #define SEP_KEY_SIG_MAX    112  /* DER ECDSA P-384, or Ed25519's 64 B */
 #define SEP_KEY_DATA_MAX   1024 /* ECDSA: the digest; Ed25519: the message */
 #define SEP_KEY_SECRET_MAX 48
+#define SEP_KEY_NONCE_MAX  32
+#define SEP_KEY_STATEMENT_MAX 4096 /* the largest seen: 1460 B */
 
 /* The enclave's key types (AKSRefKeyType). */
 enum {
@@ -141,6 +143,28 @@ struct sep_key_pubkey {
   __u8  pad[3];
 };
 
+/*
+ * The enclave's statement of a key (`oa`): the attester, an
+ * SEP_KEY_ATTEST_KEY, signs a per-boot key that vouches for the boot (ECID,
+ * measurements, nonce), which signs the subject's type, class, bag and ACL;
+ * the subject signs its own part. Returned as the enclave's DER, unparsed. Both keys must
+ * be in one bag: a gated subject is attested on the gated keys' bag, by an
+ * attestation key created there (SEP_KEY_CREATE_BIOMETRY), and needs no
+ * match; any other on the caller's own bag (EKEYREJECTED for a mix).
+ */
+struct sep_key_attest {
+  __u32 attester_len;  /* in */
+  __u32 subject_len;   /* in */
+  __u32 nonce_len;     /* in: 0..SEP_KEY_NONCE_MAX */
+  __s32 sep_status;    /* out */
+  __u32 statement_len; /* out */
+  __u32 reserved[3];
+  __u8  attester[SEP_KEY_BLOB_MAX];
+  __u8  subject[SEP_KEY_BLOB_MAX];
+  __u8  nonce[SEP_KEY_NONCE_MAX];
+  __u8  statement[SEP_KEY_STATEMENT_MAX]; /* out: one DER SEQUENCE */
+};
+
 /* sep_key_auth.flags */
 #define SEP_KEY_AUTH_WINDOW 1u /* every operation within window_s, not just one */
 
@@ -180,3 +204,4 @@ struct sep_key_auth_poll {
 #define SEP_KEY_AUTH        _IOW (SEP_KEY_IOC_MAGIC, 0x06, struct sep_key_auth)
 #define SEP_KEY_AUTH_POLL   _IOR (SEP_KEY_IOC_MAGIC, 0x07, struct sep_key_auth_poll)
 #define SEP_KEY_AUTH_CANCEL _IO  (SEP_KEY_IOC_MAGIC, 0x08)
+#define SEP_KEY_ATTEST      _IOWR(SEP_KEY_IOC_MAGIC, 0x09, struct sep_key_attest)

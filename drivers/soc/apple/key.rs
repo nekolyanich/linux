@@ -14,7 +14,7 @@
 //!   the curve's size), DER out; Ed25519 over `d` as the message, 64 B out;
 //! - `ock`: raw ECDH, X25519 and P-256/P-384, the shared x out;
 //! - kt 6, the attestation key (P-384), only attests (`oa`, H4b): `osgn`
-//!   answers -12;
+//!   answers -12; `oa` answers the statement as DER (SEP_KEY_ATTEST);
 //! - other ops on a type: -12.
 
 use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
@@ -26,7 +26,7 @@ use crate::der::RefKeyValue as RV;
 use crate::userbag::OpReply;
 use crate::SepData;
 
-pub(crate) const IFACE_VERSION: u32 = 2;
+pub(crate) const IFACE_VERSION: u32 = 3;
 
 /// The errnos `kernel::error::code` does not carry.
 pub(crate) mod errno {
@@ -66,6 +66,8 @@ const PUB_MAX: usize = 97;
 const SIG_MAX: usize = 112;
 const DATA_MAX: usize = 1024;
 const SECRET_MAX: usize = 48;
+const NONCE_MAX: usize = 32;
+const STATEMENT_MAX: usize = 4096;
 
 const CLASS_DEFAULT: u32 = 9;
 
@@ -222,6 +224,16 @@ struct Pubkey {
     pad: [u8; 3],
 }
 
+#[repr(C)]
+#[allow(dead_code)]
+struct Attest {
+    head: [u32; 8],
+    attester: [u8; BLOB_MAX],
+    subject: [u8; BLOB_MAX],
+    nonce: [u8; NONCE_MAX],
+    statement: [u8; STATEMENT_MAX],
+}
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Info>() == 32);
 static_assert!(core::mem::size_of::<Create>() == 1156);
@@ -230,6 +242,7 @@ static_assert!(core::mem::size_of::<Ecdh>() == 1204);
 static_assert!(core::mem::size_of::<Pubkey>() == 1156);
 static_assert!(core::mem::size_of::<Auth>() == 32);
 static_assert!(core::mem::size_of::<AuthPoll>() == 32);
+static_assert!(core::mem::size_of::<Attest>() == 6208);
 
 const HEAD: usize = 32;
 
@@ -243,6 +256,7 @@ const IOC_PUBKEY: u32 = _IOWR::<Pubkey>(MAGIC, 0x05);
 const IOC_AUTH: u32 = _IOW::<Auth>(MAGIC, 0x06);
 const IOC_AUTH_POLL: u32 = _IOR::<AuthPoll>(MAGIC, 0x07);
 const IOC_AUTH_CANCEL: u32 = _IO(MAGIC, 0x08);
+const IOC_ATTEST: u32 = _IOWR::<Attest>(MAGIC, 0x09);
 
 /// A struct's byte image, read from and written back to userspace. It holds
 /// an ECDH secret on its way out, so it is wiped when dropped.
@@ -322,13 +336,18 @@ fn is_gated(blob: &[u8]) -> bool {
     crate::der::refkey_find(blob, b"ed").is_some_and(|ed| ed.windows(6).any(|w| w == b"\x0c\x04cbio"))
 }
 
-/// The blob at `off`, its length in head word `len_word`.
+/// The blob at `HEAD`, its length in head word `len_word`.
 fn blob_in(img: &Image, len_word: usize) -> Result<&[u8]> {
+    blob_at(img, HEAD, len_word)
+}
+
+/// The blob at `off`, its length in head word `len_word`.
+fn blob_at(img: &Image, off: usize, len_word: usize) -> Result<&[u8]> {
     let n = img.word(len_word) as usize;
     if n == 0 || n > BLOB_MAX {
         return Err(EINVAL);
     }
-    Ok(img.field(HEAD, n))
+    Ok(img.field(off, n))
 }
 
 fn errno_of(status: i8) -> Error {
@@ -640,6 +659,61 @@ impl SepData {
         Ok(())
     }
 
+    fn key_attest(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        // attester_len, subject_len, nonce_len, sep_status, statement_len
+        let attester = blob_at(img, HEAD, 0)?;
+        let subject = blob_at(img, HEAD + BLOB_MAX, 1)?;
+        let (_kt, kind, attester_pub) = parse_blob(attester)?;
+        if kind != Kind::Attest {
+            return Err(errno::opnotsupp());
+        }
+        let (_kt, _kind, subject_pub) = parse_blob(subject)?;
+        let n = img.word(2) as usize;
+        if n > NONCE_MAX {
+            return Err(EINVAL);
+        }
+        let nonce = img.field(HEAD + 2 * BLOB_MAX, n);
+        // Neither attests nor is attested: the machine ref key seals the
+        // trusted keys, and nothing it does is the caller's business.
+        for public in [attester_pub, subject_pub] {
+            if self.is_machine_refkey(public)? {
+                dev_warn!(self.dev, "sep-key: refused to attest with the machine ref key\n");
+                return Err(EPERM);
+            }
+        }
+        let der = {
+            let d = crate::der::encode_refkey_set(&[(b"rk", RV::Der(subject))])?;
+            let mut items = KVec::new();
+            items.push((&b"d"[..], RV::Der(&d)), GFP_KERNEL)?;
+            items.push((&b"o"[..], RV::Utf8(b"oa")), GFP_KERNEL)?;
+            items.push((&b"rk"[..], RV::Der(attester)), GFP_KERNEL)?;
+            if !nonce.is_empty() {
+                items.push((&b"salt"[..], RV::Octets(nonce)), GFP_KERNEL)?;
+            }
+            crate::der::encode_refkey_set(&items)?
+        };
+        let gated = is_gated(subject);
+        // Both keys live in one bag: a gated subject in the identity bag
+        // (its ACL has `oa=true`, H4b-4: no credit), any other in the
+        // caller's. The enclave refuses a mix (-7).
+        let r = if gated {
+            if file.uid as i32 != BIO_USER {
+                return Err(errno::opnotsupp());
+            }
+            self.key_identity_op(&der, Some(subject_pub))?
+        } else {
+            self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, &der)?
+        };
+        img.set_word(3, r.status as i32 as u32);
+        let statement = reply_blob(&r)?;
+        if statement.len() > STATEMENT_MAX || !crate::der::is_one_sequence(statement) {
+            return Err(EIO);
+        }
+        img.put(HEAD + 2 * BLOB_MAX + NONCE_MAX, STATEMENT_MAX, statement)?;
+        img.set_word(4, statement.len() as u32);
+        Ok(())
+    }
+
     /// True when the caller must queue the verify work item (AUTH).
     fn key_ioctl(&self, file: &KeyFile, cmd: u32, arg: usize) -> Result<bool> {
         let user = UserPtr::from_addr(arg);
@@ -658,6 +732,7 @@ impl SepData {
             IOC_SIGN => (core::mem::size_of::<Sign>(), |s, f, i| s.key_sign(f, i)),
             IOC_ECDH => (core::mem::size_of::<Ecdh>(), |s, f, i| s.key_ecdh(f, i)),
             IOC_PUBKEY => (core::mem::size_of::<Pubkey>(), |s, _, i| s.key_pubkey(i)),
+            IOC_ATTEST => (core::mem::size_of::<Attest>(), |s, f, i| s.key_attest(f, i)),
             _ => return Err(ENOTTY),
         };
         if !self.sks_ready() {

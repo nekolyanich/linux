@@ -152,6 +152,11 @@ pub(crate) fn refkey_find<'a>(set_blob: &'a [u8], key: &[u8]) -> Option<&'a [u8]
     None
 }
 
+/// Whether `buf` is exactly one SEQUENCE, its length as the header says.
+pub(crate) fn is_one_sequence(buf: &[u8]) -> bool {
+    matches!(take_tlv(buf), Some((TAG_SEQUENCE, _, [])))
+}
+
 pub(crate) fn octet_string_body(tlv: &[u8]) -> Option<&[u8]> {
     match take_tlv(tlv) {
         Some((TAG_OCTET_STRING, body, [])) => Some(body),

@@ -26,7 +26,7 @@ use crate::der::RefKeyValue as RV;
 use crate::userbag::OpReply;
 use crate::SepData;
 
-pub(crate) const IFACE_VERSION: u32 = 3;
+pub(crate) const IFACE_VERSION: u32 = 4;
 
 /// The errnos `kernel::error::code` does not carry.
 pub(crate) mod errno {
@@ -75,10 +75,9 @@ const INFO_BAG_STORED: u32 = 1;
 const INFO_BAG_LOADED: u32 = 2;
 const INFO_BIOMETRY: u32 = 4;
 const INFO_CREDIT: u32 = 8;
+const INFO_HOME_IDENTITY: u32 = 16;
 
 const CREATE_BIOMETRY: u32 = 1;
-const CREATE_IDENTITY_BAG: u32 = 2;
-const ATTEST_IDENTITY_BAG: u32 = 1;
 const PUBKEY_BIOMETRY: u32 = 1;
 
 const AUTH_WINDOW: u32 = 1;
@@ -437,6 +436,15 @@ impl AuthState {
     }
 }
 
+/// What [`SepData::key_home_op`] does besides the home bag.
+#[derive(Clone, Copy, PartialEq)]
+enum Home {
+    /// A create: the uid's own bag is made if it is the home and absent.
+    Create,
+    /// An operation on a blob that may be a legacy one of [`BIO_USER`]'s own bag.
+    Legacy,
+}
+
 /// Per open file: the uid of its opener, whose bag every operation uses, and
 /// its AUTH.
 pub(crate) struct KeyFile {
@@ -468,13 +476,17 @@ impl KeyFile {
 
 impl SepData {
     fn key_get_info(&self, file: &KeyFile, user: UserPtr) -> Result<()> {
-        let loaded = self.user_bags.lock().loaded(file.uid);
         let mut flags = 0;
-        if crate::userbag::stored(file.uid) {
-            flags |= INFO_BAG_STORED;
-        }
-        if loaded {
-            flags |= INFO_BAG_LOADED;
+        if self.key_home_identity(file)? {
+            // stored, and loaded per operation only
+            flags |= INFO_HOME_IDENTITY | INFO_BAG_STORED;
+        } else {
+            if crate::userbag::stored(file.uid) {
+                flags |= INFO_BAG_STORED;
+            }
+            if self.user_bags.lock().loaded(file.uid) {
+                flags |= INFO_BAG_LOADED;
+            }
         }
         if self.key_bio_ready(file) {
             flags |= INFO_BIOMETRY;
@@ -507,32 +519,11 @@ impl SepData {
         let Some(kind) = kind_of(kt) else {
             return Err(EINVAL);
         };
-        if flags & !(CREATE_BIOMETRY | CREATE_IDENTITY_BAG) != 0 {
+        // an attestation key is never gated
+        if flags & !CREATE_BIOMETRY != 0 || (kind == Kind::Attest && flags != 0) {
             return Err(EINVAL);
         }
-        // An attestation key is never gated; only it is made ungated in the
-        // identity bag.
-        let bad_combo = match kind {
-            Kind::Attest => flags & CREATE_BIOMETRY != 0,
-            _ => flags & CREATE_IDENTITY_BAG != 0,
-        };
-        if bad_combo {
-            return Err(EINVAL);
-        }
-        let r = if flags & CREATE_IDENTITY_BAG != 0 {
-            // An attestation key for the gated keys: in their bag, as both
-            // keys of an `oa` must be, and ungated (H4b-4: so made, it attests
-            // them without a match, their ACL has `oa=true`).
-            if !self.key_bio_ready(file) {
-                return Err(errno::opnotsupp());
-            }
-            let der = crate::der::encode_refkey_set(&[
-                (b"bc", RV::Integer(class)),
-                (b"kt", RV::Integer(kt)),
-                (b"o", RV::Utf8(b"oc")),
-            ])?;
-            self.key_identity_op(&der, None)?
-        } else if flags & CREATE_BIOMETRY != 0 {
+        let r = if flags & CREATE_BIOMETRY != 0 {
             // On the bag designated to the fingers' SEP user: an undesignated
             // user bag answers -9 to a gated key whatever the match (H2b P3.0).
             if !self.key_bio_ready(file) {
@@ -545,14 +536,14 @@ impl SepData {
                 (b"kt", RV::Integer(kt)),
                 (b"o", RV::Utf8(b"oc")),
             ])?;
-            self.key_identity_op(&der, None)?
+            self.key_identity_op(&der, &[])?
         } else {
             let der = crate::der::encode_refkey_set(&[
                 (b"bc", RV::Integer(class)),
                 (b"kt", RV::Integer(kt)),
                 (b"o", RV::Utf8(b"oc")),
             ])?;
-            self.user_bag_op(&mut self.user_bags.lock(), file.uid, true, &der)?
+            self.key_home_op(file, &der, &[], Home::Create)?
         };
         img.set_word(3, r.status as i32 as u32);
         let blob = reply_blob(&r)?;
@@ -588,7 +579,7 @@ impl SepData {
                 (b"rk", RV::Der(blob)),
             ])?;
             // spent also when the reply is lost after the request went out
-            let r = self.key_identity_op(&der, Some(public));
+            let r = self.key_identity_op(&der, &[public]);
             self.key_credit_used(file, r.as_ref().map_or(-1, |r| r.status));
             r?
         } else {
@@ -597,7 +588,7 @@ impl SepData {
                 (b"o", RV::Utf8(b"osgn")),
                 (b"rk", RV::Der(blob)),
             ])?;
-            self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, &der)?
+            self.key_home_op(file, &der, &[public], Home::Legacy)?
         };
         img.set_word(3, r.status as i32 as u32);
         let sig = reply_blob(&r).and_then(|b| crate::der::octet_string_body(b).ok_or(EIO))?;
@@ -632,7 +623,7 @@ impl SepData {
                 (b"rk", RV::Der(blob)),
             ])?;
             // spent also when the reply is lost after the request went out
-            let r = self.key_identity_op(&der, Some(public));
+            let r = self.key_identity_op(&der, &[public]);
             self.key_credit_used(file, r.as_ref().map_or(-1, |r| r.status));
             r?
         } else {
@@ -641,7 +632,7 @@ impl SepData {
                 (b"pub", RV::Octets(peer)),
                 (b"rk", RV::Der(blob)),
             ])?;
-            self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, &der)?
+            self.key_home_op(file, &der, &[public], Home::Legacy)?
         };
         img.set_word(3, r.status as i32 as u32);
         let secret = reply_blob(&r).and_then(|b| crate::der::octet_string_body(b).ok_or(EIO))?;
@@ -672,9 +663,8 @@ impl SepData {
 
     fn key_attest(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
         // attester_len, subject_len, nonce_len, sep_status, statement_len,
-        // flags, reserved[2]
-        let flags = img.word(5);
-        if flags & !ATTEST_IDENTITY_BAG != 0 || img.word(6) != 0 || img.word(7) != 0 {
+        // reserved[3]
+        if img.word(5) != 0 || img.word(6) != 0 || img.word(7) != 0 {
             return Err(EINVAL);
         }
         let attester = blob_at(img, HEAD, 0)?;
@@ -704,26 +694,16 @@ impl SepData {
             }
             crate::der::encode_refkey_set(&items)?
         };
-        // Both keys live in one bag: the identity bag for a gated subject (its
-        // ACL has `oa=true`, H4b-4: no credit) or when asked (its ungated
-        // attestation key), else the caller's. The enclave refuses a mix (-7).
-        let identity = is_gated(subject) || flags & ATTEST_IDENTITY_BAG != 0;
-        let r = if identity {
+        // Both keys live in the caller's home bag (a gated subject's ACL has
+        // `oa=true`, H4b-4: no credit); the enclave refuses a mix (-7). A
+        // legacy pair in uid 1000's own bag is tried there too.
+        let r = if is_gated(subject) {
             if file.uid as i32 != BIO_USER {
                 return Err(errno::opnotsupp());
             }
-            // Neither attests nor is attested: the machine ref key seals the
-            // trusted keys and lives in this bag (in the caller's, the
-            // enclave refuses it anyway).
-            for public in [attester_pub, subject_pub] {
-                if self.is_machine_refkey(public)? {
-                    dev_dbg!(self.dev, "sep-key: refused to attest with the machine ref key\n");
-                    return Err(EPERM);
-                }
-            }
-            self.key_identity_op(&der, None)?
+            self.key_identity_op(&der, &[attester_pub, subject_pub])?
         } else {
-            self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, &der)?
+            self.key_home_op(file, &der, &[attester_pub, subject_pub], Home::Legacy)?
         };
         img.set_word(3, r.status as i32 as u32);
         let statement = reply_blob(&r)?;
@@ -1101,14 +1081,14 @@ impl SepData {
 
     /// One PERFORM_OPERATION on the identity bag (designated to [`BIO_USER`]),
     /// loaded and unlocked for it and unloaded after, as the machine ref key's.
-    /// `rk_pub` is the public key of the ref key the operation sends: never
-    /// the machine ref key's, which lives in this bag too and seals the
+    /// `rk_pubs` are the public keys of the ref keys the operation sends:
+    /// never the machine ref key's, which lives in this bag too and seals the
     /// trusted keys (an `ock` with it would hand out their wrapping secret).
     /// The gate in the blob's `ed` is the caller's to claim, so it is no guard.
-    fn key_identity_op(&self, der: &[u8], rk_pub: Option<&[u8]>) -> Result<OpReply> {
-        if let Some(public) = rk_pub {
+    fn key_identity_op(&self, der: &[u8], rk_pubs: &[&[u8]]) -> Result<OpReply> {
+        for public in rk_pubs {
             if self.is_machine_refkey(public)? {
-                dev_warn!(self.dev, "sep-key: refused an operation with the machine ref key\n");
+                dev_dbg!(self.dev, "sep-key: refused an operation with the machine ref key\n");
                 return Err(EPERM);
             }
         }
@@ -1142,6 +1122,36 @@ impl SepData {
         })();
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
         result
+    }
+
+    /// Whether the caller's keys live in the identity bag: [`BIO_USER`]'s,
+    /// once the bag exists (before the first enrolment they live in its own).
+    fn key_home_identity(&self, file: &KeyFile) -> Result<bool> {
+        if file.uid as i32 != BIO_USER {
+            return Ok(false);
+        }
+        let _bag = self.identity_bag_lock.lock();
+        Ok(matches!(
+            crate::keybag::read(crate::keybag::Slot::Identity)?,
+            crate::keybag::State::Present(_)
+        ))
+    }
+
+    /// One ungated operation on the caller's home bag (macOS's one bag per
+    /// user): the identity bag for [`BIO_USER`] once it exists, else the
+    /// uid's own bag (made by a create). With [`Home::Legacy`], a blob the
+    /// identity bag calls another bag's (-7) is tried once on [`BIO_USER`]'s
+    /// own bag, if stored: its keys from before interface 4.
+    fn key_home_op(&self, file: &KeyFile, der: &[u8], rk_pubs: &[&[u8]], how: Home) -> Result<OpReply> {
+        if !self.key_home_identity(file)? {
+            let create = how == Home::Create;
+            return self.user_bag_op(&mut self.user_bags.lock(), file.uid, create, der);
+        }
+        let r = self.key_identity_op(der, rk_pubs)?;
+        if how == Home::Legacy && r.status == STATUS_OTHER_BAG && crate::userbag::stored(file.uid) {
+            return self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, der);
+        }
+        Ok(r)
     }
 
     /// The enrolled-set id of [`BIO_USER`] (op33).

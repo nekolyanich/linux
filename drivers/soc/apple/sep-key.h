@@ -3,11 +3,17 @@
  * Userspace interface for the SEP key store: keys whose private half never
  * leaves the enclave.
  *
- * A key is an opaque blob the enclave wraps under the caller's own keybag (one
- * per Linux user, created on the user's first CREATE): userspace keeps the
- * blob, the enclave keeps nothing per key, and a blob works only under the bag
- * that made it, so another user's blob is refused. Forgetting the blob deletes
- * the key. The fd carries the uid that opened it.
+ * A key is an opaque blob the enclave wraps under the caller's home keybag,
+ * one per Linux user as macOS has it: the identity bag (designated to the
+ * fingers' SEP user) for uid 1000 once it exists, else the uid's own bag,
+ * created on its first CREATE. Every key of a user, plain, gated or an
+ * attestation key, lives there. Userspace keeps the blob, the enclave keeps
+ * nothing per key, and a blob works only under the bag that made it, so
+ * another user's blob is refused. Forgetting the blob deletes the key. The fd
+ * carries the uid that opened it. uid 1000's ungated keys made in its own bag
+ * before interface 4 keep working: refused by the identity bag as another
+ * bag's, an operation on them is tried on that bag too; new keys never go
+ * there.
  *
  * Every ioctl copies its struct back, also when it fails with the enclave's
  * refusal: sep_status is the enclave's own status then.
@@ -41,7 +47,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_KEY_IFACE_VERSION 3
+#define SEP_KEY_IFACE_VERSION 4
 
 #define SEP_KEY_BLOB_MAX   1024 /* the enclave's stored set {rk={..}}, ~260 B */
 #define SEP_KEY_PUB_MAX    97   /* P-384 04||X||Y */
@@ -65,19 +71,15 @@ enum {
 #define SEP_KEY_CLASS_DEFAULT 9
 
 /* sep_key_info.flags */
-#define SEP_KEY_INFO_BAG_STORED 1u /* this uid has a keybag */
-#define SEP_KEY_INFO_BAG_LOADED 2u /* and it is loaded in the enclave now */
+#define SEP_KEY_INFO_BAG_STORED 1u /* this uid's home bag exists */
+#define SEP_KEY_INFO_BAG_LOADED 2u /* and it is loaded in the enclave now (never the identity bag: per op) */
 #define SEP_KEY_INFO_BIOMETRY   4u /* this uid can create finger-gated keys */
 #define SEP_KEY_INFO_CREDIT     8u /* this file holds an AUTH credit now */
+#define SEP_KEY_INFO_HOME_IDENTITY 16u /* this uid's home bag is the identity bag */
 
 /* sep_key_create.flags */
 #define SEP_KEY_CREATE_BIOMETRY 1u /* sign/ECDH only after a match (SEP_KEY_AUTH) */
-/*
- * SEP_KEY_ATTEST_KEY only (EINVAL with any other type, and with BIOMETRY: an
- * attestation key is never gated): made in the gated keys' bag, to attest
- * them. Needs what BIOMETRY needs.
- */
-#define SEP_KEY_CREATE_IDENTITY_BAG 2u
+/* an SEP_KEY_ATTEST_KEY is never gated: EINVAL with BIOMETRY */
 
 /* sep_key_pubkey.flags */
 #define SEP_KEY_PUBKEY_BIOMETRY 1u /* the blob is finger-gated */
@@ -150,13 +152,10 @@ struct sep_key_pubkey {
  * SEP_KEY_ATTEST_KEY, signs a per-boot key that vouches for the boot (ECID,
  * measurements, nonce), which signs the subject's type, class, bag and ACL;
  * the subject signs its own part. Returned as the enclave's DER, unparsed.
- * Both keys must be in one bag (EKEYREJECTED for a mix): the gated keys' bag
- * for a gated subject or with SEP_KEY_ATTEST_IDENTITY_BAG (an attester made
- * with SEP_KEY_CREATE_IDENTITY_BAG, and the ungated subjects there), needing
- * no match; else the caller's own. X25519 subjects: EOPNOTSUPP. EACCES: the
+ * Both keys must be in one bag, the caller's home (EKEYREJECTED for a mix); a
+ * gated subject needs no match. X25519 subjects: EOPNOTSUPP. EACCES: the
  * subject's ACL refuses `oa`, which no touch changes.
  */
-#define SEP_KEY_ATTEST_IDENTITY_BAG 1u /* sep_key_attest.flags */
 
 struct sep_key_attest {
   __u32 attester_len;  /* in */
@@ -164,8 +163,7 @@ struct sep_key_attest {
   __u32 nonce_len;     /* in: 0..SEP_KEY_NONCE_MAX */
   __s32 sep_status;    /* out */
   __u32 statement_len; /* out */
-  __u32 flags;         /* in: 0 or SEP_KEY_ATTEST_IDENTITY_BAG */
-  __u32 reserved[2];   /* in: 0 */
+  __u32 reserved[3];   /* in: 0 */
   __u8  attester[SEP_KEY_BLOB_MAX];
   __u8  subject[SEP_KEY_BLOB_MAX];
   __u8  nonce[SEP_KEY_NONCE_MAX];

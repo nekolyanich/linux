@@ -55,6 +55,7 @@ enum {
   SEP_KEY_ED25519  = 3, /* sign */
   SEP_KEY_P256     = 4, /* sign, ECDH */
   SEP_KEY_P256_PKA = 5, /* the same on the enclave's PKA engine */
+  SEP_KEY_ATTEST_KEY = 6, /* P-384, attests other keys (SEP_KEY_ATTEST) only */
   SEP_KEY_P384     = 7, /* sign, ECDH */
   SEP_KEY_P384_PKA = 8,
 };
@@ -69,6 +70,10 @@ enum {
 
 /* sep_key_create.flags */
 #define SEP_KEY_CREATE_BIOMETRY 1u /* sign/ECDH only after a match (SEP_KEY_AUTH) */
+/*
+ * For SEP_KEY_ATTEST_KEY the flag picks the bag instead: the attestation key is
+ * made ungated in the gated keys' bag, to attest them.
+ */
 
 /* sep_key_pubkey.flags */
 #define SEP_KEY_PUBKEY_BIOMETRY 1u /* the blob is finger-gated */

@@ -13,6 +13,8 @@
 //! - `osgn`: P-256/P-384 ECDSA over `d` as the digest (a longer one is cut to
 //!   the curve's size), DER out; Ed25519 over `d` as the message, 64 B out;
 //! - `ock`: raw ECDH, X25519 and P-256/P-384, the shared x out;
+//! - kt 6, the attestation key (P-384), only attests (`oa`, H4b): `osgn`
+//!   answers -12;
 //! - other ops on a type: -12.
 
 use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
@@ -115,6 +117,8 @@ enum Kind {
     Ed25519,
     P256,
     P384,
+    /// kt 6: attests other keys, never signs or derives.
+    Attest,
 }
 
 /// The types CREATE takes (AKSRefKeyType), with what each can do.
@@ -123,28 +127,29 @@ fn kind_of(kt: u32) -> Option<Kind> {
         1 => Some(Kind::X25519),
         3 => Some(Kind::Ed25519),
         4 | 5 => Some(Kind::P256),
+        6 => Some(Kind::Attest),
         7 | 8 => Some(Kind::P384),
         _ => None,
     }
 }
 
-const TYPES: u32 = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8);
+const TYPES: u32 = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
 
 impl Kind {
     fn pub_len(self) -> usize {
         match self {
             Kind::X25519 | Kind::Ed25519 => 32,
             Kind::P256 => 65,
-            Kind::P384 => 97,
+            Kind::P384 | Kind::Attest => 97,
         }
     }
 
     fn signs(self) -> bool {
-        self != Kind::X25519
+        !matches!(self, Kind::X25519 | Kind::Attest)
     }
 
     fn derives(self) -> bool {
-        self != Kind::Ed25519
+        !matches!(self, Kind::Ed25519 | Kind::Attest)
     }
 }
 
@@ -478,10 +483,26 @@ impl SepData {
             _ => return Err(EINVAL),
         };
         let flags = img.word(2);
-        if kind_of(kt).is_none() || flags & !CREATE_BIOMETRY != 0 {
+        let Some(kind) = kind_of(kt) else {
+            return Err(EINVAL);
+        };
+        if flags & !CREATE_BIOMETRY != 0 {
             return Err(EINVAL);
         }
-        let r = if flags & CREATE_BIOMETRY != 0 {
+        let r = if kind == Kind::Attest && flags & CREATE_BIOMETRY != 0 {
+            // An attestation key for the gated keys: in their bag, as both
+            // keys of an `oa` must be, and ungated (H4b-4: so made, it attests
+            // them without a match, their ACL has `oa=true`).
+            if !self.key_bio_ready(file) {
+                return Err(errno::opnotsupp());
+            }
+            let der = crate::der::encode_refkey_set(&[
+                (b"bc", RV::Integer(class)),
+                (b"kt", RV::Integer(kt)),
+                (b"o", RV::Utf8(b"oc")),
+            ])?;
+            self.key_identity_op(&der, None)?
+        } else if flags & CREATE_BIOMETRY != 0 {
             // On the bag designated to the fingers' SEP user: an undesignated
             // user bag answers -9 to a gated key whatever the match (H2b P3.0).
             if !self.key_bio_ready(file) {

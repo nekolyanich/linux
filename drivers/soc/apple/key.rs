@@ -77,6 +77,8 @@ const INFO_BIOMETRY: u32 = 4;
 const INFO_CREDIT: u32 = 8;
 
 const CREATE_BIOMETRY: u32 = 1;
+const CREATE_IDENTITY_BAG: u32 = 2;
+const ATTEST_IDENTITY_BAG: u32 = 1;
 const PUBKEY_BIOMETRY: u32 = 1;
 
 const AUTH_WINDOW: u32 = 1;
@@ -505,10 +507,19 @@ impl SepData {
         let Some(kind) = kind_of(kt) else {
             return Err(EINVAL);
         };
-        if flags & !CREATE_BIOMETRY != 0 {
+        if flags & !(CREATE_BIOMETRY | CREATE_IDENTITY_BAG) != 0 {
             return Err(EINVAL);
         }
-        let r = if kind == Kind::Attest && flags & CREATE_BIOMETRY != 0 {
+        // An attestation key is never gated; only it is made ungated in the
+        // identity bag.
+        let bad_combo = match kind {
+            Kind::Attest => flags & CREATE_BIOMETRY != 0,
+            _ => flags & CREATE_IDENTITY_BAG != 0,
+        };
+        if bad_combo {
+            return Err(EINVAL);
+        }
+        let r = if flags & CREATE_IDENTITY_BAG != 0 {
             // An attestation key for the gated keys: in their bag, as both
             // keys of an `oa` must be, and ungated (H4b-4: so made, it attests
             // them without a match, their ACL has `oa=true`).
@@ -660,27 +671,28 @@ impl SepData {
     }
 
     fn key_attest(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
-        // attester_len, subject_len, nonce_len, sep_status, statement_len
+        // attester_len, subject_len, nonce_len, sep_status, statement_len,
+        // flags, reserved[2]
+        let flags = img.word(5);
+        if flags & !ATTEST_IDENTITY_BAG != 0 || img.word(6) != 0 || img.word(7) != 0 {
+            return Err(EINVAL);
+        }
         let attester = blob_at(img, HEAD, 0)?;
         let subject = blob_at(img, HEAD + BLOB_MAX, 1)?;
         let (_kt, kind, attester_pub) = parse_blob(attester)?;
         if kind != Kind::Attest {
             return Err(errno::opnotsupp());
         }
-        let (_kt, _kind, subject_pub) = parse_blob(subject)?;
+        let (_kt, subject_kind, subject_pub) = parse_blob(subject)?;
+        if subject_kind == Kind::X25519 {
+            // no proof of possession in its statement (libaks), never seen
+            return Err(errno::opnotsupp());
+        }
         let n = img.word(2) as usize;
         if n > NONCE_MAX {
             return Err(EINVAL);
         }
         let nonce = img.field(HEAD + 2 * BLOB_MAX, n);
-        // Neither attests nor is attested: the machine ref key seals the
-        // trusted keys, and nothing it does is the caller's business.
-        for public in [attester_pub, subject_pub] {
-            if self.is_machine_refkey(public)? {
-                dev_warn!(self.dev, "sep-key: refused to attest with the machine ref key\n");
-                return Err(EPERM);
-            }
-        }
         let der = {
             let d = crate::der::encode_refkey_set(&[(b"rk", RV::Der(subject))])?;
             let mut items = KVec::new();
@@ -692,15 +704,24 @@ impl SepData {
             }
             crate::der::encode_refkey_set(&items)?
         };
-        let gated = is_gated(subject);
-        // Both keys live in one bag: a gated subject in the identity bag
-        // (its ACL has `oa=true`, H4b-4: no credit), any other in the
-        // caller's. The enclave refuses a mix (-7).
-        let r = if gated {
+        // Both keys live in one bag: the identity bag for a gated subject (its
+        // ACL has `oa=true`, H4b-4: no credit) or when asked (its ungated
+        // attestation key), else the caller's. The enclave refuses a mix (-7).
+        let identity = is_gated(subject) || flags & ATTEST_IDENTITY_BAG != 0;
+        let r = if identity {
             if file.uid as i32 != BIO_USER {
                 return Err(errno::opnotsupp());
             }
-            self.key_identity_op(&der, Some(subject_pub))?
+            // Neither attests nor is attested: the machine ref key seals the
+            // trusted keys and lives in this bag (in the caller's, the
+            // enclave refuses it anyway).
+            for public in [attester_pub, subject_pub] {
+                if self.is_machine_refkey(public)? {
+                    dev_dbg!(self.dev, "sep-key: refused to attest with the machine ref key\n");
+                    return Err(EPERM);
+                }
+            }
+            self.key_identity_op(&der, None)?
         } else {
             self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, &der)?
         };

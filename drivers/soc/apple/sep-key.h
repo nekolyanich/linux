@@ -73,9 +73,11 @@ enum {
 /* sep_key_create.flags */
 #define SEP_KEY_CREATE_BIOMETRY 1u /* sign/ECDH only after a match (SEP_KEY_AUTH) */
 /*
- * For SEP_KEY_ATTEST_KEY the flag picks the bag instead: the attestation key is
- * made ungated in the gated keys' bag, to attest them.
+ * SEP_KEY_ATTEST_KEY only (EINVAL with any other type, and with BIOMETRY: an
+ * attestation key is never gated): made in the gated keys' bag, to attest
+ * them. Needs what BIOMETRY needs.
  */
+#define SEP_KEY_CREATE_IDENTITY_BAG 2u
 
 /* sep_key_pubkey.flags */
 #define SEP_KEY_PUBKEY_BIOMETRY 1u /* the blob is finger-gated */
@@ -147,18 +149,23 @@ struct sep_key_pubkey {
  * The enclave's statement of a key (`oa`): the attester, an
  * SEP_KEY_ATTEST_KEY, signs a per-boot key that vouches for the boot (ECID,
  * measurements, nonce), which signs the subject's type, class, bag and ACL;
- * the subject signs its own part. Returned as the enclave's DER, unparsed. Both keys must
- * be in one bag: a gated subject is attested on the gated keys' bag, by an
- * attestation key created there (SEP_KEY_CREATE_BIOMETRY), and needs no
- * match; any other on the caller's own bag (EKEYREJECTED for a mix).
+ * the subject signs its own part. Returned as the enclave's DER, unparsed.
+ * Both keys must be in one bag (EKEYREJECTED for a mix): the gated keys' bag
+ * for a gated subject or with SEP_KEY_ATTEST_IDENTITY_BAG (an attester made
+ * with SEP_KEY_CREATE_IDENTITY_BAG, and the ungated subjects there), needing
+ * no match; else the caller's own. X25519 subjects: EOPNOTSUPP. EACCES: the
+ * subject's ACL refuses `oa`, which no touch changes.
  */
+#define SEP_KEY_ATTEST_IDENTITY_BAG 1u /* sep_key_attest.flags */
+
 struct sep_key_attest {
   __u32 attester_len;  /* in */
   __u32 subject_len;   /* in */
   __u32 nonce_len;     /* in: 0..SEP_KEY_NONCE_MAX */
   __s32 sep_status;    /* out */
   __u32 statement_len; /* out */
-  __u32 reserved[3];
+  __u32 flags;         /* in: 0 or SEP_KEY_ATTEST_IDENTITY_BAG */
+  __u32 reserved[2];   /* in: 0 */
   __u8  attester[SEP_KEY_BLOB_MAX];
   __u8  subject[SEP_KEY_BLOB_MAX];
   __u8  nonce[SEP_KEY_NONCE_MAX];

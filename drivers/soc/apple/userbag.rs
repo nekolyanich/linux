@@ -45,7 +45,7 @@ const MAX_WRAPPED: usize = 8192;
 /// How long a user-bag exchange may wait. Under the HV the hwrng's entropy
 /// requests at boot held a CREATE_KEYBAG back 3.8 s (sep-key bench, 1 of 1),
 /// past the driver's 2 s, and a timeout condemns the key store for the boot.
-const PATIENCE_MS: kernel::time::Msecs = 10_000;
+pub(crate) const PATIENCE_MS: kernel::time::Msecs = 10_000;
 
 /// The enclave's status for a handle it does not know (K0: an unloaded bag).
 const STATUS_STALE_HANDLE: i8 = -2;
@@ -174,6 +174,12 @@ fn read(uid: u32) -> Result<Option<StoredBag>> {
 
 pub(crate) fn stored(uid: u32) -> bool {
     matches!(read(uid), Ok(Some(_)))
+}
+
+/// As [`stored`], with a record that does not check out (EUCLEAN) or cannot
+/// be read an error, not "none".
+pub(crate) fn stored_checked(uid: u32) -> Result<bool> {
+    read(uid).map(|b| b.is_some())
 }
 
 /// Stores the record with one atomic replace of the user's file, so a crash

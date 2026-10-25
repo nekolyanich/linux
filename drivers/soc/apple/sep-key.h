@@ -76,10 +76,16 @@ enum {
 #define SEP_KEY_INFO_BIOMETRY   4u /* this uid can create finger-gated keys */
 #define SEP_KEY_INFO_CREDIT     8u /* this file holds an AUTH credit now */
 #define SEP_KEY_INFO_HOME_IDENTITY 16u /* this uid's home bag is the identity bag */
+/*
+ * For uid 1000, INFO (as every operation) reads the identity keybag's record
+ * and fails with its error when it cannot: EEXIST while provisioning writes
+ * it, EINVAL or ENOTSYNC for a record that does not check out, or the
+ * error opening it.
+ */
 
 /* sep_key_create.flags */
 #define SEP_KEY_CREATE_BIOMETRY 1u /* sign/ECDH only after a match (SEP_KEY_AUTH) */
-/* an SEP_KEY_ATTEST_KEY is never gated: EINVAL with BIOMETRY */
+/* an SEP_KEY_ATTEST_KEY takes no flag (it is never gated): EINVAL with any */
 
 /* sep_key_pubkey.flags */
 #define SEP_KEY_PUBKEY_BIOMETRY 1u /* the blob is finger-gated */

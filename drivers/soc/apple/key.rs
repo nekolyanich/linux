@@ -1084,8 +1084,16 @@ impl SepData {
     /// `rk_pubs` are the public keys of the ref keys the operation sends:
     /// never the machine ref key's, which lives in this bag too and seals the
     /// trusted keys (an `ock` with it would hand out their wrapping secret).
-    /// The gate in the blob's `ed` is the caller's to claim, so it is no guard.
+    /// The gate in the blob's `ed` is the caller's to claim, so it is no guard:
+    /// the enclave's own binding of the ACL is (H2b R5; the bench's
+    /// stripped-`ed` negative).
     fn key_identity_op(&self, der: &[u8], rk_pubs: &[&[u8]]) -> Result<OpReply> {
+        self.key_identity_try(der, rk_pubs)?.ok_or(ENODEV)
+    }
+
+    /// [`Self::key_identity_op`], or `None` when there is no identity bag:
+    /// one read of its record, under its lock, decides and serves the op.
+    fn key_identity_try(&self, der: &[u8], rk_pubs: &[&[u8]]) -> Result<Option<OpReply>> {
         for public in rk_pubs {
             if self.is_machine_refkey(public)? {
                 dev_dbg!(self.dev, "sep-key: refused an operation with the machine ref key\n");
@@ -1094,23 +1102,25 @@ impl SepData {
         }
         let _bag = self.identity_bag_lock.lock();
         let crate::keybag::State::Present(stored) = crate::keybag::read(crate::keybag::Slot::Identity)? else {
-            return Err(ENODEV);
+            return Ok(None);
         };
+        // as patient as the user bags: these are a user's everyday keys now
+        let patience = crate::userbag::PATIENCE_MS;
         let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
         let result = (|| {
-            let healthy = self.sks_health_check(c"sep-key gated").ok_or(EIO)?;
+            let healthy = self.sks_health_check(c"sep-key identity").ok_or(EIO)?;
             let out = self
-                .sks_send(self.sks_req_change_lock_state(
-                    handle,
-                    crate::LockState::Unlocked,
-                    stored.secret(),
-                    healthy,
-                ))
+                .sks_send_patient(
+                    self.sks_req_change_lock_state(handle, crate::LockState::Unlocked, stored.secret(), healthy),
+                    patience,
+                )
                 .ok_or(EIO)?;
             if out.reply.status != 0 {
                 return Err(EIO);
             }
-            let out = self.sks_send(self.sks_req_refkey(handle.value(), der)).ok_or(EIO)?;
+            let out = self
+                .sks_send_patient(self.sks_req_refkey(handle.value(), der), patience)
+                .ok_or(EIO)?;
             let mut body = KVec::new();
             if out.reply.status == 0 {
                 let b = self
@@ -1120,8 +1130,8 @@ impl SepData {
             }
             Ok(OpReply { status: out.reply.status, body })
         })();
-        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-        result
+        let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), patience);
+        result.map(Some)
     }
 
     /// Whether the caller's keys live in the identity bag: [`BIO_USER`]'s,
@@ -1142,16 +1152,30 @@ impl SepData {
     /// uid's own bag (made by a create). With [`Home::Legacy`], a blob the
     /// identity bag calls another bag's (-7) is tried once on [`BIO_USER`]'s
     /// own bag, if stored: its keys from before interface 4.
+    ///
+    /// The bag is chosen by the same read that serves the op. An identity bag
+    /// made between that read and a create on the own bag (an enrolment
+    /// finishing meanwhile) leaves the new key there: a legacy one, working
+    /// through the retry. A retry that fails keeps the -7 (its error only in
+    /// the debug log); a legacy record that does not check out is its error.
     fn key_home_op(&self, file: &KeyFile, der: &[u8], rk_pubs: &[&[u8]], how: Home) -> Result<OpReply> {
-        if !self.key_home_identity(file)? {
-            let create = how == Home::Create;
-            return self.user_bag_op(&mut self.user_bags.lock(), file.uid, create, der);
+        let own = |sep: &SepData| sep.user_bag_op(&mut sep.user_bags.lock(), file.uid, how == Home::Create, der);
+        if file.uid as i32 != BIO_USER {
+            return own(self);
         }
-        let r = self.key_identity_op(der, rk_pubs)?;
-        if how == Home::Legacy && r.status == STATUS_OTHER_BAG && crate::userbag::stored(file.uid) {
-            return self.user_bag_op(&mut self.user_bags.lock(), file.uid, false, der);
+        let Some(r) = self.key_identity_try(der, rk_pubs)? else {
+            return own(self);
+        };
+        if how != Home::Legacy || r.status != STATUS_OTHER_BAG || !crate::userbag::stored_checked(file.uid)? {
+            return Ok(r);
         }
-        Ok(r)
+        match own(self) {
+            Ok(legacy) => Ok(legacy),
+            Err(e) => {
+                dev_dbg!(self.dev, "sep-key: uid {}'s own bag: {:?}\n", file.uid, e);
+                Ok(r)
+            }
+        }
     }
 
     /// The enrolled-set id of [`BIO_USER`] (op33).

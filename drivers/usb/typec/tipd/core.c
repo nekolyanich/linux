@@ -108,6 +108,7 @@ struct tps6598x_rx_identity_reg {
 
 /* Debounce delay for mode changes, in milliseconds */
 #define CD321X_DEBOUNCE_DELAY_MS 500
+#define CD321X_MUX_RETRIES 3
 
 enum {
 	TPS_MODE_APP,
@@ -588,10 +589,32 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
  * update than the USB connection it follows, with the role already active and
  * unchanged, so drop the role here; cd321x_update_work() sets it back after.
  */
-static int cd321x_mux_set(struct tps6598x *tps, struct cd321x *cd321x)
+static int cd321x_mux_set(struct tps6598x *tps, struct cd321x *cd321x,
+			  const struct typec_mux_state *old)
 {
-	if (usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)
-		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+	int ret;
+
+	if (usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE) {
+		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+		if (ret) {
+			/*
+			 * Never switch under a live role. Keep the old state so
+			 * the next update tries the switch again, and make one.
+			 */
+			cd321x->state = *old;
+			if (cd321x->mux_retries++ < CD321X_MUX_RETRIES) {
+				dev_warn(tps->dev, "mux switch postponed, USB role drop failed: %d\n",
+					 ret);
+				mod_delayed_work(system_wq, &cd321x->update_work,
+						 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+			} else {
+				dev_err(tps->dev, "mux switch dropped, USB role drop failed: %d\n",
+					ret);
+			}
+			return ret;
+		}
+	}
+	cd321x->mux_retries = 0;
 
 	return typec_mux_set(cd321x->mux, &cd321x->state);
 }
@@ -599,6 +622,7 @@ static int cd321x_mux_set(struct tps6598x *tps, struct cd321x *cd321x)
 static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	const struct typec_mux_state old = cd321x->state;
 	struct typec_thunderbolt_switch_data tbt_switch_data = {
 		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
 	};
@@ -610,7 +634,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		cd321x_mux_set(tps, cd321x);
+		cd321x_mux_set(tps, cd321x, &old);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -650,7 +674,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.data = &dp_data;
 		cd321x->state.mode = mode;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		cd321x_mux_set(tps, cd321x);
+		cd321x_mux_set(tps, cd321x, &old);
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
@@ -674,7 +698,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
-		cd321x_mux_set(tps, cd321x);
+		cd321x_mux_set(tps, cd321x, &old);
 
 		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
 		tbt_switch_data.tbt = tbt_data;
@@ -695,7 +719,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
-		cd321x_mux_set(tps, cd321x);
+		cd321x_mux_set(tps, cd321x, &old);
 
 		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
 		tbt_switch_data.usb4 = eusb_data;
@@ -710,7 +734,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.mode = TYPEC_STATE_USB;
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		cd321x_mux_set(tps, cd321x);
+		cd321x_mux_set(tps, cd321x, &old);
 	}
 
 	/* Clear data since it's no longer used after typec_mux_set and points to the stack */
@@ -861,6 +885,7 @@ static void cd321x_update_work(struct work_struct *work)
 		if (!IS_ERR(tps->partner))
 			typec_unregister_partner(tps->partner);
 		tps->partner = NULL;
+		cd321x->mux_retries = 0;
 	}
 
 	/* If there was a disconnection, set PHY to off */

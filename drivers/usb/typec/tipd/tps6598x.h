@@ -399,6 +399,8 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	/* mux switches postponed in a row by a failed USB role drop */
+	unsigned int mux_retries;
 
 	struct typec_thunderbolt_switch *tbt_switch;
 

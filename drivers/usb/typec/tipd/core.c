@@ -589,12 +589,20 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
  * update than the USB connection it follows, with the role already active and
  * unchanged, so drop the role here; cd321x_update_work() sets it back after.
  */
+/* DP pin assignments C and E take all four lanes: USB2 only, no PIPE to move. */
+static bool cd321x_dp_all_lanes(struct cd321x *cd321x, const struct typec_mux_state *state)
+{
+	return state->alt && state->alt == cd321x->port_altmode_dp &&
+	       (state->mode == TYPEC_DP_STATE_C || state->mode == TYPEC_DP_STATE_E);
+}
+
 static int cd321x_mux_set(struct tps6598x *tps, struct cd321x *cd321x,
 			  const struct typec_mux_state *old)
 {
 	int ret;
 
-	if (usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE) {
+	if (usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE &&
+	    !(cd321x_dp_all_lanes(cd321x, old) && cd321x_dp_all_lanes(cd321x, &cd321x->state))) {
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret) {
 			/*

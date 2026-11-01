@@ -237,6 +237,13 @@ struct Attest {
     statement: [u8; STATEMENT_MAX],
 }
 
+#[repr(C)]
+#[allow(dead_code)]
+struct ChangeSecret {
+    head: [u32; 4],
+    new_secret: [u8; CHANGE_SECRET_MAX],
+}
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Info>() == 32);
 static_assert!(core::mem::size_of::<Create>() == 1156);
@@ -246,6 +253,7 @@ static_assert!(core::mem::size_of::<Pubkey>() == 1156);
 static_assert!(core::mem::size_of::<Auth>() == 32);
 static_assert!(core::mem::size_of::<AuthPoll>() == 32);
 static_assert!(core::mem::size_of::<Attest>() == 6208);
+static_assert!(core::mem::size_of::<ChangeSecret>() == 80);
 
 const HEAD: usize = 32;
 
@@ -260,6 +268,15 @@ const IOC_AUTH: u32 = _IOW::<Auth>(MAGIC, 0x06);
 const IOC_AUTH_POLL: u32 = _IOR::<AuthPoll>(MAGIC, 0x07);
 const IOC_AUTH_CANCEL: u32 = _IO(MAGIC, 0x08);
 const IOC_ATTEST: u32 = _IOWR::<Attest>(MAGIC, 0x09);
+const IOC_CHANGE_SECRET: u32 = _IOWR::<ChangeSecret>(MAGIC, 0x0a);
+
+/// SEP_KEY_CHANGE_SECRET: the most a caller's new secret takes, and where.
+const CHANGE_SECRET_AT: usize = 16;
+const CHANGE_SECRET_MAX: usize = 64;
+/// The kernel makes the new secret: random, as the identity bag's first one.
+const CHANGE_RANDOM: u32 = 1;
+/// The new secret SEP_KEY_CHANGE_RANDOM makes.
+const RANDOM_SECRET_LEN: usize = 32;
 
 /// A struct's byte image, read from and written back to userspace. It holds
 /// an ECDH secret on its way out, so it is wiped when dropped.
@@ -754,6 +771,7 @@ impl SepData {
             IOC_ECDH => (core::mem::size_of::<Ecdh>(), |s, f, i| s.key_ecdh(f, i)),
             IOC_PUBKEY => (core::mem::size_of::<Pubkey>(), |s, _, i| s.key_pubkey(i)),
             IOC_ATTEST => (core::mem::size_of::<Attest>(), |s, f, i| s.key_attest(f, i)),
+            IOC_CHANGE_SECRET => (core::mem::size_of::<ChangeSecret>(), |s, f, i| s.key_change_secret(f, i)),
             _ => return Err(ENOTTY),
         };
         if !self.sks_ready() {
@@ -1152,6 +1170,87 @@ impl SepData {
         })();
         let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), patience);
         result.map(Some)
+    }
+
+    /// SEP_KEY_CHANGE_SECRET: a new secret for the caller's home bag, its keys
+    /// and EK kept (tanabota U-K). R1 covers the identity bag only, which is
+    /// [`BIO_USER`]'s home: a uid's own bag is never designated, and op 0x07
+    /// works on a designated handle; EOPNOTSUPP for it.
+    ///
+    /// Under the bag's lock: load it, designate it to [`BIO_USER`] unless the
+    /// Touch ID bring-up did, op 0x07 old to new on -1000, COPY_KEYBAG on -1000
+    /// and one atomic replace of the record (the new wrapped copy and the new
+    /// secret). Every other user of the secret reads the record per use; the
+    /// enrolment path's copy is updated here. The caller's new secret is wiped
+    /// from the image before it goes back.
+    fn key_change_secret(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        // flags, sep_status, new_len, reserved
+        let (flags, new_len) = (img.word(0), img.word(2) as usize);
+        let random = flags & CHANGE_RANDOM != 0;
+        if flags & !CHANGE_RANDOM != 0 || new_len > CHANGE_SECRET_MAX || random == (new_len != 0) {
+            return Err(EINVAL);
+        }
+        let mut new = crate::Secret(KVec::new());
+        if random {
+            new.0.resize(RANDOM_SECRET_LEN, 0, GFP_KERNEL)?;
+            crate::shim::random_bytes(&mut new.0)?;
+        } else {
+            new.0.extend_from_slice(img.field(CHANGE_SECRET_AT, new_len), GFP_KERNEL)?;
+        }
+        img.put(CHANGE_SECRET_AT, CHANGE_SECRET_MAX, &[])?;
+        if file.uid as i32 != BIO_USER {
+            return Err(errno::opnotsupp());
+        }
+        let user = crate::sks::DesignateUser::new(BIO_USER).ok_or(EINVAL)?;
+        let special = user.special_handle();
+        let patience = crate::userbag::PATIENCE_MS;
+
+        let _bag = self.identity_bag_lock.lock();
+        let crate::keybag::State::Present(stored) = crate::keybag::read(crate::keybag::Slot::Identity)? else {
+            return Err(errno::opnotsupp());
+        };
+        let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
+        let result = (|| {
+            if !self.keybag_designated.load(Relaxed) {
+                let d = crate::sks::Designation::new(handle, user);
+                let out = self.sks_send_patient(self.sks_req_designate(&d, stored.secret()), patience).ok_or(EIO)?;
+                if out.reply.status != 0 {
+                    img.set_word(1, out.reply.status as i32 as u32);
+                    return Err(errno_of(out.reply.status));
+                }
+            }
+            let out = self
+                .sks_send_patient(self.sks_req_change_secret(special, stored.secret(), &new), patience)
+                .ok_or(EIO)?;
+            img.set_word(1, out.reply.status as i32 as u32);
+            if out.reply.status != 0 {
+                return Err(errno_of(out.reply.status));
+            }
+            // From here the enclave holds the new secret. If the record is not
+            // rewritten, the old one still opens with the old secret (no
+            // generation in the enclave, U-J), so ops keep working, and the
+            // next boot loads the old copy: the change is lost, not the bag.
+            let fresh = self
+                .sks_send_patient(self.sks_req_copy_keybag_special(special), patience)
+                .and_then(|out| self.wrapped_from_copy_reply(&out, c"the identity bag after its change"));
+            let written = match fresh {
+                Some(fresh) => crate::keybag::replace_bag_and_secret(crate::keybag::Slot::Identity, &fresh, &new),
+                None => Err(EIO),
+            };
+            if let Err(e) = written {
+                dev_err!(
+                    self.dev,
+                    "sep-key: the identity bag's secret changed in the enclave but its record was not rewritten ({:?}); the old record stays valid until reboot loads it\n",
+                    e
+                );
+                return Err(EIO);
+            }
+            self.sks_update_enrolment_secret(special, &new)?;
+            dev_info!(self.dev, "sep-key: the identity bag's secret changed\n");
+            Ok(())
+        })();
+        let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), patience);
+        result
     }
 
     /// Whether the caller's keys live in the identity bag: [`BIO_USER`]'s,

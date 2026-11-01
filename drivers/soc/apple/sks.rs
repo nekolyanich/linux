@@ -410,7 +410,7 @@ impl SepData {
     /// `0x0d` designate, which makes the system key bag. On 13.5 the body is:
     /// source handle, session, an empty blob and
     /// nothing after it.
-    fn sks_req_designate(&self, d: &crate::sks::Designation, secret: &[u8]) -> Result<SksRequest> {
+    pub(crate) fn sks_req_designate(&self, d: &crate::sks::Designation, secret: &[u8]) -> Result<SksRequest> {
         let mut body = image::Body::new();
         body.put_u32(self.sks_designate_variant())?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
@@ -544,12 +544,36 @@ impl SepData {
     }
 
     /// `0x02` copy the designated biometric identity bag.
-    fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag();
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
         body.put_i32(handle.value())?;
+        self.sks_seal(&op, &body)
+    }
+
+    /// `0x07` change secret on the designated handle `special`: body u32 1,
+    /// client, i32 special, blob old, blob new, u64 0, u32 0xff, u32 0 (M-1).
+    /// The enclave rewraps the bag; the new wrapped copy comes from
+    /// COPY_KEYBAG on `special`, not on the load handle (U-J: that one still
+    /// gives the bytes from before the change).
+    pub(crate) fn sks_req_change_secret(
+        &self,
+        special: crate::sks::SpecialHandle,
+        old: &[u8],
+        new: &[u8],
+    ) -> Result<SksRequest> {
+        let op = crate::sks::sks_change_secret();
+        let mut body = image::Body::new();
+        body.put_u32(crate::sks::SKS_CHANGE_SECRET_VARIANT)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_blob(old)?;
+        body.put_blob(new)?;
+        body.put_u64(0)?;
+        body.put_u32(crate::sks::SKS_CHANGE_SECRET_SCALAR)?;
+        body.put_u32(0)?;
         self.sks_seal(&op, &body)
     }
 
@@ -823,6 +847,19 @@ impl SepData {
         self.keybag_designated.store(true, Relaxed);
 
         self.sks_remember_enrolment_material(designation.user().special_handle(), secret);
+    }
+
+    /// After a change of the identity bag's secret: the enrolment path's copy
+    /// (its VERIFY_SECRET for the passcode context) follows it.
+    pub(crate) fn sks_update_enrolment_secret(&self, special: crate::sks::SpecialHandle, secret: &[u8]) -> Result<()> {
+        let mut copy = KVec::new();
+        copy.extend_from_slice(secret, GFP_KERNEL)?;
+        if let Some(material) = &mut *self.enrol_material.lock() {
+            if material.special.value() == special.value() {
+                material.secret = Secret(copy);
+            }
+        }
+        Ok(())
     }
 
     fn sks_remember_enrolment_material(&self, special: crate::sks::SpecialHandle, secret: &[u8]) {
@@ -1267,6 +1304,19 @@ pub(crate) fn sks_copy_keybag() -> SksOp {
         name: c"COPY_KEYBAG",
     }
 }
+
+/// `0x07` change a designated bag's secret: macOS's `aks_change_secret`
+/// (tanabota M-1: libaks selector 15, 2 of 2 traces; U-J/U-K from Linux).
+const OP_SKS_CHANGE_SECRET: u8 = 0x07;
+pub(crate) fn sks_change_secret() -> SksOp {
+    SksOp {
+        opcode: OP_SKS_CHANGE_SECRET,
+        name: c"CHANGE_SECRET",
+    }
+}
+pub(crate) const SKS_CHANGE_SECRET_VARIANT: u32 = 1;
+/// The scalar libaks passes after the two secrets (M-1: 0xff in both traces).
+pub(crate) const SKS_CHANGE_SECRET_SCALAR: u32 = 0xff;
 
 const OP_SKS_CREATE_KEYBAG: u8 = 0x01;
 pub(crate) const SKS_CREATE_NAME: &CStr = c"CREATE_KEYBAG";

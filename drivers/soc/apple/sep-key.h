@@ -211,6 +211,28 @@ struct sep_key_auth_poll {
   __u32 reserved[4];
 };
 
+/*
+ * A new secret for the caller's home bag: its keys, their certificates and
+ * its EK stay (the enclave rewraps the bag, op 0x07 as macOS's
+ * aks_change_secret). Only the identity bag for now (uid 1000's home):
+ * EOPNOTSUPP for a uid's own bag. With SEP_KEY_CHANGE_RANDOM (new_len 0) the
+ * kernel makes a random 32 B secret; else new_secret holds new_len bytes,
+ * wiped before the struct goes back. sep_status is the enclave's answer to
+ * the change (or to the designation before it). EIO with sep_status 0: the
+ * enclave changed the secret but the record was not rewritten; the old
+ * record still opens with the old secret, and the next boot loads it.
+ */
+#define SEP_KEY_CHANGE_RANDOM 1u
+#define SEP_KEY_CHANGE_SECRET_MAX 64
+
+struct sep_key_change_secret {
+  __u32 flags;      /* in: 0 or SEP_KEY_CHANGE_RANDOM */
+  __s32 sep_status; /* out */
+  __u32 new_len;    /* in: 1..SEP_KEY_CHANGE_SECRET_MAX, 0 with RANDOM */
+  __u32 reserved;
+  __u8  new_secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
+};
+
 #define SEP_KEY_IOC_MAGIC 0xB2
 
 #define SEP_KEY_GET_INFO _IOR (SEP_KEY_IOC_MAGIC, 0x01, struct sep_key_info)
@@ -222,3 +244,4 @@ struct sep_key_auth_poll {
 #define SEP_KEY_AUTH_POLL   _IOR (SEP_KEY_IOC_MAGIC, 0x07, struct sep_key_auth_poll)
 #define SEP_KEY_AUTH_CANCEL _IO  (SEP_KEY_IOC_MAGIC, 0x08)
 #define SEP_KEY_ATTEST      _IOWR(SEP_KEY_IOC_MAGIC, 0x09, struct sep_key_attest)
+#define SEP_KEY_CHANGE_SECRET _IOWR(SEP_KEY_IOC_MAGIC, 0x0a, struct sep_key_change_secret)

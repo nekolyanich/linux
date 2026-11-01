@@ -312,6 +312,22 @@ pub(crate) fn replace_wrapped(
     )
 }
 
+/// Replaces the wrapped blob and the secret together, after the enclave
+/// changed the bag's secret: the same bag (uuid, provenance), one atomic
+/// replace. The previous record still opens with the previous secret (the
+/// enclave keeps no generation, tanabota U-J): the caller must not leave it
+/// anywhere else.
+pub(crate) fn replace_bag_and_secret(slot: Slot, fresh: &[u8], secret: &[u8]) -> Result<()> {
+    if fresh.is_empty() || fresh.len() > MAX_WRAPPED || secret.is_empty() || secret.len() > MAX_WRAPPED {
+        return Err(EINVAL);
+    }
+    let stored = match read(slot)? {
+        State::Present(stored) => stored,
+        State::Absent(_) => return Err(ENOENT),
+    };
+    write_record(slot, stored.uuid_provenance().state(), fresh, stored.uuid(), secret)
+}
+
 fn write_record(
     slot: Slot,
     state: u32,

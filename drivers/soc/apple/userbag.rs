@@ -536,11 +536,24 @@ impl SepData {
     }
 
     /// DESIGNATE {handle, -uid} with the bag's secret (Variant5's carries it),
-    /// for a uid that gets one; nothing for the others.
+    /// for a uid that gets one; nothing for the others. A designation made
+    /// earlier this boot outlives its load handle (U-B) and is unlocked in
+    /// place instead: once SEP_KEY_LOCK closed it, a DESIGNATE onto it again
+    /// is refused (tanabota U-N1: mailbox status -1 after LOCK). -2 there
+    /// means none yet: DESIGNATE. `secret` is one that already opened the bag.
     fn user_bag_designate(&self, uid: u32, handle: KeyBagHandle, secret: &[u8]) -> Result<()> {
         let Some(user) = designated_user(uid) else {
             return Ok(());
         };
+        let healthy = self.sks_health_check(c"sep-key designate").ok_or(EIO)?;
+        if let Some(out) = self.sks_send_patient(
+            self.sks_req_unlock_special(user.special_handle(), secret, healthy),
+            PATIENCE_MS,
+        ) {
+            if out.reply.status == 0 {
+                return Ok(());
+            }
+        }
         let d = crate::sks::Designation::new(handle, user);
         let out = self
             .sks_send_patient(self.sks_req_designate(&d, secret), PATIENCE_MS)

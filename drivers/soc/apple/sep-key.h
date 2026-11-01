@@ -18,6 +18,10 @@
  * Every ioctl copies its struct back, also when it fails with the enclave's
  * refusal: sep_status is the enclave's own status then.
  *
+ * A key created with SEP_KEY_CREATE_PRESENCE is gated by a finger or the
+ * bag's password (macOS's .userPresence): a match credits it as below; the
+ * password half follows the bag's secret, so it changes with that secret.
+ *
  * A key created with SEP_KEY_CREATE_BIOMETRY is gated by a finger: the
  * enclave signs or derives with it only within a context a match has
  * credited. SEP_KEY_AUTH starts a Touch ID verify for this file (the sensor is
@@ -85,10 +89,12 @@ enum {
 
 /* sep_key_create.flags */
 #define SEP_KEY_CREATE_BIOMETRY 1u /* sign/ECDH only after a match (SEP_KEY_AUTH) */
+#define SEP_KEY_CREATE_PRESENCE 2u /* after a match or the bag's password: finger or password */
 /* an SEP_KEY_ATTEST_KEY takes no flag (it is never gated): EINVAL with any */
 
 /* sep_key_pubkey.flags */
 #define SEP_KEY_PUBKEY_BIOMETRY 1u /* the blob is finger-gated */
+#define SEP_KEY_PUBKEY_PRESENCE 2u /* the blob is finger-or-password gated */
 
 struct sep_key_info {
   __u32 version;
@@ -102,7 +108,7 @@ struct sep_key_info {
 struct sep_key_create {
   __u32 type;       /* in: SEP_KEY_* */
   __u32 class;      /* in: 0 or SEP_KEY_CLASS_DEFAULT; nothing else in v1 */
-  __u32 flags;      /* in: 0 or SEP_KEY_CREATE_BIOMETRY */
+  __u32 flags;      /* in: 0, SEP_KEY_CREATE_BIOMETRY or SEP_KEY_CREATE_PRESENCE */
   __s32 sep_status; /* out */
   __u32 blob_len;   /* out */
   __u32 pub_len;    /* out */

@@ -78,7 +78,9 @@ const INFO_CREDIT: u32 = 8;
 const INFO_HOME_IDENTITY: u32 = 16;
 
 const CREATE_BIOMETRY: u32 = 1;
+const CREATE_PRESENCE: u32 = 2;
 const PUBKEY_BIOMETRY: u32 = 1;
+const PUBKEY_PRESENCE: u32 = 2;
 
 const AUTH_WINDOW: u32 = 1;
 const AUTH_WINDOW_MAX: u32 = 300;
@@ -331,10 +333,20 @@ fn parse_blob(blob: &[u8]) -> Result<(u32, Kind, &[u8])> {
     Ok((kt, kind, public))
 }
 
-/// Whether the blob carries a `cbio` constraint (created gated): its `ed`
-/// member holds the ACL the create answered.
-fn is_gated(blob: &[u8]) -> bool {
+/// Whether the blob carries a `cbio` constraint (created finger-gated): its
+/// `ed` member holds the ACL the create answered.
+fn is_finger_gated(blob: &[u8]) -> bool {
     crate::der::refkey_find(blob, b"ed").is_some_and(|ed| ed.windows(6).any(|w| w == b"\x0c\x04cbio"))
+}
+
+/// Whether the blob carries a `cpo` constraint (created finger-or-password).
+fn is_presence_gated(blob: &[u8]) -> bool {
+    crate::der::refkey_find(blob, b"ed").is_some_and(|ed| ed.windows(5).any(|w| w == b"\x0c\x03cpo"))
+}
+
+/// Whether an operation with the blob needs the file's credit.
+fn is_gated(blob: &[u8]) -> bool {
+    is_finger_gated(blob) || is_presence_gated(blob)
 }
 
 /// The blob at `HEAD`, its length in head word `len_word`.
@@ -520,16 +532,18 @@ impl SepData {
             return Err(EINVAL);
         };
         // an attestation key is never gated
-        if flags & !CREATE_BIOMETRY != 0 || (kind == Kind::Attest && flags != 0) {
+        if !matches!(flags, 0 | CREATE_BIOMETRY | CREATE_PRESENCE) || (kind == Kind::Attest && flags != 0) {
             return Err(EINVAL);
         }
-        let r = if flags & CREATE_BIOMETRY != 0 {
+        let r = if flags != 0 {
             // On the bag designated to the fingers' SEP user: an undesignated
             // user bag answers -9 to a gated key whatever the match (H2b P3.0).
+            // A finger-or-password key goes there too: its password half is
+            // that bag's secret (VERIFY_SECRET on -uid, U-B card 3).
             if !self.key_bio_ready(file) {
                 return Err(errno::opnotsupp());
             }
-            let ed = self.key_gated_ed()?;
+            let ed = if flags == CREATE_PRESENCE { Self::key_presence_ed()? } else { self.key_gated_ed()? };
             let der = crate::der::encode_refkey_set(&[
                 (b"bc", RV::Integer(class)),
                 (b"ed", RV::Der(&ed)),
@@ -651,13 +665,19 @@ impl SepData {
         // blob_len, type, pub_len
         let blob = blob_in(img, 0)?;
         let (kt, _kind, public) = parse_blob(blob)?;
-        let gated = is_gated(blob);
+        let gated = if is_finger_gated(blob) {
+            PUBKEY_BIOMETRY
+        } else if is_presence_gated(blob) {
+            PUBKEY_PRESENCE
+        } else {
+            0
+        };
         let mut copy = KVec::new();
         copy.extend_from_slice(public, GFP_KERNEL)?;
         img.put(HEAD + BLOB_MAX, PUB_MAX, &copy)?;
         img.set_word(1, kt);
         img.set_word(2, copy.len() as u32);
-        img.set_word(3, if gated { PUBKEY_BIOMETRY } else { 0 });
+        img.set_word(3, gated);
         Ok(())
     }
 
@@ -1215,6 +1235,23 @@ impl SepData {
             (b"odel", RV::Der(TRUE)),
             (b"okd", RV::Der(&cbio)),
             (b"osgn", RV::Der(&cbio)),
+        ])?;
+        crate::der::encode_refkey_set(&[(b"acl", RV::Der(&acl))])
+    }
+
+    /// The `ed` of a finger-or-password create: `{acl={ock,osgn,okd={cpo=
+    /// "DeviceOwnerAuthentication"}, odel,oa=true}}`, macOS's
+    /// `.userPresence` (H1 01588; bench U-C: a match credits it, U-B: so does
+    /// a VERIFY_SECRET of the bag's secret).
+    fn key_presence_ed() -> Result<KVec<u8>> {
+        let cpo = crate::der::encode_refkey_set(&[(b"cpo", RV::Utf8(b"DeviceOwnerAuthentication"))])?;
+        const TRUE: &[u8] = &[0x01, 0x01, 0x01];
+        let acl = crate::der::encode_refkey_set(&[
+            (b"oa", RV::Der(TRUE)),
+            (b"ock", RV::Der(&cpo)),
+            (b"odel", RV::Der(TRUE)),
+            (b"okd", RV::Der(&cpo)),
+            (b"osgn", RV::Der(&cpo)),
         ])?;
         crate::der::encode_refkey_set(&[(b"acl", RV::Der(&acl))])
     }

@@ -6,6 +6,30 @@
 //! `0x02` copies the bag out enclave-wrapped, `0x03` reloads it. NEVER create a
 //! second bag while a stored blob exists — it orphans the previous one in the
 //! enclave with no recovery; [`NoStoredKeyBag`] enforces this by type.
+//!
+//! The identity bag is uid 1000's home bag, kept like every uid's (tanabota,
+//! 2026-11-01): its record is `/var/lib/tanabota-sep-bag-1000.bin` in
+//! userbag.rs's format (H, with its home flag). The old record
+//! `aurora-sep-keybag.bin` (K) stays as a mirror in this format, rewritten
+//! with H, so a rollback generation reads the same bag and secret and never
+//! provisions a new one over it (with K missing, an old kernel's
+//! `provision_keybag=1` would create a new identity bag); R3 removes it.
+//! The create's intent and refusal markers stay in K.
+//!
+//! Migration, at every read of the slot, idempotent, each step one atomic
+//! replace or a create that never overwrites:
+//! 1. H holds uid 1000's own bag from before (no home flag): copied to
+//!    `tanabota-sep-bag-1000.legacy.bin` (the -7 retry reads it there); an
+//!    identical copy already there is a crash between this and step 2.
+//! 2. K committed and H not home: H written from K (same bag, uuid, secret,
+//!    provenance) and read back to compare.
+//! 3. H home and K differs: the same uuid and secret with another wrapped
+//!    copy is a snapshot only K got (an older generation writes K alone, and
+//!    a snapshot writes K before H): H takes K's copy. Anything else (another
+//!    secret: a change whose mirror write was lost; K missing, an intent or
+//!    unreadable) is H's: K is rewritten from H. A change writes H before K,
+//!    so a stale K never wins, and an old K left after a secret change would
+//!    be an open copy (no generation in the enclave), so it never stays.
 
 use crate::shim;
 use crate::store::crc16_ccitt_false;
@@ -143,6 +167,77 @@ fn checksum_input(
 /// Absent only when the file is missing; every other unreadable state errors —
 /// "cannot tell" must never read as "nothing here", which would orphan a bag.
 pub(crate) fn read(slot: Slot) -> Result<State> {
+    migrate(slot)?;
+    match crate::userbag::read_home(HOME_UID)? {
+        crate::userbag::HomeFile::Home(h) => Ok(State::Present(from_home(h))),
+        _ => match read_old(slot)? {
+            // migrate() writes H from a committed K or fails
+            State::Present(_) => Err(EIO),
+            absent => Ok(absent),
+        },
+    }
+}
+
+/// The fingers' user, whose home bag the identity slot is.
+const HOME_UID: u32 = crate::SBIO_PROBE_USER_ID as u32;
+
+fn from_home(h: crate::userbag::HomeRecord) -> StoredKeyBag {
+    StoredKeyBag {
+        wrapped: h.wrapped,
+        uuid: h.uuid,
+        secret: h.secret,
+        provenance: if h.readback { UuidProvenance::ReadBackFromBag } else { UuidProvenance::AsGenerated },
+    }
+}
+
+fn readback(p: UuidProvenance) -> bool {
+    p == UuidProvenance::ReadBackFromBag
+}
+
+/// Brings the files to the module comment's shape; see the steps there.
+fn migrate(slot: Slot) -> Result<()> {
+    use crate::userbag::{self, HomeFile};
+    let home = userbag::read_home(HOME_UID)?;
+    if matches!(home, HomeFile::Legacy) {
+        userbag::move_legacy_aside(HOME_UID)?;
+    }
+    let old = read_old(slot);
+    match (home, old) {
+        (HomeFile::Home(h), Ok(State::Present(k))) => {
+            if k.uuid == h.uuid && k.provenance == readback_of(h.readback) && *k.secret == *h.secret {
+                if k.wrapped != h.wrapped {
+                    pr_info!("apple_sep: uid 1000's home record takes the identity record's newer snapshot\n");
+                    userbag::write_home(HOME_UID, &h.uuid, h.readback, &h.secret, &k.wrapped)?;
+                }
+                Ok(())
+            } else {
+                pr_warn!("apple_sep: the identity record differs from uid 1000's home record: rewritten from it\n");
+                write_record(slot, readback_of(h.readback).state(), &h.wrapped, &h.uuid, &h.secret)
+            }
+        }
+        (HomeFile::Home(h), _) => {
+            write_record(slot, readback_of(h.readback).state(), &h.wrapped, &h.uuid, &h.secret)
+        }
+        (_, Ok(State::Present(k))) => {
+            userbag::write_home(HOME_UID, &k.uuid, readback(k.provenance), &k.secret, &k.wrapped)?;
+            match userbag::read_home(HOME_UID)? {
+                HomeFile::Home(h) if h.uuid == k.uuid && h.wrapped == k.wrapped && *h.secret == *k.secret => {
+                    pr_info!("apple_sep: the identity bag's record moved to uid 1000's home record\n");
+                    Ok(())
+                }
+                _ => Err(EIO),
+            }
+        }
+        (_, _) => Ok(()),
+    }
+}
+
+fn readback_of(readback: bool) -> UuidProvenance {
+    if readback { UuidProvenance::ReadBackFromBag } else { UuidProvenance::AsGenerated }
+}
+
+/// K as the record it is (intent, refused, committed).
+fn read_old(slot: Slot) -> Result<State> {
     let file = match shim::StoreFile::open_readonly(slot.path()) {
         Ok(f) => f,
         Err(e) if e == ENOENT => {
@@ -253,6 +348,9 @@ pub(crate) fn write_bag_uuid(
     if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() > MAX_WRAPPED {
         return Err(EINVAL);
     }
+    // a create: H first; a crash before K leaves K's intent, which the next
+    // read rewrites from H
+    crate::userbag::write_home(HOME_UID, uuid, true, secret, wrapped)?;
     write_record(
         slot,
         UuidProvenance::ReadBackFromBag.state(),
@@ -273,6 +371,7 @@ pub(crate) fn write_generated_uuid(
     if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() > MAX_WRAPPED {
         return Err(EINVAL);
     }
+    crate::userbag::write_home(HOME_UID, uuid, false, secret, wrapped)?;
     write_record(
         slot,
         UuidProvenance::AsGenerated.state(),
@@ -303,13 +402,16 @@ pub(crate) fn replace_wrapped(
         // Sepos13 lookup UUID is not the UUID returned by COPY_KEYBAG_UUID.
         return Err(EPERM);
     }
+    // a snapshot: K first, then H; a crash between leaves K's newer copy with
+    // the same secret, which the next read gives H
     write_record(
         slot,
         stored.uuid_provenance().state(),
         fresh,
         stored.uuid(),
         stored.secret(),
-    )
+    )?;
+    crate::userbag::write_home(HOME_UID, stored.uuid(), readback(stored.provenance), stored.secret(), fresh)
 }
 
 /// Replaces the wrapped blob and the secret together, after the enclave
@@ -325,6 +427,9 @@ pub(crate) fn replace_bag_and_secret(slot: Slot, fresh: &[u8], secret: &[u8]) ->
         State::Present(stored) => stored,
         State::Absent(_) => return Err(ENOENT),
     };
+    // a change: H first, then K; a crash between leaves K with the old
+    // secret, which the next read rewrites from H
+    crate::userbag::write_home(HOME_UID, stored.uuid(), readback(stored.provenance), secret, fresh)?;
     write_record(slot, stored.uuid_provenance().state(), fresh, stored.uuid(), secret)
 }
 

@@ -43,12 +43,14 @@ const VERSION_SECRET_LEN: u32 = 2;
 pub(crate) const SECRET_MAX: usize = 128;
 
 // MAGIC, u32 version, u32 uid, u32 wrapped length, u16 crc (over the whole
-// record with this field zero), u16 0, the bag UUID, the secret, the bag
-// (v2: u32 secret length, the secret, the bag).
+// record with this field zero), u16 flags (0 before uid 1000's home moved
+// here), the bag UUID, the secret, the bag (v2: u32 secret length, the
+// secret, the bag).
 const OFF_VERSION: usize = 0x10;
 const OFF_UID: usize = 0x14;
 const OFF_LEN: usize = 0x18;
 const OFF_CRC: usize = 0x1c;
+const OFF_FLAGS: usize = 0x1e;
 const OFF_UUID: usize = 0x20;
 const OFF_SECRET: usize = 0x30;
 const HEADER: usize = OFF_SECRET + crate::SKS_SECRET_LEN;
@@ -58,6 +60,14 @@ static_assert!(OFF_UUID + UUID_LEN == OFF_SECRET);
 static_assert!(HEADER == 0x50);
 
 const MAX_WRAPPED: usize = 8192;
+
+/// The uuid is the bag's own, read back after its create (the identity
+/// record's state 3); else the one the host created it with.
+const FLAG_READBACK: u16 = 1;
+/// The uid's home record: for [`crate::SBIO_PROBE_USER_ID`], the bag the
+/// identity record named, moved here (keybag.rs); its keys from before
+/// interface 4 stay in its old own bag, now at the `.legacy.bin` path.
+const FLAG_HOME: u16 = 2;
 
 /// How long a user-bag exchange may wait. Under the HV the hwrng's entropy
 /// requests at boot held a CREATE_KEYBAG back 3.8 s (sep-key bench, 1 of 1),
@@ -136,6 +146,27 @@ impl BagPath {
         Ok(p)
     }
 
+    /// `/var/lib/tanabota-sep-bag-<uid>.legacy.bin`: uid 1000's own bag from
+    /// before interface 4, moved aside when its home record took the path.
+    fn legacy(uid: u32) -> Result<BagPath> {
+        let mut p = BagPath {
+            buf: [0; 48],
+            len: 0,
+        };
+        write!(p, "/var/lib/tanabota-sep-bag-{}.legacy.bin", uid).map_err(|_| EINVAL)?;
+        Ok(p)
+    }
+
+    /// Where userbag's own ops keep `uid`'s bag: the fingers' user's own bag
+    /// is the legacy one (its home is keybag.rs's, at [`BagPath::new`]).
+    fn own(uid: u32) -> Result<BagPath> {
+        if uid as i32 == crate::SBIO_PROBE_USER_ID {
+            BagPath::legacy(uid)
+        } else {
+            BagPath::new(uid)
+        }
+    }
+
     fn as_cstr(&self) -> &CStr {
         // `write_str` keeps the byte after `len` zero and never writes a NUL.
         CStr::from_bytes_with_nul(&self.buf[..=self.len]).unwrap_or(c"")
@@ -144,6 +175,7 @@ impl BagPath {
 
 struct StoredBag {
     uuid: [u8; UUID_LEN],
+    flags: u16,
     wrapped: KVec<u8>,
     secret: Secret,
 }
@@ -167,7 +199,10 @@ fn u32_at(b: &[u8], off: usize) -> u32 {
 /// left by a create the enclave refused). A record that does not check out is
 /// EUCLEAN: never replaced here, since the user's keys need that bag.
 fn read(uid: u32) -> Result<Option<StoredBag>> {
-    let path = BagPath::new(uid)?;
+    read_at(&BagPath::own(uid)?, uid)
+}
+
+fn read_at(path: &BagPath, uid: u32) -> Result<Option<StoredBag>> {
     let f = match shim::StoreFile::open_readonly(path.as_cstr()) {
         Ok(f) => f,
         // Only a missing file is "no bag": any other failure to open says
@@ -211,6 +246,7 @@ fn read(uid: u32) -> Result<Option<StoredBag>> {
     uuid.copy_from_slice(&rec[OFF_UUID..OFF_UUID + UUID_LEN]);
     Ok(Some(StoredBag {
         uuid,
+        flags: u16::from_le_bytes([rec[OFF_FLAGS], rec[OFF_FLAGS + 1]]),
         wrapped,
         secret: Secret(secret),
     }))
@@ -235,6 +271,17 @@ fn write(
     secret: &[u8],
     wrapped: &[u8],
 ) -> Result<()> {
+    write_flags(path, uid, 0, uuid, secret, wrapped)
+}
+
+fn write_flags(
+    path: &BagPath,
+    uid: u32,
+    flags: u16,
+    uuid: &[u8; UUID_LEN],
+    secret: &[u8],
+    wrapped: &[u8],
+) -> Result<()> {
     if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.is_empty() || secret.len() > SECRET_MAX {
         return Err(EINVAL);
     }
@@ -245,7 +292,8 @@ fn write(
     rec.extend_from_slice(&(if v1 { VERSION } else { VERSION_SECRET_LEN }).to_le_bytes(), GFP_KERNEL)?;
     rec.extend_from_slice(&uid.to_le_bytes(), GFP_KERNEL)?;
     rec.extend_from_slice(&(wrapped.len() as u32).to_le_bytes(), GFP_KERNEL)?;
-    rec.extend_from_slice(&[0; 4], GFP_KERNEL)?;
+    rec.extend_from_slice(&[0; 2], GFP_KERNEL)?;
+    rec.extend_from_slice(&flags.to_le_bytes(), GFP_KERNEL)?;
     rec.extend_from_slice(uuid, GFP_KERNEL)?;
     if !v1 {
         rec.extend_from_slice(&(secret.len() as u32).to_le_bytes(), GFP_KERNEL)?;
@@ -255,6 +303,74 @@ fn write(
     let crc = record_crc(rec);
     rec[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_le_bytes());
     shim::replace_file(path.as_cstr(), rec)
+}
+
+/// A uid's home record (keybag.rs keeps the fingers' user's bag here).
+pub(crate) struct HomeRecord {
+    pub(crate) uuid: [u8; UUID_LEN],
+    pub(crate) readback: bool,
+    pub(crate) wrapped: KVec<u8>,
+    pub(crate) secret: Secret,
+}
+
+/// What `tanabota-sep-bag-<uid>.bin` holds for keybag.rs's migration.
+pub(crate) enum HomeFile {
+    /// No file, or an empty one.
+    Missing,
+    /// A record without [`FLAG_HOME`]: the uid's own bag from before.
+    Legacy,
+    Home(HomeRecord),
+}
+
+/// `uid`'s file at the home path, as [`HomeFile`]; a record that does not
+/// check out is EUCLEAN.
+pub(crate) fn read_home(uid: u32) -> Result<HomeFile> {
+    Ok(match read_at(&BagPath::new(uid)?, uid)? {
+        None => HomeFile::Missing,
+        Some(b) if b.flags & FLAG_HOME == 0 => HomeFile::Legacy,
+        Some(b) => HomeFile::Home(HomeRecord {
+            uuid: b.uuid,
+            readback: b.flags & FLAG_READBACK != 0,
+            wrapped: b.wrapped,
+            secret: b.secret,
+        }),
+    })
+}
+
+/// Writes `uid`'s home record (one atomic replace of the home path).
+pub(crate) fn write_home(uid: u32, uuid: &[u8; UUID_LEN], readback: bool, secret: &[u8], wrapped: &[u8]) -> Result<()> {
+    let flags = FLAG_HOME | if readback { FLAG_READBACK } else { 0 };
+    write_flags(&BagPath::new(uid)?, uid, flags, uuid, secret, wrapped)
+}
+
+/// Moves a legacy record at the home path aside to the `.legacy.bin` path,
+/// as a copy created there (never over an existing file); the home path is
+/// then replaced by the caller. A crash between the two leaves both: the
+/// copy is identical to the record still at the home path, and the next try
+/// finds it so and goes on. A different file already at the legacy path is
+/// EUCLEAN: which of the two holds the keys cannot be told here.
+pub(crate) fn move_legacy_aside(uid: u32) -> Result<()> {
+    let home = BagPath::new(uid)?;
+    let legacy = BagPath::legacy(uid)?;
+    let raw = |p: &BagPath| -> Result<Option<Secret>> {
+        let f = match shim::StoreFile::open_readonly(p.as_cstr()) {
+            Ok(f) => f,
+            Err(e) if e == ENOENT => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut b = Secret(KVec::new());
+        b.0.resize(f.size()? as usize, 0, GFP_KERNEL)?;
+        f.read_exact(0, &mut b.0)?;
+        Ok(Some(b))
+    };
+    let Some(rec) = raw(&home)? else {
+        return Ok(());
+    };
+    match raw(&legacy)? {
+        Some(existing) if existing.0 == rec.0 => Ok(()),
+        Some(_) => Err(crate::key::errno::uclean()),
+        None => shim::create_file(legacy.as_cstr(), &rec),
+    }
 }
 
 /// What the enclave answered an operation on a bag: for an ECDH, the shared
@@ -364,7 +480,7 @@ impl SepData {
         if self.profile.key_store != crate::profile::KeyStore::Variant5 {
             return Err(crate::key::errno::opnotsupp());
         }
-        let path = BagPath::new(uid)?;
+        let path = BagPath::own(uid)?;
         let (file, created) = shim::StoreFile::open_host(path.as_cstr())?;
         if !created && file.size()? != 0 {
             return Err(EEXIST);
@@ -545,7 +661,7 @@ impl SepData {
             .sks_send_patient(self.sks_req_copy_keybag_special(special), PATIENCE_MS)
             .and_then(|out| self.wrapped_from_copy_reply(&out, c"a user bag after its change"));
         let written = match fresh {
-            Some(fresh) => BagPath::new(uid).and_then(|path| write(&path, uid, &stored.uuid, new, &fresh)),
+            Some(fresh) => BagPath::own(uid).and_then(|path| write(&path, uid, &stored.uuid, new, &fresh)),
             None => Err(EIO),
         };
         if let Err(e) = written {

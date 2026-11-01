@@ -1308,8 +1308,23 @@ impl SepData {
         if file.uid as i32 != BIO_USER {
             return own(self);
         }
-        let Some(r) = self.key_identity_try(der, rk_pubs)? else {
-            return own(self);
+        let r = match self.key_identity_try(der, rk_pubs)? {
+            Some(r) => r,
+            // uid 1000's home bag is made on its first create like any uid's,
+            // as the identity bag (keybag.rs keeps it as uid 1000's home
+            // record); only keys from before interface 4 live in its own bag.
+            // provision_keybag=0 (the bench's copies of m2pro's state) makes
+            // none, as at the Touch ID bring-up.
+            None if how == Home::Create
+                && *crate::module_parameters::provision_keybag.value() != 0
+                && !crate::userbag::stored_checked(file.uid)? =>
+            {
+                if !self.sks_provision_identity_keybag() {
+                    return Err(EIO);
+                }
+                self.key_identity_try(der, rk_pubs)?.ok_or(EIO)?
+            }
+            None => return own(self),
         };
         if how != Home::Legacy || r.status != STATUS_OTHER_BAG || !crate::userbag::stored_checked(file.uid)? {
             return Ok(r);

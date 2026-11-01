@@ -80,6 +80,7 @@ const INFO_HOME_IDENTITY: u32 = 16;
 const INFO_PASSWORD: u32 = 32;
 /// ... and closed: its ops are ENOKEY until SEP_KEY_UNLOCK.
 const INFO_LOCKED: u32 = 64;
+const INFO_LOGIN_SAME: u32 = 128;
 
 const CREATE_BIOMETRY: u32 = 1;
 const CREATE_PRESENCE: u32 = 2;
@@ -561,10 +562,15 @@ impl SepData {
         if self.key_bio_ready(file) {
             flags |= INFO_BIOMETRY;
         }
-        if matches!(crate::userbag::home_mode(file.uid), Ok(Some(m)) if m & crate::userbag::FLAG_PASSWORD != 0) {
-            flags |= INFO_PASSWORD;
-            if self.bag_secret(file.uid).is_none() {
-                flags |= INFO_LOCKED;
+        if let Ok(Some(m)) = crate::userbag::home_mode(file.uid) {
+            if m & crate::userbag::FLAG_PASSWORD != 0 {
+                flags |= INFO_PASSWORD;
+                if self.bag_secret(file.uid).is_none() {
+                    flags |= INFO_LOCKED;
+                }
+                if m & crate::userbag::FLAG_LOGIN_SAME != 0 {
+                    flags |= INFO_LOGIN_SAME;
+                }
             }
         }
         // SAFETY: a shim callback for this file.

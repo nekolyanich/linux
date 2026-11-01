@@ -82,6 +82,7 @@ enum {
 #define SEP_KEY_INFO_HOME_IDENTITY 16u /* this uid's home bag is the identity bag */
 #define SEP_KEY_INFO_PASSWORD   32u /* this uid's home bag is in password mode */
 #define SEP_KEY_INFO_LOCKED     64u /* and closed: ops are ENOKEY until SEP_KEY_UNLOCK */
+#define SEP_KEY_INFO_LOGIN_SAME 128u /* and marked as the login password (PAM tries it) */
 /*
  * For uid 1000, INFO (as every operation) reads the identity keybag's record
  * and fails with its error when it cannot: EEXIST while provisioning writes

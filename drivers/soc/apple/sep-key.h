@@ -51,7 +51,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_KEY_IFACE_VERSION 4
+#define SEP_KEY_IFACE_VERSION 5 /* 5: password-mode bags, UNLOCK, LOCK */
 
 #define SEP_KEY_BLOB_MAX   1024 /* the enclave's stored set {rk={..}}, ~260 B */
 #define SEP_KEY_PUB_MAX    97   /* P-384 04||X||Y */
@@ -80,6 +80,8 @@ enum {
 #define SEP_KEY_INFO_BIOMETRY   4u /* this uid can create finger-gated keys */
 #define SEP_KEY_INFO_CREDIT     8u /* this file holds an AUTH credit now */
 #define SEP_KEY_INFO_HOME_IDENTITY 16u /* this uid's home bag is the identity bag */
+#define SEP_KEY_INFO_PASSWORD   32u /* this uid's home bag is in password mode */
+#define SEP_KEY_INFO_LOCKED     64u /* and closed: ops are ENOKEY until SEP_KEY_UNLOCK */
 /*
  * For uid 1000, INFO (as every operation) reads the identity keybag's record
  * and fails with its error when it cannot: EEXIST while provisioning writes
@@ -229,6 +231,16 @@ struct sep_key_auth_poll {
  */
 #define SEP_KEY_CHANGE_RANDOM 1u
 #define SEP_KEY_CHANGE_OLD    2u
+/*
+ * The new secret is a password (password mode): the record stores no secret,
+ * the bag is closed at every boot until SEP_KEY_UNLOCK, the kernel keeps the
+ * password only while it is open. Without it the record stores the new
+ * secret (stored mode; SEP_KEY_CHANGE_RANDOM always is). On a password-mode
+ * bag a change needs SEP_KEY_CHANGE_OLD and the bag open (EINVAL, ENOKEY).
+ */
+#define SEP_KEY_CHANGE_TO_PASSWORD 4u
+/* with TO_PASSWORD: the password is the user's login password (PAM tries it) */
+#define SEP_KEY_CHANGE_LOGIN_SAME  8u
 #define SEP_KEY_CHANGE_SECRET_MAX 128
 
 struct sep_key_change_secret {
@@ -239,6 +251,42 @@ struct sep_key_change_secret {
   __u32 reserved[4]; /* in: 0 */
   __u8  old_secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
   __u8  new_secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
+};
+
+/*
+ * Opens a password-mode bag with its password: the caller's own uid, or any
+ * uid when the caller has CAP_SYS_ADMIN (a PAM module). The kernel keeps the
+ * password while the bag is open, to load it again after a sleep; for uid
+ * 1000 the Touch ID bring-up that waited for it runs. A wrong password is
+ * EACCES with the enclave's status in sep_status (-5). EINVAL for a bag in
+ * stored mode, ENOKEY with no bag. secret is zeroed on the way out.
+ *
+ * SEP_KEY_UNLOCK_LOGIN is PAM's try with the login password: ENOKEY without
+ * a word to the enclave unless the bag is marked as having the login password
+ * (no wrong attempt spent); a refusal clears that mark.
+ * SEP_KEY_UNLOCK_SET_LOGIN_SAME sets the mark once the password opened the bag.
+ */
+#define SEP_KEY_UNLOCK_LOGIN          1u
+#define SEP_KEY_UNLOCK_SET_LOGIN_SAME 2u
+
+struct sep_key_unlock {
+  __u32 flags;      /* in: SEP_KEY_UNLOCK_* */
+  __u32 uid;        /* in: whose bag */
+  __s32 sep_status; /* out */
+  __u32 secret_len; /* in: 1..SEP_KEY_CHANGE_SECRET_MAX */
+  __u32 reserved[4]; /* in: 0 */
+  __u8  secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
+};
+
+/*
+ * Closes a password-mode bag (the caller's own, or any with CAP_SYS_ADMIN):
+ * the enclave locks it, the kernel forgets its password, its ops are ENOKEY
+ * until SEP_KEY_UNLOCK (INFO: SEP_KEY_INFO_LOCKED). EINVAL in stored mode.
+ */
+struct sep_key_lock {
+  __u32 flags;      /* in: 0 */
+  __u32 uid;        /* in: whose bag */
+  __u32 reserved[6]; /* in: 0 */
 };
 
 #define SEP_KEY_IOC_MAGIC 0xB2
@@ -253,3 +301,5 @@ struct sep_key_change_secret {
 #define SEP_KEY_AUTH_CANCEL _IO  (SEP_KEY_IOC_MAGIC, 0x08)
 #define SEP_KEY_ATTEST      _IOWR(SEP_KEY_IOC_MAGIC, 0x09, struct sep_key_attest)
 #define SEP_KEY_CHANGE_SECRET _IOWR(SEP_KEY_IOC_MAGIC, 0x0a, struct sep_key_change_secret)
+#define SEP_KEY_UNLOCK      _IOWR(SEP_KEY_IOC_MAGIC, 0x0b, struct sep_key_unlock)
+#define SEP_KEY_LOCK        _IOW (SEP_KEY_IOC_MAGIC, 0x0c, struct sep_key_lock)

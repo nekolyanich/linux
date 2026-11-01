@@ -1274,6 +1274,13 @@ impl SepData {
         if self.touchid_failed.load(Relaxed) {
             return Err(EIO);
         }
+        // A password-mode identity bag (R2) opens at SEP_KEY_UNLOCK: before
+        // anything is set up, so nothing half done is left to latch, and the
+        // unlock starts this again.
+        if self.identity_closed() {
+            dev_info!(self.dev, "Touch ID: waits for uid 1000's bag to be unlocked\n");
+            return Err(crate::key::errno::nokey());
+        }
 
         let mut store = store::Store::open().inspect_err(|e| {
             dev_err!(
@@ -1300,7 +1307,7 @@ impl SepData {
                 e
             );
         })?;
-        let stored = match keybag::read(keybag::Slot::Identity) {
+        let stored = match self.identity_read() {
             Ok(keybag::State::Present(stored)) => stored,
             Ok(keybag::State::Absent(_)) => {
                 dev_err!(self.dev, "Touch ID: no persisted identity keybag exists\n");
@@ -1368,6 +1375,10 @@ impl SepData {
 
     pub(crate) fn prepare_bio_open(&self) -> Result<()> {
         if let Err(e) = self.activate_touchid() {
+            if e == crate::key::errno::nokey() && self.identity_closed() {
+                // not a failure: the bag is closed, nothing was started
+                return Err(e);
+            }
             self.touchid_failed.store(true, Relaxed);
             diag::touchid(false);
             dev_err!(
@@ -3393,7 +3404,7 @@ impl SepData {
         if self.keybag_designated.load(Relaxed) {
             if let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) {
                 let special = user.special_handle();
-                if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
+                if let Ok(keybag::State::Present(stored)) = self.identity_read() {
                     unlocked = match self.profile.key_store {
                         profile::KeyStore::Sepos13 { .. } => self
                             .sks_step(c"DEVICE_STATE_TRANSITION", |healthy| {

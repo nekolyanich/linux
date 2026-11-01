@@ -271,7 +271,7 @@ impl SepData {
             return Err(ENODEV);
         }
         let _bag = self.identity_bag_lock.lock();
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+        let keybag::State::Present(stored) = self.identity_read()? else {
             return Err(ENODEV);
         };
         let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
@@ -303,7 +303,7 @@ impl SepData {
             b
         };
         let _bag = self.identity_bag_lock.lock();
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+        let keybag::State::Present(stored) = self.identity_read()? else {
             return Err(ENODEV);
         };
         let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
@@ -373,7 +373,7 @@ impl SepData {
             (b, p)
         };
         let _bag = self.identity_bag_lock.lock();
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+        let keybag::State::Present(stored) = self.identity_read()? else {
             return Err(ENODEV);
         };
         let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;

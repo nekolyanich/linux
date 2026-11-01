@@ -701,6 +701,11 @@ struct SepData {
     key_dev: Mutex<Option<key::KeyChardev>>,
     #[pin]
     user_bags: Mutex<userbag::UserBags>,
+    /// The secrets of password-mode bags while unlocked (SEP_KEY_UNLOCK until
+    /// SEP_KEY_LOCK), by uid: kept only here, to load a bag again after a
+    /// sleep or a SEP reset (tanabota architecture 2.9).
+    #[pin]
+    bag_secrets: Mutex<KVec<(u32, Secret)>>,
     /// The ACM context a /dev/sep-key AUTH's verify credits (set only while
     /// that AUTH holds the Touch ID session, so no other verify can credit
     /// it), and the outcome kept for its poll once the session is given back.
@@ -953,6 +958,7 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
                 user_bags <- new_mutex!(userbag::UserBags::new()),
+                bag_secrets <- new_mutex!(KVec::new()),
                 key_auth <- new_mutex!(key::KeyAuthShared::new()),
                 identity_bag_lock <- new_mutex!(()),
                 store <- new_mutex!(store),
@@ -2041,7 +2047,7 @@ impl SepData {
             return false;
         };
         let special = du.special_handle();
-        let stored = match keybag::read(keybag::Slot::Identity) {
+        let stored = match self.identity_read() {
             Ok(keybag::State::Present(s)) => s,
             _ => {
                 return false;

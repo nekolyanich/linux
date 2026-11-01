@@ -494,6 +494,30 @@ impl SepData {
         })
     }
 
+    /// `0x04` change lock state to locked (1) on a designated handle, no
+    /// secret (U-A: it locks; a match does not reopen it, U-E). Variant5 only.
+    pub(crate) fn sks_req_lock_special(&self, special: crate::sks::SpecialHandle) -> Result<SksRequest> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(crate::key::errno::opnotsupp());
+        }
+        let mut body = image::Body::new();
+        body.put_u32(SKS_LOCK_STATE_VARIANT)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_i32(1)?;
+        body.put_blob(&[])?;
+        body.put_u64(SKS_LOCK_STATE_FLAGS)?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg =
+            crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        Ok(SksRequest {
+            name: crate::sks::SKS_LOCK_STATE_NAME,
+            msg,
+            img,
+        })
+    }
+
     /// `0x18` device-state transition to unlocked, the 13.5 identity-session
     /// unlock: `device_state_transition` for the session's handle and secret,
     /// with state 0 and flags 0.

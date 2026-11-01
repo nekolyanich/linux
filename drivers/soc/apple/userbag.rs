@@ -68,6 +68,14 @@ const FLAG_READBACK: u16 = 1;
 /// identity record named, moved here (keybag.rs); its keys from before
 /// interface 4 stay in its old own bag, now at the `.legacy.bin` path.
 const FLAG_HOME: u16 = 2;
+/// Password mode (R2): the record stores no secret (a v2 record of secret
+/// length 0); the bag opens with the password SEP_KEY_UNLOCK brings, and
+/// stays closed from boot until then.
+pub(crate) const FLAG_PASSWORD: u16 = 4;
+/// The bag's password is the user's login password, as far as the last
+/// unlock showed: PAM's try with the login password is sent to the enclave
+/// only then, so a different login password costs no wrong attempt.
+pub(crate) const FLAG_LOGIN_SAME: u16 = 8;
 
 /// How long a user-bag exchange may wait. Under the HV the hwrng's entropy
 /// requests at boot held a CREATE_KEYBAG back 3.8 s (sep-key bench, 1 of 1),
@@ -228,8 +236,9 @@ fn read_at(path: &BagPath, uid: u32) -> Result<Option<StoredBag>> {
         _ => return Err(crate::key::errno::uclean()),
     };
     let bag_at = secret_at + secret_len;
+    let flags = u16::from_le_bytes([rec[OFF_FLAGS], rec[OFF_FLAGS + 1]]);
     if rec[..OFF_VERSION] != MAGIC
-        || secret_len == 0
+        || (secret_len == 0) != (flags & FLAG_PASSWORD != 0)
         || secret_len > SECRET_MAX
         || bag_at >= size
         || u32_at(&rec, OFF_UID) != uid
@@ -246,7 +255,7 @@ fn read_at(path: &BagPath, uid: u32) -> Result<Option<StoredBag>> {
     uuid.copy_from_slice(&rec[OFF_UUID..OFF_UUID + UUID_LEN]);
     Ok(Some(StoredBag {
         uuid,
-        flags: u16::from_le_bytes([rec[OFF_FLAGS], rec[OFF_FLAGS + 1]]),
+        flags,
         wrapped,
         secret: Secret(secret),
     }))
@@ -282,7 +291,8 @@ fn write_flags(
     secret: &[u8],
     wrapped: &[u8],
 ) -> Result<()> {
-    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.is_empty() || secret.len() > SECRET_MAX {
+    let password = flags & FLAG_PASSWORD != 0;
+    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.is_empty() != password || secret.len() > SECRET_MAX {
         return Err(EINVAL);
     }
     let v1 = secret.len() == crate::SKS_SECRET_LEN;
@@ -309,6 +319,8 @@ fn write_flags(
 pub(crate) struct HomeRecord {
     pub(crate) uuid: [u8; UUID_LEN],
     pub(crate) readback: bool,
+    /// [`FLAG_PASSWORD`] and [`FLAG_LOGIN_SAME`] as stored.
+    pub(crate) mode: u16,
     pub(crate) wrapped: KVec<u8>,
     pub(crate) secret: Secret,
 }
@@ -331,16 +343,44 @@ pub(crate) fn read_home(uid: u32) -> Result<HomeFile> {
         Some(b) => HomeFile::Home(HomeRecord {
             uuid: b.uuid,
             readback: b.flags & FLAG_READBACK != 0,
+            mode: b.flags & (FLAG_PASSWORD | FLAG_LOGIN_SAME),
             wrapped: b.wrapped,
             secret: b.secret,
         }),
     })
 }
 
-/// Writes `uid`'s home record (one atomic replace of the home path).
-pub(crate) fn write_home(uid: u32, uuid: &[u8; UUID_LEN], readback: bool, secret: &[u8], wrapped: &[u8]) -> Result<()> {
-    let flags = FLAG_HOME | if readback { FLAG_READBACK } else { 0 };
+/// Writes `uid`'s home record (one atomic replace of the home path); `mode`
+/// is [`FLAG_PASSWORD`] / [`FLAG_LOGIN_SAME`], and with a password no secret
+/// is written whatever `secret` holds.
+pub(crate) fn write_home(
+    uid: u32,
+    uuid: &[u8; UUID_LEN],
+    readback: bool,
+    mode: u16,
+    secret: &[u8],
+    wrapped: &[u8],
+) -> Result<()> {
+    let flags = FLAG_HOME | if readback { FLAG_READBACK } else { 0 } | (mode & (FLAG_PASSWORD | FLAG_LOGIN_SAME));
+    let secret = if mode & FLAG_PASSWORD != 0 { &[][..] } else { secret };
     write_flags(&BagPath::new(uid)?, uid, flags, uuid, secret, wrapped)
+}
+
+/// `uid`'s record at the home path with `set` and `clear` applied to its
+/// flags (LOGIN_SAME after an unlock), the rest as it is.
+pub(crate) fn update_home_flags(uid: u32, set: u16, clear: u16) -> Result<()> {
+    let path = BagPath::new(uid)?;
+    let b = read_at(&path, uid)?.ok_or_else(crate::key::errno::nokey)?;
+    let flags = (b.flags | set) & !clear;
+    if flags == b.flags {
+        return Ok(());
+    }
+    write_flags(&path, uid, flags, &b.uuid, &b.secret, &b.wrapped)
+}
+
+/// The mode flags of `uid`'s record at the home path; None without one.
+pub(crate) fn home_mode(uid: u32) -> Result<Option<u16>> {
+    Ok(read_at(&BagPath::new(uid)?, uid)?.map(|b| b.flags & (FLAG_PASSWORD | FLAG_LOGIN_SAME)))
 }
 
 /// Moves a legacy record at the home path aside to the `.legacy.bin` path,
@@ -387,6 +427,55 @@ impl Drop for OpReply {
 }
 
 impl SepData {
+    /// The secret SEP_KEY_UNLOCK brought for `uid`'s password-mode bag.
+    pub(crate) fn bag_secret(&self, uid: u32) -> Option<Secret> {
+        let list = self.bag_secrets.lock();
+        let (_, s) = list.iter().find(|(u, _)| *u == uid)?;
+        let mut copy = KVec::new();
+        copy.extend_from_slice(s, GFP_KERNEL).ok()?;
+        Some(Secret(copy))
+    }
+
+    pub(crate) fn bag_secret_set(&self, uid: u32, secret: &[u8]) -> Result<()> {
+        let mut copy = KVec::new();
+        copy.extend_from_slice(secret, GFP_KERNEL)?;
+        let mut list = self.bag_secrets.lock();
+        if let Some(e) = list.iter_mut().find(|(u, _)| *u == uid) {
+            e.1 = Secret(copy);
+            return Ok(());
+        }
+        list.push((uid, Secret(copy)), GFP_KERNEL)?;
+        Ok(())
+    }
+
+    pub(crate) fn bag_secret_forget(&self, uid: u32) {
+        let mut list = self.bag_secrets.lock();
+        if let Some(i) = list.iter().position(|(u, _)| *u == uid) {
+            // dropping the Secret wipes it
+            let _ = list.swap_remove(i);
+        }
+    }
+
+    /// The identity slot (uid 1000's home bag) with its secret: the stored
+    /// one, or in password mode the one SEP_KEY_UNLOCK brought; ENOKEY while
+    /// a password-mode bag is closed. What every user of the secret reads.
+    pub(crate) fn identity_read(&self) -> Result<crate::keybag::State> {
+        match crate::keybag::read(crate::keybag::Slot::Identity)? {
+            crate::keybag::State::Present(s) if s.password() => {
+                let secret = self.bag_secret(crate::SBIO_PROBE_USER_ID as u32).ok_or_else(crate::key::errno::nokey)?;
+                Ok(crate::keybag::State::Present(s.with_secret(secret)))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// A password-mode identity bag not unlocked yet: Touch ID waits.
+    pub(crate) fn identity_closed(&self) -> bool {
+        matches!(crate::keybag::read(crate::keybag::Slot::Identity),
+                 Ok(crate::keybag::State::Present(s)) if s.password())
+            && self.bag_secret(crate::SBIO_PROBE_USER_ID as u32).is_none()
+    }
+
     fn user_bag_unlock(&self, handle: KeyBagHandle, secret: &[u8]) -> Result<()> {
         let healthy = self.sks_health_check(c"sep-key unlock").ok_or(EIO)?;
         let out = self
@@ -568,7 +657,13 @@ impl SepData {
             return Ok(h);
         }
         let handle = match read(bag.uid)? {
-            Some(stored) => self.user_bag_load(bag.uid, &stored)?,
+            Some(mut stored) => {
+                if stored.flags & FLAG_PASSWORD != 0 {
+                    // closed until SEP_KEY_UNLOCK brings its password
+                    stored.secret = self.bag_secret(bag.uid).ok_or_else(crate::key::errno::nokey)?;
+                }
+                self.user_bag_load(bag.uid, &stored)?
+            }
             None if create => self.user_bag_create(bag.uid)?,
             None => return Err(crate::key::errno::nokey()),
         };
@@ -623,12 +718,18 @@ impl SepData {
     /// If the record is not rewritten after the enclave said yes, the old
     /// record still opens with the old secret (no generation, U-J): the bag
     /// keeps working until it is loaded again, then the change is lost.
+    ///
+    /// `mode` ([`FLAG_PASSWORD`], [`FLAG_LOGIN_SAME`]) is the bag's after
+    /// the change. A password-mode bag changes only open and with `old`
+    /// given (EINVAL without), so a process of the user cannot replace a
+    /// password it never knew.
     pub(crate) fn user_bag_change_secret(
         &self,
         bags: &mut UserBags,
         uid: u32,
         old: Option<&[u8]>,
         new: &[u8],
+        mode: u16,
         status: &mut i32,
     ) -> Result<()> {
         let Some(user) = designated_user(uid) else {
@@ -636,7 +737,13 @@ impl SepData {
         };
         let special = user.special_handle();
         let bag = bags.find(uid).ok_or(EBADF)?;
-        let stored = read(uid)?.ok_or_else(crate::key::errno::nokey)?;
+        let mut stored = read(uid)?.ok_or_else(crate::key::errno::nokey)?;
+        if stored.flags & FLAG_PASSWORD != 0 {
+            if old.is_none() {
+                return Err(EINVAL);
+            }
+            stored.secret = self.bag_secret(uid).ok_or_else(crate::key::errno::nokey)?;
+        }
         let mut retried = false;
         loop {
             self.user_bag_handle(bag, false)?;
@@ -661,7 +768,11 @@ impl SepData {
             .sks_send_patient(self.sks_req_copy_keybag_special(special), PATIENCE_MS)
             .and_then(|out| self.wrapped_from_copy_reply(&out, c"a user bag after its change"));
         let written = match fresh {
-            Some(fresh) => BagPath::own(uid).and_then(|path| write(&path, uid, &stored.uuid, new, &fresh)),
+            Some(fresh) => BagPath::own(uid).and_then(|path| {
+                let flags = (stored.flags & !(FLAG_PASSWORD | FLAG_LOGIN_SAME)) | mode;
+                let secret = if mode & FLAG_PASSWORD != 0 { &[][..] } else { new };
+                write_flags(&path, uid, flags, &stored.uuid, secret, &fresh)
+            }),
             None => Err(EIO),
         };
         if let Err(e) = written {
@@ -673,7 +784,66 @@ impl SepData {
             );
             return Err(EIO);
         }
+        if mode & FLAG_PASSWORD != 0 {
+            self.bag_secret_set(uid, new)?;
+        } else {
+            self.bag_secret_forget(uid);
+        }
         dev_info!(self.dev, "sep-key: uid {}'s bag secret changed\n", uid);
+        Ok(())
+    }
+
+    /// SEP_KEY_UNLOCK's check of `secret` on `uid`'s own password-mode bag:
+    /// LOAD, CHANGE_LOCK_STATE 0 with it, DESIGNATE -uid on success (the
+    /// designation outlives the load handle, U-B), UNLOAD. The enclave's
+    /// status of the unlock (-5: not the secret).
+    pub(crate) fn user_bag_verify(&self, _bags: &mut UserBags, uid: u32, secret: &[u8]) -> Result<i8> {
+        let mut stored = read(uid)?.ok_or_else(crate::key::errno::nokey)?;
+        if stored.flags & FLAG_PASSWORD == 0 {
+            return Err(EINVAL);
+        }
+        let out = self
+            .sks_send_patient(self.sks_req_load_keybag(&stored.wrapped), PATIENCE_MS)
+            .ok_or(EIO)?;
+        let body = self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out).unwrap_or(&[]);
+        if out.reply.status != 0 || body.len() != crate::SKS_LOAD_REPLY_LEN {
+            return Err(EIO);
+        }
+        let raw = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        if raw < 0 {
+            return Err(EIO);
+        }
+        let handle = KeyBagHandle::from_load_reply(raw);
+        let result = (|| {
+            let healthy = self.sks_health_check(c"sep-key unlock").ok_or(EIO)?;
+            let out = self
+                .sks_send_patient(self.sks_req_change_lock_state(handle, LockState::Unlocked, secret, healthy), PATIENCE_MS)
+                .ok_or(EIO)?;
+            if out.reply.status != 0 {
+                return Ok(out.reply.status);
+            }
+            self.user_bag_designate(uid, handle, secret)?;
+            Ok(0)
+        })();
+        let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), PATIENCE_MS);
+        result
+    }
+
+    /// SEP_KEY_LOCK on `uid`'s own bag: CHANGE_LOCK_STATE 1 on -uid, its load
+    /// handle unloaded, its secret forgotten; ops are ENOKEY until UNLOCK.
+    pub(crate) fn user_bag_lock(&self, bags: &mut UserBags, uid: u32) -> Result<()> {
+        let user = designated_user(uid).ok_or_else(crate::key::errno::opnotsupp)?;
+        if !matches!(read(uid)?, Some(b) if b.flags & FLAG_PASSWORD != 0) {
+            return Err(EINVAL);
+        }
+        self.bag_secret_forget(uid);
+        // -2 when nothing designated it this boot: closed already
+        let _ = self.sks_send_patient(self.sks_req_lock_special(user.special_handle()), PATIENCE_MS);
+        if let Some(bag) = bags.find(uid) {
+            if let Some(h) = bag.handle.take() {
+                let _ = self.sks_send_patient(self.sks_req_unload_keybag(h), PATIENCE_MS);
+            }
+        }
         Ok(())
     }
 

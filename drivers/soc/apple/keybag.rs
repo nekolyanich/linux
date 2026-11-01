@@ -16,6 +16,12 @@
 //! `provision_keybag=1` would create a new identity bag); R3 removes it.
 //! The create's intent and refusal markers stay in K.
 //!
+//! In password mode (R2) H stores no secret, and K must not either: K is then
+//! the create's intent marker. An old generation reads that as "a bag may
+//! exist unnamed" (EEXIST): it never provisions over it, and has no identity
+//! bag (no Touch ID, no keys in it) until rolled forward. Back to a stored
+//! secret, K is the mirror again.
+//!
 //! Migration, at every read of the slot, idempotent, each step one atomic
 //! replace or a create that never overwrites:
 //! 1. H holds uid 1000's own bag from before (no home flag): copied to
@@ -120,6 +126,8 @@ pub(crate) struct StoredKeyBag {
     uuid: [u8; UUID_LEN],
     secret: crate::Secret,
     provenance: UuidProvenance,
+    /// userbag's FLAG_PASSWORD / FLAG_LOGIN_SAME of uid 1000's home record.
+    mode: u16,
 }
 
 impl StoredKeyBag {
@@ -137,6 +145,21 @@ impl StoredKeyBag {
 
     pub(crate) fn secret(&self) -> &[u8] {
         &self.secret
+    }
+
+    /// Password mode: the record holds no secret; [`Self::with_secret`]
+    /// gives the one SEP_KEY_UNLOCK brought.
+    pub(crate) fn password(&self) -> bool {
+        self.mode & crate::userbag::FLAG_PASSWORD != 0
+    }
+
+    pub(crate) fn mode(&self) -> u16 {
+        self.mode
+    }
+
+    pub(crate) fn with_secret(mut self, secret: crate::Secret) -> StoredKeyBag {
+        self.secret = secret;
+        self
     }
 }
 
@@ -187,6 +210,7 @@ fn from_home(h: crate::userbag::HomeRecord) -> StoredKeyBag {
         uuid: h.uuid,
         secret: h.secret,
         provenance: if h.readback { UuidProvenance::ReadBackFromBag } else { UuidProvenance::AsGenerated },
+        mode: h.mode,
     }
 }
 
@@ -203,11 +227,16 @@ fn migrate(slot: Slot) -> Result<()> {
     }
     let old = read_old(slot);
     match (home, old) {
+        // password mode: K is the intent marker, never a secret
+        (HomeFile::Home(h), old) if h.mode & userbag::FLAG_PASSWORD != 0 => match old {
+            Err(e) if e == EEXIST => Ok(()),
+            _ => write_intent(slot),
+        },
         (HomeFile::Home(h), Ok(State::Present(k))) => {
             if k.uuid == h.uuid && k.provenance == readback_of(h.readback) && *k.secret == *h.secret {
                 if k.wrapped != h.wrapped {
                     pr_info!("apple_sep: uid 1000's home record takes the identity record's newer snapshot\n");
-                    userbag::write_home(HOME_UID, &h.uuid, h.readback, &h.secret, &k.wrapped)?;
+                    userbag::write_home(HOME_UID, &h.uuid, h.readback, h.mode, &h.secret, &k.wrapped)?;
                 }
                 Ok(())
             } else {
@@ -219,7 +248,7 @@ fn migrate(slot: Slot) -> Result<()> {
             write_record(slot, readback_of(h.readback).state(), &h.wrapped, &h.uuid, &h.secret)
         }
         (_, Ok(State::Present(k))) => {
-            userbag::write_home(HOME_UID, &k.uuid, readback(k.provenance), &k.secret, &k.wrapped)?;
+            userbag::write_home(HOME_UID, &k.uuid, readback(k.provenance), 0, &k.secret, &k.wrapped)?;
             match userbag::read_home(HOME_UID)? {
                 HomeFile::Home(h) if h.uuid == k.uuid && h.wrapped == k.wrapped && *h.secret == *k.secret => {
                     pr_info!("apple_sep: the identity bag's record moved to uid 1000's home record\n");
@@ -328,6 +357,7 @@ fn read_old(slot: Slot) -> Result<State> {
         uuid,
         secret,
         provenance,
+        mode: 0,
     }))
 }
 
@@ -350,7 +380,7 @@ pub(crate) fn write_bag_uuid(
     }
     // a create: H first; a crash before K leaves K's intent, which the next
     // read rewrites from H
-    crate::userbag::write_home(HOME_UID, uuid, true, secret, wrapped)?;
+    crate::userbag::write_home(HOME_UID, uuid, true, 0, secret, wrapped)?;
     write_record(
         slot,
         UuidProvenance::ReadBackFromBag.state(),
@@ -371,7 +401,7 @@ pub(crate) fn write_generated_uuid(
     if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() > MAX_WRAPPED {
         return Err(EINVAL);
     }
-    crate::userbag::write_home(HOME_UID, uuid, false, secret, wrapped)?;
+    crate::userbag::write_home(HOME_UID, uuid, false, 0, secret, wrapped)?;
     write_record(
         slot,
         UuidProvenance::AsGenerated.state(),
@@ -403,15 +433,18 @@ pub(crate) fn replace_wrapped(
         return Err(EPERM);
     }
     // a snapshot: K first, then H; a crash between leaves K's newer copy with
-    // the same secret, which the next read gives H
-    write_record(
-        slot,
-        stored.uuid_provenance().state(),
-        fresh,
-        stored.uuid(),
-        stored.secret(),
-    )?;
-    crate::userbag::write_home(HOME_UID, stored.uuid(), readback(stored.provenance), stored.secret(), fresh)
+    // the same secret, which the next read gives H. In password mode K stays
+    // the marker and H alone takes the copy.
+    if !stored.password() {
+        write_record(
+            slot,
+            stored.uuid_provenance().state(),
+            fresh,
+            stored.uuid(),
+            stored.secret(),
+        )?;
+    }
+    crate::userbag::write_home(HOME_UID, stored.uuid(), readback(stored.provenance), stored.mode, stored.secret(), fresh)
 }
 
 /// Replaces the wrapped blob and the secret together, after the enclave
@@ -419,7 +452,9 @@ pub(crate) fn replace_wrapped(
 /// replace. The previous record still opens with the previous secret (the
 /// enclave keeps no generation, tanabota U-J): the caller must not leave it
 /// anywhere else.
-pub(crate) fn replace_bag_and_secret(slot: Slot, fresh: &[u8], secret: &[u8]) -> Result<()> {
+/// `mode`: userbag's FLAG_PASSWORD / FLAG_LOGIN_SAME of the bag after the
+/// change; with a password, H stores no secret and K becomes the marker.
+pub(crate) fn replace_bag_and_secret(slot: Slot, fresh: &[u8], secret: &[u8], mode: u16) -> Result<()> {
     if fresh.is_empty() || fresh.len() > MAX_WRAPPED || secret.is_empty() || secret.len() > MAX_WRAPPED {
         return Err(EINVAL);
     }
@@ -429,7 +464,10 @@ pub(crate) fn replace_bag_and_secret(slot: Slot, fresh: &[u8], secret: &[u8]) ->
     };
     // a change: H first, then K; a crash between leaves K with the old
     // secret, which the next read rewrites from H
-    crate::userbag::write_home(HOME_UID, stored.uuid(), readback(stored.provenance), secret, fresh)?;
+    crate::userbag::write_home(HOME_UID, stored.uuid(), readback(stored.provenance), mode, secret, fresh)?;
+    if mode & crate::userbag::FLAG_PASSWORD != 0 {
+        return write_intent(slot);
+    }
     write_record(slot, stored.uuid_provenance().state(), fresh, stored.uuid(), secret)
 }
 

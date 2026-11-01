@@ -1758,6 +1758,7 @@ impl SepData {
                 break None;
             }
             if counter >= ENROL_MAX_CAPTURES {
+                dev_err!(self.dev, "enrol: no completion after {} captures\n", counter);
                 break Some(Err(ENROL_STATUS_TOO_MANY));
             }
 
@@ -1769,6 +1770,14 @@ impl SepData {
                     has_template,
                 } => {
                     counter = counter.saturating_add(1);
+                    dev_info!(
+                        self.dev,
+                        "enrol: capture {} stage {} {}% complete {}\n",
+                        counter,
+                        stage,
+                        percent,
+                        complete
+                    );
                     let woke = bio::enrol_advance(
                         &mut self.bio_session.lock(),
                         self.capture_epoch.load(Relaxed),
@@ -1797,6 +1806,7 @@ impl SepData {
                 }
                 ImageOutcome::Retry => {
                     counter = counter.saturating_add(1);
+                    dev_info!(self.dev, "enrol: capture {} not usable, retrying\n", counter);
                     // The capture did not take (partial/unusable contact). Nudge
                     // the person to hold still and press again rather than
                     // silently re-capturing with no feedback.

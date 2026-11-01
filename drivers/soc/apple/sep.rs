@@ -413,7 +413,9 @@ static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
 
-const ENROL_MAX_CAPTURES: u32 = 12;
+// Captures one enrolment takes at most: a cap against a runaway loop, not
+// a budget; the enclave says when it is complete (m2pro needed more than 12).
+const ENROL_MAX_CAPTURES: u32 = 32;
 
 const ENROL_POLL_MS: u32 = 2;
 

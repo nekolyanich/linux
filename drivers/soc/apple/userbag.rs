@@ -14,6 +14,15 @@
 //! and its secret. It is loaded and unlocked at the user's first operation and
 //! unloaded when the user's last open file closes. A bag the enclave has
 //! forgotten (a stale handle, -2: a sleep, a SEP reset) is loaded again once.
+//!
+//! As macOS does at login (LOAD, DESIGNATE {1, -501}), every loaded bag of a
+//! uid of 10 or more is designated to its own SEP user -uid, and its ops
+//! address -uid: a designation takes any user from 10 up and lasts the boot,
+//! also past an unload of the load handle (tanabota U-A card 5, U-B card 6).
+//! That names SEP user uid for Touch ID too (op33, `cbio`), and makes the
+//! bag's secret changeable (op 0x07 works on a designated handle). Not for
+//! the fingers' user ([`crate::SBIO_PROBE_USER_ID`]): -1000 is the identity
+//! bag's, and that uid's own bag only serves its keys from before it.
 
 use core::fmt::Write;
 
@@ -25,9 +34,17 @@ use crate::{image, shim, LockState, Secret, SepData, SksRequest};
 
 const MAGIC: [u8; 16] = *b"TANABOTA-SEPBAG1";
 const VERSION: u32 = 1;
+/// A secret of another length than [`crate::SKS_SECRET_LEN`] (a login
+/// password after SEP_KEY_CHANGE_SECRET): u32 its length at [`OFF_SECRET`],
+/// then the secret, then the bag. A 32 B secret is still written as v1, so a
+/// kernel from before reads every record a random rekey leaves.
+const VERSION_SECRET_LEN: u32 = 2;
+/// The longest secret a v2 record holds (SEP_KEY_CHANGE_SECRET's maximum).
+pub(crate) const SECRET_MAX: usize = 128;
 
 // MAGIC, u32 version, u32 uid, u32 wrapped length, u16 crc (over the whole
-// record with this field zero), u16 0, the bag UUID, the secret, the bag.
+// record with this field zero), u16 0, the bag UUID, the secret, the bag
+// (v2: u32 secret length, the secret, the bag).
 const OFF_VERSION: usize = 0x10;
 const OFF_UID: usize = 0x14;
 const OFF_LEN: usize = 0x18;
@@ -54,6 +71,21 @@ pub(crate) struct UserBag {
     uid: u32,
     handle: Option<KeyBagHandle>,
     files: u32,
+}
+
+/// The SEP user a uid's bag is designated to, if it is: 10 and up (the
+/// enclave's floor, macOS's too), never the fingers' user.
+fn designated_user(uid: u32) -> Option<crate::sks::DesignateUser> {
+    let u = i32::try_from(uid).ok()?;
+    if u == crate::SBIO_PROBE_USER_ID {
+        return None;
+    }
+    crate::sks::DesignateUser::new(u)
+}
+
+/// The handle an op on `uid`'s bag addresses: -uid when designated.
+fn op_handle(uid: u32, handle: KeyBagHandle) -> i32 {
+    designated_user(uid).map_or(handle.value(), |u| u.special_handle().value())
 }
 
 /// The users with an open `/dev/sep-key` and their loaded bags.
@@ -111,6 +143,7 @@ impl BagPath {
 }
 
 struct StoredBag {
+    uuid: [u8; UUID_LEN],
     wrapped: KVec<u8>,
     secret: Secret,
 }
@@ -146,7 +179,7 @@ fn read(uid: u32) -> Result<Option<StoredBag>> {
     if size == 0 {
         return Ok(None);
     }
-    if !(HEADER + 1..=HEADER + MAX_WRAPPED).contains(&size) {
+    if !(HEADER + 1..=OFF_SECRET + 4 + SECRET_MAX + MAX_WRAPPED).contains(&size) {
         return Err(crate::key::errno::uclean());
     }
     // The record holds the bag's secret: wiped when dropped.
@@ -154,19 +187,30 @@ fn read(uid: u32) -> Result<Option<StoredBag>> {
     rec.0.resize(size, 0, GFP_KERNEL)?;
     f.read_exact(0, &mut rec.0)?;
     let crc = u16::from_le_bytes([rec[OFF_CRC], rec[OFF_CRC + 1]]);
+    let (secret_at, secret_len) = match u32_at(&rec, OFF_VERSION) {
+        VERSION => (OFF_SECRET, crate::SKS_SECRET_LEN),
+        VERSION_SECRET_LEN if size > OFF_SECRET + 4 => (OFF_SECRET + 4, u32_at(&rec, OFF_SECRET) as usize),
+        _ => return Err(crate::key::errno::uclean()),
+    };
+    let bag_at = secret_at + secret_len;
     if rec[..OFF_VERSION] != MAGIC
-        || u32_at(&rec, OFF_VERSION) != VERSION
+        || secret_len == 0
+        || secret_len > SECRET_MAX
+        || bag_at >= size
         || u32_at(&rec, OFF_UID) != uid
-        || u32_at(&rec, OFF_LEN) as usize != size - HEADER
+        || u32_at(&rec, OFF_LEN) as usize != size - bag_at
         || crc != record_crc(&rec)
     {
         return Err(crate::key::errno::uclean());
     }
     let mut wrapped = KVec::new();
-    wrapped.extend_from_slice(&rec[HEADER..], GFP_KERNEL)?;
+    wrapped.extend_from_slice(&rec[bag_at..], GFP_KERNEL)?;
     let mut secret = KVec::new();
-    secret.extend_from_slice(&rec[OFF_SECRET..HEADER], GFP_KERNEL)?;
+    secret.extend_from_slice(&rec[secret_at..bag_at], GFP_KERNEL)?;
+    let mut uuid = [0u8; UUID_LEN];
+    uuid.copy_from_slice(&rec[OFF_UUID..OFF_UUID + UUID_LEN]);
     Ok(Some(StoredBag {
+        uuid,
         wrapped,
         secret: Secret(secret),
     }))
@@ -191,18 +235,21 @@ fn write(
     secret: &[u8],
     wrapped: &[u8],
 ) -> Result<()> {
-    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.len() != crate::SKS_SECRET_LEN
-    {
+    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED || secret.is_empty() || secret.len() > SECRET_MAX {
         return Err(EINVAL);
     }
+    let v1 = secret.len() == crate::SKS_SECRET_LEN;
     let mut rec = Secret(KVec::new());
     let rec = &mut rec.0;
     rec.extend_from_slice(&MAGIC, GFP_KERNEL)?;
-    rec.extend_from_slice(&VERSION.to_le_bytes(), GFP_KERNEL)?;
+    rec.extend_from_slice(&(if v1 { VERSION } else { VERSION_SECRET_LEN }).to_le_bytes(), GFP_KERNEL)?;
     rec.extend_from_slice(&uid.to_le_bytes(), GFP_KERNEL)?;
     rec.extend_from_slice(&(wrapped.len() as u32).to_le_bytes(), GFP_KERNEL)?;
     rec.extend_from_slice(&[0; 4], GFP_KERNEL)?;
     rec.extend_from_slice(uuid, GFP_KERNEL)?;
+    if !v1 {
+        rec.extend_from_slice(&(secret.len() as u32).to_le_bytes(), GFP_KERNEL)?;
+    }
     rec.extend_from_slice(secret, GFP_KERNEL)?;
     rec.extend_from_slice(wrapped, GFP_KERNEL)?;
     let crc = record_crc(rec);
@@ -273,11 +320,40 @@ impl SepData {
             return Err(EIO);
         }
         let handle = KeyBagHandle::from_load_reply(raw);
-        if let Err(e) = self.user_bag_unlock(handle, &stored.secret) {
+        let ready = self
+            .user_bag_unlock(handle, &stored.secret)
+            .and_then(|()| self.user_bag_designate(uid, handle, &stored.secret));
+        if let Err(e) = ready {
             let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), PATIENCE_MS);
             return Err(e);
         }
         Ok(handle)
+    }
+
+    /// DESIGNATE {handle, -uid} with the bag's secret (Variant5's carries it),
+    /// for a uid that gets one; nothing for the others.
+    fn user_bag_designate(&self, uid: u32, handle: KeyBagHandle, secret: &[u8]) -> Result<()> {
+        let Some(user) = designated_user(uid) else {
+            return Ok(());
+        };
+        let d = crate::sks::Designation::new(handle, user);
+        let out = self
+            .sks_send_patient(self.sks_req_designate(&d, secret), PATIENCE_MS)
+            .ok_or(EIO)?;
+        let body = self
+            .sks_report_response(crate::sks::SKS_DESIGNATE_NAME, &out)
+            .unwrap_or(&[]);
+        if out.reply.status != 0 || body.len() != crate::sks::SKS_DESIGNATE_REPLY_LEN {
+            dev_warn!(
+                self.dev,
+                "sep-key: DESIGNATE uid {}'s bag: mailbox status {}, {} B\n",
+                uid,
+                out.reply.status,
+                body.len()
+            );
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     /// CREATE_KEYBAG as the identity bag's T6020 create (E6, K0), then
@@ -361,7 +437,10 @@ impl SepData {
             return Err(e);
         }
         dev_info!(self.dev, "sep-key: created the keybag of uid {}\n", uid);
-        if let Err(e) = self.user_bag_unlock(handle, &secret) {
+        let ready = self
+            .user_bag_unlock(handle, &secret)
+            .and_then(|()| self.user_bag_designate(uid, handle, &secret));
+        if let Err(e) = ready {
             let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), PATIENCE_MS);
             return Err(e);
         }
@@ -395,8 +474,10 @@ impl SepData {
         loop {
             let handle = self.user_bag_handle(bag, create)?;
             let out = self
-                .sks_send_patient(self.sks_req_refkey(handle.value(), der), PATIENCE_MS)
+                .sks_send_patient(self.sks_req_refkey(op_handle(uid, handle), der), PATIENCE_MS)
                 .ok_or(EIO)?;
+            // -2 also when the enclave lost the designation (a SEP reset): the
+            // reload designates again.
             if out.reply.status == STATUS_STALE_HANDLE && !retried {
                 dev_info!(self.dev, "sep-key: uid {}'s bag went stale; loading it again\n", uid);
                 bag.handle = None;
@@ -415,6 +496,69 @@ impl SepData {
                 body,
             });
         }
+    }
+
+    /// SEP_KEY_CHANGE_SECRET on `uid`'s own bag: op 0x07 on -uid from `old`
+    /// (the record's when `None`) to `new`, COPY_KEYBAG on -uid (the load
+    /// handle still gives the bytes from before, tanabota U-J), and one atomic
+    /// replace of the record with the new copy and `new`. EOPNOTSUPP for a
+    /// uid whose bag is not designated. The enclave's status in `status`.
+    ///
+    /// If the record is not rewritten after the enclave said yes, the old
+    /// record still opens with the old secret (no generation, U-J): the bag
+    /// keeps working until it is loaded again, then the change is lost.
+    pub(crate) fn user_bag_change_secret(
+        &self,
+        bags: &mut UserBags,
+        uid: u32,
+        old: Option<&[u8]>,
+        new: &[u8],
+        status: &mut i32,
+    ) -> Result<()> {
+        let Some(user) = designated_user(uid) else {
+            return Err(crate::key::errno::opnotsupp());
+        };
+        let special = user.special_handle();
+        let bag = bags.find(uid).ok_or(EBADF)?;
+        let stored = read(uid)?.ok_or_else(crate::key::errno::nokey)?;
+        let mut retried = false;
+        loop {
+            self.user_bag_handle(bag, false)?;
+            let out = self
+                .sks_send_patient(
+                    self.sks_req_change_secret(special, old.unwrap_or(&stored.secret), new),
+                    PATIENCE_MS,
+                )
+                .ok_or(EIO)?;
+            if out.reply.status == STATUS_STALE_HANDLE && !retried {
+                bag.handle = None;
+                retried = true;
+                continue;
+            }
+            *status = out.reply.status as i32;
+            if out.reply.status != 0 {
+                return Err(EACCES);
+            }
+            break;
+        }
+        let fresh = self
+            .sks_send_patient(self.sks_req_copy_keybag_special(special), PATIENCE_MS)
+            .and_then(|out| self.wrapped_from_copy_reply(&out, c"a user bag after its change"));
+        let written = match fresh {
+            Some(fresh) => BagPath::new(uid).and_then(|path| write(&path, uid, &stored.uuid, new, &fresh)),
+            None => Err(EIO),
+        };
+        if let Err(e) = written {
+            dev_err!(
+                self.dev,
+                "sep-key: uid {}'s bag secret changed in the enclave but its record was not rewritten ({:?}); the old record stays valid until the bag is loaded again\n",
+                uid,
+                e
+            );
+            return Err(EIO);
+        }
+        dev_info!(self.dev, "sep-key: uid {}'s bag secret changed\n", uid);
+        Ok(())
     }
 
     pub(crate) fn user_bag_open(&self, bags: &mut UserBags, uid: u32) -> Result<()> {

@@ -214,22 +214,30 @@ struct sep_key_auth_poll {
 /*
  * A new secret for the caller's home bag: its keys, their certificates and
  * its EK stay (the enclave rewraps the bag, op 0x07 as macOS's
- * aks_change_secret). Only the identity bag for now (uid 1000's home):
- * EOPNOTSUPP for a uid's own bag. With SEP_KEY_CHANGE_RANDOM (new_len 0) the
- * kernel makes a random 32 B secret; else new_secret holds new_len bytes,
- * wiped before the struct goes back. sep_status is the enclave's answer to
- * the change (or to the designation before it). EIO with sep_status 0: the
- * enclave changed the secret but the record was not rewritten; the old
- * record still opens with the old secret, and the next boot loads it.
+ * aks_change_secret). uid 1000's home is the identity bag; another uid's is
+ * its own bag, designated to its SEP user -uid whenever the driver loads it
+ * (uid 10 and up). uid 0 and 1..9: EOPNOTSUPP.
+ *
+ * With SEP_KEY_CHANGE_RANDOM (new_len 0) the kernel makes a random 32 B new
+ * secret; else new_secret holds new_len bytes. With SEP_KEY_CHANGE_OLD,
+ * old_secret holds old_len bytes the enclave checks (a login password); else
+ * (old_len 0) the bag record's secret is the old one. Both are zeroed before
+ * the struct goes back. A refusal is EACCES with the enclave's status in
+ * sep_status (-5: not the bag's secret). EIO with sep_status 0: the enclave
+ * changed the secret but the record was not rewritten; the old record still
+ * opens with the old secret, and the next load of the bag uses it.
  */
 #define SEP_KEY_CHANGE_RANDOM 1u
-#define SEP_KEY_CHANGE_SECRET_MAX 64
+#define SEP_KEY_CHANGE_OLD    2u
+#define SEP_KEY_CHANGE_SECRET_MAX 128
 
 struct sep_key_change_secret {
-  __u32 flags;      /* in: 0 or SEP_KEY_CHANGE_RANDOM */
+  __u32 flags;      /* in: SEP_KEY_CHANGE_RANDOM and/or SEP_KEY_CHANGE_OLD */
   __s32 sep_status; /* out */
+  __u32 old_len;    /* in: 1..SEP_KEY_CHANGE_SECRET_MAX with OLD, else 0 */
   __u32 new_len;    /* in: 1..SEP_KEY_CHANGE_SECRET_MAX, 0 with RANDOM */
-  __u32 reserved;
+  __u32 reserved[4]; /* in: 0 */
+  __u8  old_secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
   __u8  new_secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
 };
 

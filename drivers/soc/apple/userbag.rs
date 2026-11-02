@@ -127,7 +127,7 @@ impl UserBags {
 
 /// `/var/lib/tanabota-sep-bag-<uid>.bin`, NUL-terminated.
 struct BagPath {
-    buf: [u8; 48],
+    buf: [u8; 64],
     len: usize,
 }
 
@@ -147,7 +147,7 @@ impl Write for BagPath {
 impl BagPath {
     fn new(uid: u32) -> Result<BagPath> {
         let mut p = BagPath {
-            buf: [0; 48],
+            buf: [0; 64],
             len: 0,
         };
         write!(p, "/var/lib/tanabota-sep-bag-{}.bin", uid).map_err(|_| EINVAL)?;
@@ -158,10 +158,26 @@ impl BagPath {
     /// before interface 4, moved aside when its home record took the path.
     fn legacy(uid: u32) -> Result<BagPath> {
         let mut p = BagPath {
-            buf: [0; 48],
+            buf: [0; 64],
             len: 0,
         };
         write!(p, "/var/lib/tanabota-sep-bag-{}.legacy.bin", uid).map_err(|_| EINVAL)?;
+        Ok(p)
+    }
+
+    /// `/var/lib/tanabota-sep-bag-<uid>.retired-<8 hex>.bin`: a home record
+    /// SEP_KEY_NEW_BAG replaced, named by its bag's uuid.
+    fn retired(uid: u32, uuid: &[u8; UUID_LEN]) -> Result<BagPath> {
+        let mut p = BagPath {
+            buf: [0; 64],
+            len: 0,
+        };
+        write!(
+            p,
+            "/var/lib/tanabota-sep-bag-{}.retired-{:02x}{:02x}{:02x}{:02x}.bin",
+            uid, uuid[0], uuid[1], uuid[2], uuid[3]
+        )
+        .map_err(|_| EINVAL)?;
         Ok(p)
     }
 
@@ -381,6 +397,34 @@ pub(crate) fn update_home_flags(uid: u32, set: u16, clear: u16) -> Result<()> {
 /// The mode flags of `uid`'s record at the home path; None without one.
 pub(crate) fn home_mode(uid: u32) -> Result<Option<u16>> {
     Ok(read_at(&BagPath::new(uid)?, uid)?.map(|b| b.flags & (FLAG_PASSWORD | FLAG_LOGIN_SAME)))
+}
+
+/// SEP_KEY_NEW_BAG: copies `uid`'s home record to its `.retired-<uuid8>.bin`
+/// path (created, never over another file; the same bytes there already are
+/// a retry) before the home path takes the new bag. Only a password-mode
+/// record: it holds no secret, so the copy opens nothing (EINVAL for a
+/// stored secret, which would stay on disk with it).
+pub(crate) fn retire_home(uid: u32) -> Result<()> {
+    let home = BagPath::new(uid)?;
+    let b = read_at(&home, uid)?.ok_or_else(crate::key::errno::nokey)?;
+    if b.flags & FLAG_PASSWORD == 0 {
+        return Err(EINVAL);
+    }
+    let f = shim::StoreFile::open_readonly(home.as_cstr())?;
+    let mut raw = KVec::new();
+    raw.resize(f.size()? as usize, 0, GFP_KERNEL)?;
+    f.read_exact(0, &mut raw)?;
+    let retired = BagPath::retired(uid, &b.uuid)?;
+    match shim::create_file(retired.as_cstr(), &raw) {
+        Err(e) if e == EEXIST => {
+            let g = shim::StoreFile::open_readonly(retired.as_cstr())?;
+            let mut there = KVec::new();
+            there.resize(g.size()? as usize, 0, GFP_KERNEL)?;
+            g.read_exact(0, &mut there)?;
+            if there == raw { Ok(()) } else { Err(EEXIST) }
+        }
+        r => r,
+    }
 }
 
 /// Moves a legacy record at the home path aside to the `.legacy.bin` path,
@@ -900,6 +944,16 @@ impl SepData {
                     "sep-key: unloading uid {}'s bag before sleep: no answer\n",
                     bag.uid
                 ),
+            }
+        }
+    }
+
+    /// SEP_KEY_NEW_BAG on `uid`'s own bag: the old bag's load handle goes,
+    /// so the next op loads the new record.
+    pub(crate) fn user_bag_forget_handle(&self, bags: &mut UserBags, uid: u32) {
+        if let Some(bag) = bags.find(uid) {
+            if let Some(h) = bag.handle.take() {
+                let _ = self.sks_send_patient(self.sks_req_unload_keybag(h), PATIENCE_MS);
             }
         }
     }

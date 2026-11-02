@@ -51,7 +51,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_KEY_IFACE_VERSION 5 /* 5: password-mode bags, UNLOCK, LOCK */
+#define SEP_KEY_IFACE_VERSION 6 /* 5: password-mode bags, UNLOCK, LOCK; 6: NEW_BAG */
 
 #define SEP_KEY_BLOB_MAX   1024 /* the enclave's stored set {rk={..}}, ~260 B */
 #define SEP_KEY_PUB_MAX    97   /* P-384 04||X||Y */
@@ -290,6 +290,30 @@ struct sep_key_lock {
   __u32 reserved[6]; /* in: 0 */
 };
 
+/*
+ * A new home bag for the caller (uid 10 and up), made with the password
+ * given: the enclave takes it at creation, so no other secret of the bag ever
+ * exists. It is designated to -uid in place of the old bag (for uid 1000 the
+ * fingers stay, and Touch ID, the per-op loads and the enrolment follow the
+ * new bag), open, its record in password mode (with SEP_KEY_NEW_BAG_LOGIN_SAME
+ * marked as the login password). The old bag is left as it is and its record
+ * (no secret) kept as tanabota-sep-bag-<uid>.retired-<uuid8>.bin. Keys, EKs
+ * and certificates of the old bag do not open in the new one: reissue them.
+ * The current bag must be in password mode (EINVAL: a stored secret would
+ * stay on disk) and open (ENOKEY). uuid: the new bag's, out. secret is zeroed
+ * on the way out.
+ */
+#define SEP_KEY_NEW_BAG_LOGIN_SAME 1u
+
+struct sep_key_new_bag {
+  __u32 flags;      /* in: 0 or SEP_KEY_NEW_BAG_LOGIN_SAME */
+  __s32 sep_status; /* out */
+  __u32 secret_len; /* in: 1..SEP_KEY_CHANGE_SECRET_MAX */
+  __u32 reserved[5]; /* in: 0 */
+  __u8  uuid[16];   /* out */
+  __u8  secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
+};
+
 #define SEP_KEY_IOC_MAGIC 0xB2
 
 #define SEP_KEY_GET_INFO _IOR (SEP_KEY_IOC_MAGIC, 0x01, struct sep_key_info)
@@ -304,3 +328,4 @@ struct sep_key_lock {
 #define SEP_KEY_CHANGE_SECRET _IOWR(SEP_KEY_IOC_MAGIC, 0x0a, struct sep_key_change_secret)
 #define SEP_KEY_UNLOCK      _IOWR(SEP_KEY_IOC_MAGIC, 0x0b, struct sep_key_unlock)
 #define SEP_KEY_LOCK        _IOW (SEP_KEY_IOC_MAGIC, 0x0c, struct sep_key_lock)
+#define SEP_KEY_NEW_BAG     _IOWR(SEP_KEY_IOC_MAGIC, 0x0d, struct sep_key_new_bag)

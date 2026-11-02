@@ -886,6 +886,93 @@ impl SepData {
         Ok(())
     }
 
+    /// SEP_KEY_NEW_BAG on the identity bag: the enrolment path and the
+    /// snapshot binding follow the new bag designated to `special`.
+    pub(crate) fn sks_rebind_enrolment(
+        &self,
+        special: crate::sks::SpecialHandle,
+        secret: &[u8],
+        identity: Option<keybag::SnapshotIdentity>,
+    ) -> Result<()> {
+        let mut copy = KVec::new();
+        copy.extend_from_slice(secret, GFP_KERNEL)?;
+        *self.enrol_material.lock() = Some(EnrolMaterial {
+            special,
+            secret: Secret(copy),
+            snapshot_identity: identity,
+        });
+        Ok(())
+    }
+
+    /// A new bag made with `secret` directly (SEP_KEY_NEW_BAG: the secret is
+    /// never stored), in the user-bag create shape (Variant5 only), unlocked:
+    /// its load handle, its own uuid read back, and its wrapped copy. The
+    /// handle is unloaded on every failure.
+    pub(crate) fn sks_create_bag_with_secret(
+        &self,
+        secret: &[u8],
+    ) -> Result<(crate::sks::KeyBagHandle, [u8; keybag::UUID_LEN], KVec<u8>)> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(crate::key::errno::opnotsupp());
+        }
+        let patience = crate::userbag::PATIENCE_MS;
+        let mut uuid = [0u8; keybag::UUID_LEN];
+        shim::random_bytes(&mut uuid)?;
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        let enc = &self.profile.keybag_create;
+        let mut body = image::Body::new();
+        body.put_u32(enc.variant)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_u32(enc.bag_type)?;
+        body.put_i32(enc.arg)?;
+        body.put_blob(secret)?;
+        body.put_blob(&[])?;
+        body.put_blob(&uuid)?;
+        body.put_blob(&[])?;
+        body.put_u64(0)?;
+        body.put_u64(0)?;
+        body.put_blob(&[])?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg = crate::sks::encode_sks_create(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        let out = self
+            .sks_send_patient(Ok(SksRequest { name: crate::sks::SKS_CREATE_NAME, msg, img }), patience)
+            .ok_or(EIO)?;
+        let reply = self.sks_report_response(crate::sks::SKS_CREATE_NAME, &out).unwrap_or(&[]);
+        if out.reply.status != 0 || reply.len() < 8 {
+            dev_warn!(self.dev, "sep-key: CREATE_KEYBAG of a new bag: mailbox status {}, {} B\n", out.reply.status, reply.len());
+            return Err(EIO);
+        }
+        let raw = i32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]);
+        if raw < 0 {
+            return Err(EIO);
+        }
+        let handle = crate::sks::KeyBagHandle::from_create_reply(raw);
+        let made = (|| {
+            let bag_uuid = self.sks_read_uuid(handle).ok_or(EIO)?;
+            let wrapped = self
+                .sks_send_patient(self.sks_req_copy_keybag(handle), patience)
+                .and_then(|c| self.wrapped_from_copy_reply(&c, c"a new bag"))
+                .ok_or(EIO)?;
+            let healthy = self.sks_health_check(c"sep-key new bag").ok_or(EIO)?;
+            let out = self
+                .sks_send_patient(self.sks_req_change_lock_state(handle, LockState::Unlocked, secret, healthy), patience)
+                .ok_or(EIO)?;
+            if out.reply.status != 0 {
+                return Err(EIO);
+            }
+            Ok((bag_uuid, wrapped))
+        })();
+        match made {
+            Ok((bag_uuid, wrapped)) => Ok((handle, bag_uuid, wrapped)),
+            Err(e) => {
+                let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), patience);
+                Err(e)
+            }
+        }
+    }
+
     fn sks_remember_enrolment_material(&self, special: crate::sks::SpecialHandle, secret: &[u8]) {
         let mut copy = KVec::new();
         if copy.extend_from_slice(secret, GFP_KERNEL).is_err() {

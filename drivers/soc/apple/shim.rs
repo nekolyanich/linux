@@ -16,7 +16,14 @@ extern "C" {
     fn sep_store_sync(handle: *mut c_void) -> c_int;
     fn sep_store_replace(path: *const c_char, buf: *const c_void, len: usize, noreplace: bool)
         -> c_int;
+    fn sep_store_unlink(path: *const c_char) -> c_int;
     fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
+}
+
+/// Removes the file at `path` and syncs its directory; ENOENT if absent.
+pub(crate) fn remove_file(path: &CStr) -> Result<()> {
+    // SAFETY: `path` is NUL-terminated; the shim keeps nothing.
+    kernel::error::to_result(unsafe { sep_store_unlink(path.as_char_ptr()) })
 }
 
 pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {

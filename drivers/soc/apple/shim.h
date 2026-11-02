@@ -52,6 +52,7 @@ long sep_store_write(void *handle, long long off, const void *buf,
 int sep_store_sync(void *handle);
 int sep_store_replace(const char *path, const void *buf, size_t len,
 		      bool noreplace);
+int sep_store_unlink(const char *path);
 
 /* -- sha_shim.c --------------------------------------------------------- */
 

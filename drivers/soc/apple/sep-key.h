@@ -314,6 +314,67 @@ struct sep_key_new_bag {
   __u8  secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
 };
 
+/*
+ * Bag management (interface 6). Each uid's records: its home bag
+ * (tanabota-sep-bag-<uid>.bin), uid 1000's legacy own bag (.legacy.bin) and
+ * the bags SEP_KEY_NEW_BAG or SEP_KEY_BAG_USE retired (.retired-<uuid8>.bin,
+ * listed in tanabota-sep-bags-<uid>.idx). For the caller's uid, or any as root.
+ *
+ * SEP_KEY_BAG_LIST: up to SEP_KEY_BAGS_MAX entries: uuid, role
+ * (SEP_KEY_BAG_HOME/LEGACY/RETIRED), flags: the record's mode
+ * (SEP_KEY_BAG_PASSWORD, SEP_KEY_BAG_LOGIN_SAME) and, for what the kernel
+ * holds, SEP_KEY_BAG_OPEN, SEP_KEY_BAG_DESIGNATED, SEP_KEY_BAG_LOADED.
+ *
+ * SEP_KEY_BAG_DELETE: a non-home bag's record goes (one holding a secret,
+ * a stored-mode legacy record, is overwritten with zeros first). EBUSY for
+ * the home bag, ENOENT for an unknown uuid. Keys made in it are gone.
+ *
+ * SEP_KEY_BAG_USE: a retired password-mode bag is the home bag again (the
+ * rollback of SEP_KEY_NEW_BAG), opened with its password: a wrong one is
+ * EACCES with sep_status -5 and nothing changes. The current home bag is
+ * retired in its place. A stored-mode target (a legacy bag) is EINVAL: the
+ * home bag stays in password mode. secret is zeroed on the way out.
+ */
+#define SEP_KEY_BAGS_MAX 16
+#define SEP_KEY_BAG_HOME    1
+#define SEP_KEY_BAG_LEGACY  2
+#define SEP_KEY_BAG_RETIRED 3
+#define SEP_KEY_BAG_PASSWORD   0x004u
+#define SEP_KEY_BAG_LOGIN_SAME 0x008u
+#define SEP_KEY_BAG_OPEN       0x100u
+#define SEP_KEY_BAG_DESIGNATED 0x200u
+#define SEP_KEY_BAG_LOADED     0x400u
+
+struct sep_key_bag_entry {
+  __u8  uuid[16];
+  __u32 role;
+  __u32 flags;
+};
+
+struct sep_key_bag_list {
+  __u32 uid;        /* in */
+  __u32 count;      /* out */
+  __u32 reserved[6]; /* in: 0 */
+  struct sep_key_bag_entry bags[SEP_KEY_BAGS_MAX]; /* out */
+};
+
+struct sep_key_bag_delete {
+  __u32 flags;      /* in: 0 */
+  __u32 uid;        /* in */
+  __u32 reserved[6]; /* in: 0 */
+  __u8  uuid[16];   /* in */
+};
+
+struct sep_key_bag_use {
+  __u32 flags;      /* in: 0 */
+  __u32 uid;        /* in */
+  __s32 sep_status; /* out */
+  __u32 secret_len; /* in: 1..SEP_KEY_CHANGE_SECRET_MAX */
+  __u32 reserved[4]; /* in: 0 */
+  __u8  uuid[16];   /* in */
+  __u8  secret[SEP_KEY_CHANGE_SECRET_MAX]; /* in, zeroed on the way out */
+};
+
 #define SEP_KEY_IOC_MAGIC 0xB2
 
 #define SEP_KEY_GET_INFO _IOR (SEP_KEY_IOC_MAGIC, 0x01, struct sep_key_info)
@@ -329,3 +390,6 @@ struct sep_key_new_bag {
 #define SEP_KEY_UNLOCK      _IOWR(SEP_KEY_IOC_MAGIC, 0x0b, struct sep_key_unlock)
 #define SEP_KEY_LOCK        _IOW (SEP_KEY_IOC_MAGIC, 0x0c, struct sep_key_lock)
 #define SEP_KEY_NEW_BAG     _IOWR(SEP_KEY_IOC_MAGIC, 0x0d, struct sep_key_new_bag)
+#define SEP_KEY_BAG_LIST    _IOWR(SEP_KEY_IOC_MAGIC, 0x0e, struct sep_key_bag_list)
+#define SEP_KEY_BAG_DELETE  _IOW (SEP_KEY_IOC_MAGIC, 0x0f, struct sep_key_bag_delete)
+#define SEP_KEY_BAG_USE     _IOWR(SEP_KEY_IOC_MAGIC, 0x10, struct sep_key_bag_use)

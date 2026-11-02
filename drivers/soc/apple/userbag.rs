@@ -181,6 +181,17 @@ impl BagPath {
         Ok(p)
     }
 
+    /// `/var/lib/tanabota-sep-bags-<uid>.idx`: the uuids of `uid`'s retired
+    /// records (the store has no directory listing).
+    fn index(uid: u32) -> Result<BagPath> {
+        let mut p = BagPath {
+            buf: [0; 64],
+            len: 0,
+        };
+        write!(p, "/var/lib/tanabota-sep-bags-{}.idx", uid).map_err(|_| EINVAL)?;
+        Ok(p)
+    }
+
     /// Where userbag's own ops keep `uid`'s bag: the fingers' user's own bag
     /// is the legacy one (its home is keybag.rs's, at [`BagPath::new`]).
     fn own(uid: u32) -> Result<BagPath> {
@@ -415,16 +426,224 @@ pub(crate) fn retire_home(uid: u32) -> Result<()> {
     raw.resize(f.size()? as usize, 0, GFP_KERNEL)?;
     f.read_exact(0, &mut raw)?;
     let retired = BagPath::retired(uid, &b.uuid)?;
+    // listed first: an entry without its file is dropped by tidy(), a file
+    // without its entry would be invisible
+    index_add(uid, &b.uuid)?;
     match shim::create_file(retired.as_cstr(), &raw) {
         Err(e) if e == EEXIST => {
-            let g = shim::StoreFile::open_readonly(retired.as_cstr())?;
-            let mut there = KVec::new();
-            there.resize(g.size()? as usize, 0, GFP_KERNEL)?;
-            g.read_exact(0, &mut there)?;
+            let there = raw_file(&retired)?.ok_or(ENOENT)?;
             if there == raw { Ok(()) } else { Err(EEXIST) }
         }
         r => r,
     }
+}
+
+fn raw_file(p: &BagPath) -> Result<Option<KVec<u8>>> {
+    let f = match shim::StoreFile::open_readonly(p.as_cstr()) {
+        Ok(f) => f,
+        Err(e) if e == ENOENT => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut b = KVec::new();
+    b.resize(f.size()? as usize, 0, GFP_KERNEL)?;
+    f.read_exact(0, &mut b)?;
+    Ok(Some(b))
+}
+
+const INDEX_MAGIC: [u8; 16] = *b"TANABOTA-BAGIDX1";
+/// More retired bags than this per uid: delete some first (ENOSPC).
+pub(crate) const BAGS_MAX: usize = 16;
+
+/// The retired uuids of `uid`, as the index lists them.
+fn index_read(uid: u32) -> Result<KVec<[u8; UUID_LEN]>> {
+    let mut out = KVec::new();
+    let Some(b) = raw_file(&BagPath::index(uid)?)? else {
+        return Ok(out);
+    };
+    if b.len() < 20 || b[..16] != INDEX_MAGIC {
+        return Err(crate::key::errno::uclean());
+    }
+    let n = u32_at(&b, 16) as usize;
+    if n > BAGS_MAX || b.len() != 20 + n * UUID_LEN {
+        return Err(crate::key::errno::uclean());
+    }
+    for i in 0..n {
+        let mut u = [0u8; UUID_LEN];
+        u.copy_from_slice(&b[20 + i * UUID_LEN..20 + (i + 1) * UUID_LEN]);
+        out.push(u, GFP_KERNEL)?;
+    }
+    Ok(out)
+}
+
+fn index_write(uid: u32, list: &[[u8; UUID_LEN]]) -> Result<()> {
+    let mut b = KVec::new();
+    b.extend_from_slice(&INDEX_MAGIC, GFP_KERNEL)?;
+    b.extend_from_slice(&(list.len() as u32).to_le_bytes(), GFP_KERNEL)?;
+    for u in list {
+        b.extend_from_slice(u, GFP_KERNEL)?;
+    }
+    shim::replace_file(BagPath::index(uid)?.as_cstr(), &b)
+}
+
+fn index_add(uid: u32, uuid: &[u8; UUID_LEN]) -> Result<()> {
+    let mut list = index_read(uid)?;
+    if list.iter().any(|u| u == uuid) {
+        return Ok(());
+    }
+    if list.len() >= BAGS_MAX {
+        return Err(ENOSPC);
+    }
+    list.push(*uuid, GFP_KERNEL)?;
+    index_write(uid, &list)
+}
+
+fn index_remove(uid: u32, uuid: &[u8; UUID_LEN]) -> Result<()> {
+    let list = index_read(uid)?;
+    let mut keep = KVec::new();
+    for u in list.iter().filter(|u| *u != uuid) {
+        keep.push(*u, GFP_KERNEL)?;
+    }
+    if keep.len() == list.len() {
+        return Ok(());
+    }
+    index_write(uid, &keep)
+}
+
+/// Where a bag of `uid` other than the home one lives.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Role {
+    Home = 1,
+    Legacy = 2,
+    Retired = 3,
+}
+
+/// One record of a uid, as SEP_KEY_BAG_LIST shows it.
+pub(crate) struct BagEntry {
+    pub(crate) uuid: [u8; UUID_LEN],
+    pub(crate) role: Role,
+    /// FLAG_PASSWORD / FLAG_LOGIN_SAME as stored.
+    pub(crate) mode: u16,
+}
+
+/// Brings `uid`'s retired records in line with the index, after a crash
+/// anywhere in NEW_BAG / BAG_USE / BAG_DELETE: an entry without its file is
+/// dropped; a retired record of the home bag's uuid (BAG_USE replaced the
+/// home path and was cut short before the source went) is removed.
+pub(crate) fn tidy(uid: u32) -> Result<()> {
+    let home = read_at(&BagPath::new(uid)?, uid)?.map(|b| b.uuid);
+    for u in index_read(uid)?.iter() {
+        let p = BagPath::retired(uid, u)?;
+        match read_at(&p, uid)? {
+            None => index_remove(uid, u)?,
+            Some(b) if Some(b.uuid) == home && b.flags & FLAG_PASSWORD != 0 => {
+                shim::remove_file(p.as_cstr())?;
+                index_remove(uid, u)?;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Every record of `uid`: the home one, the legacy one (uid 1000's own bag
+/// from before), the retired ones.
+pub(crate) fn list(uid: u32) -> Result<KVec<BagEntry>> {
+    tidy(uid)?;
+    let mut out = KVec::new();
+    let mode = |f: u16| f & (FLAG_PASSWORD | FLAG_LOGIN_SAME);
+    if let Some(b) = read_at(&BagPath::new(uid)?, uid)? {
+        // uid 1000's home path holds its legacy own bag until the identity
+        // record moved there (keybag.rs): only a home record is the home
+        let role = if b.flags & FLAG_HOME != 0 || uid as i32 != crate::SBIO_PROBE_USER_ID { Role::Home } else { Role::Legacy };
+        out.push(BagEntry { uuid: b.uuid, role, mode: mode(b.flags) }, GFP_KERNEL)?;
+    }
+    if let Some(b) = read_at(&BagPath::legacy(uid)?, uid)? {
+        out.push(BagEntry { uuid: b.uuid, role: Role::Legacy, mode: mode(b.flags) }, GFP_KERNEL)?;
+    }
+    for u in index_read(uid)?.iter() {
+        if let Some(b) = read_at(&BagPath::retired(uid, u)?, uid)? {
+            out.push(BagEntry { uuid: b.uuid, role: Role::Retired, mode: mode(b.flags) }, GFP_KERNEL)?;
+        }
+    }
+    Ok(out)
+}
+
+/// The path of `uid`'s non-home record of bag `uuid` and its role, or
+/// EBUSY for the home bag, ENOENT for none.
+fn find_other(uid: u32, uuid: &[u8; UUID_LEN]) -> Result<(BagPath, Role)> {
+    if read_at(&BagPath::new(uid)?, uid)?.is_some_and(|b| b.uuid == *uuid && b.flags & FLAG_HOME != 0) {
+        return Err(EBUSY);
+    }
+    if read_at(&BagPath::legacy(uid)?, uid)?.is_some_and(|b| b.uuid == *uuid) {
+        return Ok((BagPath::legacy(uid)?, Role::Legacy));
+    }
+    if index_read(uid)?.iter().any(|u| u == uuid) {
+        let p = BagPath::retired(uid, uuid)?;
+        if read_at(&p, uid)?.is_some() {
+            return Ok((p, Role::Retired));
+        }
+    }
+    Err(ENOENT)
+}
+
+/// SEP_KEY_BAG_DELETE's file part: `uid`'s non-home record of `uuid` goes.
+/// A record that holds a secret (stored mode: a legacy bag) is overwritten
+/// with zeros and synced first (on a copy-on-write filesystem the old
+/// blocks may still survive in it and in its snapshots).
+pub(crate) fn delete(uid: u32, uuid: &[u8; UUID_LEN]) -> Result<Role> {
+    let (path, role) = find_other(uid, uuid)?;
+    let b = read_at(&path, uid)?.ok_or(ENOENT)?;
+    if b.flags & FLAG_PASSWORD == 0 {
+        let (f, _) = shim::StoreFile::open_host(path.as_cstr())?;
+        let mut zeros = KVec::new();
+        zeros.resize(f.size()? as usize, 0u8, GFP_KERNEL)?;
+        f.write_all(0, &zeros)?;
+        f.sync()?;
+    }
+    shim::remove_file(path.as_cstr())?;
+    if role == Role::Retired {
+        index_remove(uid, uuid)?;
+    }
+    Ok(role)
+}
+
+/// What SEP_KEY_BAG_USE needs of its target: the record (password mode
+/// only: the home bag is never stored-mode again, EINVAL), and its path.
+pub(crate) struct UseTarget {
+    path: BagPath,
+    pub(crate) uuid: [u8; UUID_LEN],
+    pub(crate) readback: bool,
+    pub(crate) wrapped: KVec<u8>,
+    raw: KVec<u8>,
+}
+
+pub(crate) fn use_target(uid: u32, uuid: &[u8; UUID_LEN]) -> Result<UseTarget> {
+    let (path, _) = find_other(uid, uuid)?;
+    let b = read_at(&path, uid)?.ok_or(ENOENT)?;
+    if b.flags & FLAG_PASSWORD == 0 {
+        return Err(EINVAL);
+    }
+    let raw = raw_file(&path)?.ok_or(ENOENT)?;
+    Ok(UseTarget { uuid: b.uuid, readback: b.flags & FLAG_READBACK != 0, wrapped: b.wrapped, path, raw })
+}
+
+/// SEP_KEY_BAG_USE's file part, after the enclave took the target: the home
+/// record is retired (copied to its .retired-<uuid8>.bin, listed), the
+/// target's record replaces the home path (one atomic replace), the
+/// target's own file goes. A crash leaves: before the replace, the old home
+/// in place (and maybe its retired copy): the old bag is home, as before; after
+/// it, the target is home and its old file a retired record of the home's
+/// uuid, which tidy() removes at the next list, use or boot.
+pub(crate) fn use_commit(uid: u32, t: &UseTarget) -> Result<()> {
+    retire_home(uid)?;
+    shim::replace_file(BagPath::new(uid)?.as_cstr(), &t.raw)?;
+    tidy(uid)?;
+    if read_at(&t.path, uid)?.is_some() {
+        // a legacy record cannot be a target (stored mode); a retired one
+        // with the home's uuid was removed by tidy()
+        shim::remove_file(t.path.as_cstr())?;
+    }
+    Ok(())
 }
 
 /// Moves a legacy record at the home path aside to the `.legacy.bin` path,
@@ -855,7 +1074,7 @@ impl SepData {
     /// designation outlives the load handle, U-B), UNLOAD. The enclave's
     /// status of the unlock (-5: not the secret).
     pub(crate) fn user_bag_verify(&self, _bags: &mut UserBags, uid: u32, secret: &[u8]) -> Result<i8> {
-        let mut stored = read(uid)?.ok_or_else(crate::key::errno::nokey)?;
+        let stored = read(uid)?.ok_or_else(crate::key::errno::nokey)?;
         if stored.flags & FLAG_PASSWORD == 0 {
             return Err(EINVAL);
         }

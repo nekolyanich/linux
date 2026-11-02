@@ -316,6 +316,41 @@ struct NewBag {
 }
 
 static_assert!(core::mem::size_of::<NewBag>() == 176);
+
+#[repr(C)]
+#[allow(dead_code)]
+struct BagList {
+    head: [u32; 8],
+    entries: [[u8; 24]; crate::userbag::BAGS_MAX],
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct BagDelete {
+    head: [u32; 8],
+    uuid: [u8; 16],
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct BagUse {
+    head: [u32; 8],
+    uuid: [u8; 16],
+    secret: [u8; CHANGE_SECRET_MAX],
+}
+
+static_assert!(core::mem::size_of::<BagList>() == 32 + 24 * 16);
+static_assert!(core::mem::size_of::<BagDelete>() == 48);
+static_assert!(core::mem::size_of::<BagUse>() == 176);
+const IOC_BAG_LIST: u32 = _IOWR::<BagList>(MAGIC, 0x0e);
+const IOC_BAG_DELETE: u32 = _IOW::<BagDelete>(MAGIC, 0x0f);
+const IOC_BAG_USE: u32 = _IOWR::<BagUse>(MAGIC, 0x10);
+/// BAG_LIST entry flags besides the record's mode (password 4, login 8).
+const BAG_OPEN: u32 = 0x100;
+const BAG_DESIGNATED: u32 = 0x200;
+const BAG_LOADED: u32 = 0x400;
+const BAG_UUID_AT: usize = HEAD;
+const BAG_USE_SECRET_AT: usize = HEAD + 16;
 const IOC_NEW_BAG: u32 = _IOWR::<NewBag>(MAGIC, 0x0d);
 /// SEP_KEY_NEW_BAG: the new password is the user's login password.
 const NEW_BAG_LOGIN_SAME: u32 = 1;
@@ -843,6 +878,9 @@ impl SepData {
             IOC_UNLOCK => (core::mem::size_of::<Unlock>(), |s, f, i| s.key_unlock(f, i)),
             IOC_LOCK => (core::mem::size_of::<Lock>(), |s, f, i| s.key_lock(f, i)),
             IOC_NEW_BAG => (core::mem::size_of::<NewBag>(), |s, f, i| s.key_new_bag(f, i)),
+            IOC_BAG_LIST => (core::mem::size_of::<BagList>(), |s, f, i| s.key_bag_list(f, i)),
+            IOC_BAG_DELETE => (core::mem::size_of::<BagDelete>(), |s, f, i| s.key_bag_delete(f, i)),
+            IOC_BAG_USE => (core::mem::size_of::<BagUse>(), |s, f, i| s.key_bag_use(f, i)),
             _ => return Err(ENOTTY),
         };
         if !self.sks_ready() {
@@ -1594,6 +1632,176 @@ impl SepData {
         if identity && self.touchid_started.load(Relaxed) {
             let ok = crate::sbio::UserId::new(BIO_USER).is_some_and(|u| self.establish_scrd_match_context(u));
             dev_info!(self.dev, "sep-key: the match credential made again for the new bag: {}\n", ok);
+        }
+        Ok(())
+    }
+
+    /// SEP_KEY_BAG_LIST: every record of `uid` (the caller's, or any as
+    /// root): uuid, role, mode, and for the home bag whether it is open,
+    /// designated and loaded.
+    fn key_bag_list(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        // uid, count (out), reserved[6]
+        if (2..8).any(|i| img.word(i) != 0) {
+            return Err(EINVAL);
+        }
+        let uid = img.word(0);
+        if uid != file.uid && !crate::shim::capable_admin() {
+            return Err(EPERM);
+        }
+        let identity = uid as i32 == BIO_USER;
+        let list = {
+            let _id = identity.then(|| self.identity_bag_lock.lock());
+            crate::userbag::list(uid)?
+        };
+        let loaded = self.user_bags.lock().loaded(uid);
+        for (i, e) in list.iter().enumerate() {
+            let mut flags = e.mode as u32;
+            let home = e.role == crate::userbag::Role::Home;
+            let password = e.mode & crate::userbag::FLAG_PASSWORD != 0;
+            if home && (!password || self.bag_secret(uid).is_some()) {
+                flags |= BAG_OPEN;
+            }
+            if home && (if identity { self.keybag_designated.load(Relaxed) } else { loaded || self.bag_secret(uid).is_some() }) {
+                flags |= BAG_DESIGNATED;
+            }
+            // uid 1000's own-path ops load its legacy bag; another uid's, its home
+            let own_role = if identity { crate::userbag::Role::Legacy } else { crate::userbag::Role::Home };
+            if loaded && e.role == own_role {
+                flags |= BAG_LOADED;
+            }
+            let mut ent = [0u8; 24];
+            ent[..16].copy_from_slice(&e.uuid);
+            ent[16..20].copy_from_slice(&(e.role as u32).to_ne_bytes());
+            ent[20..24].copy_from_slice(&flags.to_ne_bytes());
+            img.put(HEAD + 24 * i, 24, &ent)?;
+        }
+        img.set_word(1, list.len() as u32);
+        Ok(())
+    }
+
+    /// SEP_KEY_BAG_DELETE: a non-home bag of `uid` (the caller's, or any as
+    /// root): its record goes (zeroed first when it holds a secret); the
+    /// home bag is EBUSY, an unknown uuid ENOENT. The enclave forgets an
+    /// unloaded bag by itself; uid 1000's legacy bag is unloaded if loaded.
+    fn key_bag_delete(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        // flags, uid, reserved[6]
+        if img.word(0) != 0 || (2..8).any(|i| img.word(i) != 0) {
+            return Err(EINVAL);
+        }
+        let uid = img.word(1);
+        if uid != file.uid && !crate::shim::capable_admin() {
+            return Err(EPERM);
+        }
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(img.field(BAG_UUID_AT, 16));
+        let identity = uid as i32 == BIO_USER;
+        let _id = identity.then(|| self.identity_bag_lock.lock());
+        let mut bags = self.user_bags.lock();
+        if identity {
+            // the legacy bag is what uid 1000's own-path ops load
+            self.user_bag_forget_handle(&mut bags, uid);
+        }
+        let role = crate::userbag::delete(uid, &uuid)?;
+        let what = if role == crate::userbag::Role::Legacy { "legacy" } else { "retired" };
+        dev_info!(self.dev, "sep-key: uid {}'s {} bag deleted\n", uid, what);
+        Ok(())
+    }
+
+    /// SEP_KEY_BAG_USE: makes a retired bag of `uid` (the caller's, or any
+    /// as root) the home bag again, with its password: LOAD, unlock (a wrong
+    /// password is EACCES with the enclave's -5, and nothing changes),
+    /// DESIGNATE -uid; then the records swap (userbag::use_commit) and the
+    /// password is kept. For [`BIO_USER`] the identity's users follow as with
+    /// NEW_BAG. Only a password-mode target (EINVAL: the home bag is never
+    /// stored-mode again), and only from a password-mode home.
+    fn key_bag_use(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        // flags, uid, sep_status, secret_len, reserved[4]
+        let (uid, len) = (img.word(1), img.word(3) as usize);
+        let bad = img.word(0) != 0 || !(1..=CHANGE_SECRET_MAX).contains(&len) || (4..8).any(|i| img.word(i) != 0);
+        let mut secret = crate::Secret(KVec::new());
+        let copied = if bad {
+            Ok(())
+        } else {
+            secret.0.extend_from_slice(img.field(BAG_USE_SECRET_AT, len), GFP_KERNEL).map_err(Error::from)
+        };
+        img.put(BAG_USE_SECRET_AT, CHANGE_SECRET_MAX, &[])?;
+        copied?;
+        if bad {
+            return Err(EINVAL);
+        }
+        let uid = Self::key_target_uid(file, uid)?;
+        let user = crate::sks::DesignateUser::new(uid as i32).ok_or_else(errno::opnotsupp)?;
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(img.field(BAG_UUID_AT, 16));
+        let identity = uid as i32 == BIO_USER;
+        let patience = crate::userbag::PATIENCE_MS;
+        let _id = identity.then(|| self.identity_bag_lock.lock());
+        let mut bags = (!identity).then(|| self.user_bags.lock());
+
+        crate::userbag::tidy(uid)?;
+        let home = crate::userbag::home_mode(uid)?.ok_or_else(errno::nokey)?;
+        if home & crate::userbag::FLAG_PASSWORD == 0 {
+            return Err(EINVAL);
+        }
+        let t = crate::userbag::use_target(uid, &uuid)?;
+        let out = self.sks_send_patient(self.sks_req_load_keybag(&t.wrapped), patience).ok_or(EIO)?;
+        let body = self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out).unwrap_or(&[]);
+        if out.reply.status != 0 || body.len() != crate::SKS_LOAD_REPLY_LEN {
+            return Err(EIO);
+        }
+        let raw = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        if raw < 0 {
+            return Err(EIO);
+        }
+        let handle = crate::sks::KeyBagHandle::from_load_reply(raw);
+        let result = (|| {
+            let healthy = self.sks_health_check(c"sep-key bag use").ok_or(EIO)?;
+            let out = self
+                .sks_send_patient(self.sks_req_change_lock_state(handle, crate::LockState::Unlocked, &secret, healthy), patience)
+                .ok_or(EIO)?;
+            if out.reply.status != 0 {
+                img.set_word(2, out.reply.status as i32 as u32);
+                return Err(EACCES);
+            }
+            let d = crate::sks::Designation::new(handle, user);
+            let out = self.sks_send_patient(self.sks_req_designate(&d, &secret), patience).ok_or(EIO)?;
+            if out.reply.status != 0 {
+                img.set_word(2, out.reply.status as i32 as u32);
+                dev_warn!(self.dev, "sep-key: DESIGNATE uid {}'s bag to use: mailbox status {}\n", uid, out.reply.status);
+                return Err(EIO);
+            }
+            crate::userbag::use_commit(uid, &t).inspect_err(|e| {
+                dev_err!(
+                    self.dev,
+                    "sep-key: uid {}'s bag is designated but the records did not swap ({:?}); the home record decides at the next boot\n",
+                    uid,
+                    e
+                );
+            })?;
+            self.bag_secret_set(uid, &secret)?;
+            if identity {
+                let provenance = if t.readback {
+                    crate::keybag::UuidProvenance::ReadBackFromBag
+                } else {
+                    crate::keybag::UuidProvenance::AsGenerated
+                };
+                let binding = crate::keybag::SnapshotIdentity::from_loaded(t.uuid, provenance, t.uuid, false);
+                self.sks_rebind_enrolment(user.special_handle(), &secret, binding)?;
+                self.keybag_designated.store(true, Relaxed);
+            }
+            Ok(())
+        })();
+        let _ = self.sks_send_patient(self.sks_req_unload_keybag(handle), patience);
+        result?;
+        if let Some(bags) = bags.as_mut() {
+            self.user_bag_forget_handle(bags, uid);
+        }
+        drop(bags);
+        drop(_id);
+        dev_info!(self.dev, "sep-key: uid {}'s home bag is an earlier one again\n", uid);
+        if identity && self.touchid_started.load(Relaxed) {
+            let ok = crate::sbio::UserId::new(BIO_USER).is_some_and(|u| self.establish_scrd_match_context(u));
+            dev_info!(self.dev, "sep-key: the match credential made again for the bag: {}\n", ok);
         }
         Ok(())
     }

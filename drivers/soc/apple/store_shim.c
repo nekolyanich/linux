@@ -343,6 +343,83 @@ out_free:
 	return err;
 }
 
+/*
+ * Removes the regular file @path (the driver's own record), then syncs its
+ * directory. Under the replace lock, so no replace of it runs meanwhile.
+ * -ENOENT if it is not there.
+ */
+int sep_store_unlink(const char *path)
+{
+	const struct cred *old;
+	struct file *dir;
+	struct cred *kern;
+	struct dentry *d;
+	const char *name;
+	struct path root;
+	char *dpath;
+	int err;
+
+	name = strrchr(path, '/');
+	if (!name || name == path || !name[1])
+		return -EINVAL;
+	dpath = kstrndup(path, name - path, GFP_KERNEL);
+	kern = prepare_kernel_cred(&init_task);
+	if (!dpath || !kern) {
+		err = -ENOMEM;
+		goto out_free;
+	}
+	name++;
+
+	mutex_lock(&sep_store_replace_lock);
+	task_lock(&init_task);
+	get_fs_root(init_task.fs, &root);
+	task_unlock(&init_task);
+	old = override_creds(kern);
+
+	dir = file_open_root(&root, dpath, O_RDONLY | O_DIRECTORY, 0);
+	if (IS_ERR(dir)) {
+		err = PTR_ERR(dir);
+		goto out_creds;
+	}
+	err = mnt_want_write(dir->f_path.mnt);
+	if (err)
+		goto out_dir;
+	d = start_removing(mnt_idmap(dir->f_path.mnt), dir->f_path.dentry, &QSTR(name));
+	if (IS_ERR(d)) {
+		err = PTR_ERR(d);
+		goto out_drop;
+	}
+	if (d_really_is_negative(d))
+		err = -ENOENT;
+	else if (!d_is_reg(d))
+		err = -EISDIR;
+	else
+		err = security_path_unlink(&dir->f_path, d);
+	if (!err)
+		err = vfs_unlink(mnt_idmap(dir->f_path.mnt), d_inode(dir->f_path.dentry), d, NULL);
+	end_removing(d);
+	if (!err) {
+		int serr = vfs_fsync(dir, 0);
+
+		if (serr && serr != -EINVAL && serr != -EOPNOTSUPP)
+			pr_err_ratelimited("apple-sep: %s: directory sync failed (%d); the file is removed\n",
+					   dpath, serr);
+	}
+out_drop:
+	mnt_drop_write(dir->f_path.mnt);
+out_dir:
+	filp_close(dir, NULL);
+out_creds:
+	revert_creds(old);
+	path_put(&root);
+	mutex_unlock(&sep_store_replace_lock);
+out_free:
+	if (kern)
+		put_cred(kern);
+	kfree(dpath);
+	return err;
+}
+
 void sep_store_close(void *handle)
 {
 	if (handle)

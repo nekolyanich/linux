@@ -153,10 +153,6 @@ impl StoredKeyBag {
         self.mode & crate::userbag::FLAG_PASSWORD != 0
     }
 
-    pub(crate) fn mode(&self) -> u16 {
-        self.mode
-    }
-
     pub(crate) fn with_secret(mut self, secret: crate::Secret) -> StoredKeyBag {
         self.secret = secret;
         self
@@ -221,6 +217,8 @@ fn readback(p: UuidProvenance) -> bool {
 /// Brings the files to the module comment's shape; see the steps there.
 fn migrate(slot: Slot) -> Result<()> {
     use crate::userbag::{self, HomeFile};
+    // a BAG_USE cut short leaves a retired copy of the home bag: removed
+    let _ = userbag::tidy(HOME_UID);
     let home = userbag::read_home(HOME_UID)?;
     if matches!(home, HomeFile::Legacy) {
         userbag::move_legacy_aside(HOME_UID)?;

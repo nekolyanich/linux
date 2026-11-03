@@ -1491,6 +1491,18 @@ impl SepData {
         let crate::keybag::State::Present(stored) = crate::keybag::read(crate::keybag::Slot::Identity)? else {
             return Err(errno::nokey());
         };
+        // After a LOCK the designation is still there, closed: a LOAD then names that resident bag
+        // and unlocking it by the handle answers -5 even to the right password (m2pro
+        // 2026-11-03, a switch locked the bag). Open the designation in place first, as
+        // user_bag_designate does for other uids (U-N1); only without one go by the handle.
+        if self.keybag_designated.load(Relaxed) {
+            let special = crate::sks::DesignateUser::new(BIO_USER).ok_or(EINVAL)?.special_handle();
+            let healthy = self.sks_health_check(c"sep-key unlock").ok_or(EIO)?;
+            let out = self
+                .sks_send_patient(self.sks_req_unlock_special(special, secret, healthy), patience)
+                .ok_or(EIO)?;
+            return Ok(out.reply.status);
+        }
         let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
         let result = (|| {
             let healthy = self.sks_health_check(c"sep-key unlock").ok_or(EIO)?;

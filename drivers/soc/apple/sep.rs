@@ -706,6 +706,10 @@ struct SepData {
     /// sleep or a SEP reset (tanabota architecture 2.9).
     #[pin]
     bag_secrets: Mutex<KVec<(u32, Secret)>>,
+    /// The soft locks and the password-required rule's counters, by uid
+    /// (architecture 2.10.2-3).
+    #[pin]
+    soft: Mutex<KVec<key::SoftState>>,
     /// The ACM context a /dev/sep-key AUTH's verify credits (set only while
     /// that AUTH holds the Touch ID session, so no other verify can credit
     /// it), and the outcome kept for its poll once the session is given back.
@@ -959,6 +963,7 @@ impl SepData {
                 key_dev <- new_mutex!(None),
                 user_bags <- new_mutex!(userbag::UserBags::new()),
                 bag_secrets <- new_mutex!(KVec::new()),
+                soft <- new_mutex!(KVec::new()),
                 key_auth <- new_mutex!(key::KeyAuthShared::new()),
                 identity_bag_lock <- new_mutex!(()),
                 store <- new_mutex!(store),
@@ -2776,6 +2781,18 @@ module! {
         xart_start_sector: u64 {
             default: 0,
             description: "Expected 512-byte start sector of the APFS .gl extent in the iBoot container. Zero accepts the APFS result; nonzero must match it and cannot override it",
+        },
+        credit_max_uses: u32 {
+            default: 20,
+            description: "Ops a /dev/sep-key window credit (a finger match) serves before it ends, besides its time; 0: time only",
+        },
+        password_every_h: u32 {
+            default: 48,
+            description: "Hours a password-mode bag stays usable without its password before it is locked for real; 0: never",
+        },
+        failed_matches_lock: u32 {
+            default: 5,
+            description: "Failed finger matches in a row that lock uid 1000's password-mode bag for real; 0: never",
         },
         provision_keybag: u8 {
             default: 1,

@@ -3249,6 +3249,13 @@ impl SepData {
     }
 
     fn finish_verify(&self, outcome: bio::VerifyOutcome, token_bytes: [u8; bio::TOKEN_LEN]) {
+        // the soft lock and the failed-match rule (architecture 2.10.2-3) see
+        // every compared finger, /dev/sep-key AUTH's and fprintd's alike
+        match &outcome {
+            bio::VerifyOutcome::Matched(_) => self.key_match_outcome(true),
+            bio::VerifyOutcome::NoMatch => self.key_match_outcome(false),
+            bio::VerifyOutcome::Failed(_) => {}
+        }
         let filed = {
             let mut session = self.bio_session.lock();
             let filed = bio::verify_finish(

@@ -51,7 +51,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_KEY_IFACE_VERSION 6 /* 5: password-mode bags, UNLOCK, LOCK; 6: NEW_BAG */
+#define SEP_KEY_IFACE_VERSION 7 /* 5: password-mode bags, UNLOCK, LOCK; 6: NEW_BAG; 7: SOFTLOCK */
 
 #define SEP_KEY_BLOB_MAX   1024 /* the enclave's stored set {rk={..}}, ~260 B */
 #define SEP_KEY_PUB_MAX    97   /* P-384 04||X||Y */
@@ -83,6 +83,7 @@ enum {
 #define SEP_KEY_INFO_PASSWORD   32u /* this uid's home bag is in password mode */
 #define SEP_KEY_INFO_LOCKED     64u /* and closed: ops are ENOKEY until SEP_KEY_UNLOCK */
 #define SEP_KEY_INFO_LOGIN_SAME 128u /* and marked as the login password (PAM tries it) */
+#define SEP_KEY_INFO_SOFT_LOCKED 256u /* soft-locked: ops EKEYEXPIRED until a match or the password */
 /*
  * For uid 1000, INFO (as every operation) reads the identity keybag's record
  * and fails with its error when it cannot: EEXIST while provisioning writes
@@ -291,6 +292,25 @@ struct sep_key_lock {
 };
 
 /*
+ * Soft-locks a bag (the caller's own, or any with CAP_SYS_ADMIN; tanabota
+ * architecture 2.10.2): the bag stays open in the enclave, but its ops answer
+ * EKEYEXPIRED and every finger credit ends (also: a window credit ends after
+ * apple_sep.credit_max_uses ops). A finger match (SEP_KEY_AUTH, or fprintd's
+ * verify through /dev/sep-bio, for uid 1000) or SEP_KEY_UNLOCK with the
+ * bag's password lifts it, as does SEP_KEY_SOFTLOCK_CLEAR (CAP_SYS_ADMIN).
+ * Kept in memory only. The password-required rule (2.10.3) locks the bag
+ * for real (as SEP_KEY_LOCK) after apple_sep.password_every_h hours without
+ * the password or apple_sep.failed_matches_lock failed matches in a row; the
+ * op that finds it answers ENOKEY.
+ */
+#define SEP_KEY_SOFTLOCK_CLEAR 1u
+struct sep_key_softlock {
+  __u32 flags;      /* in: 0 or SEP_KEY_SOFTLOCK_CLEAR */
+  __u32 uid;        /* in: whose bag */
+  __u32 reserved[6]; /* in: 0 */
+};
+
+/*
  * A new home bag for the caller (uid 10 and up), made with the password
  * given: the enclave takes it at creation, so no other secret of the bag ever
  * exists. It is designated to -uid in place of the old bag (for uid 1000 the
@@ -393,3 +413,4 @@ struct sep_key_bag_use {
 #define SEP_KEY_BAG_LIST    _IOWR(SEP_KEY_IOC_MAGIC, 0x0e, struct sep_key_bag_list)
 #define SEP_KEY_BAG_DELETE  _IOW (SEP_KEY_IOC_MAGIC, 0x0f, struct sep_key_bag_delete)
 #define SEP_KEY_BAG_USE     _IOWR(SEP_KEY_IOC_MAGIC, 0x10, struct sep_key_bag_use)
+#define SEP_KEY_SOFTLOCK    _IOW (SEP_KEY_IOC_MAGIC, 0x11, struct sep_key_softlock)

@@ -26,7 +26,7 @@ use crate::der::RefKeyValue as RV;
 use crate::userbag::OpReply;
 use crate::SepData;
 
-pub(crate) const IFACE_VERSION: u32 = 6;
+pub(crate) const IFACE_VERSION: u32 = 7;
 
 /// The errnos `kernel::error::code` does not carry.
 pub(crate) mod errno {
@@ -46,6 +46,13 @@ pub(crate) mod errno {
 
     pub(crate) fn nokey() -> Error {
         of(kernel::bindings::ENOKEY)
+    }
+
+    /// A soft-locked bag's ops: open in the enclave, refused here until a
+    /// match or the password (EKEYREVOKED is taken: a gated key whose finger
+    /// set is gone).
+    pub(crate) fn keyexpired() -> Error {
+        of(kernel::bindings::EKEYEXPIRED)
     }
 
     pub(crate) fn uclean() -> Error {
@@ -81,6 +88,7 @@ const INFO_PASSWORD: u32 = 32;
 /// ... and closed: its ops are ENOKEY until SEP_KEY_UNLOCK.
 const INFO_LOCKED: u32 = 64;
 const INFO_LOGIN_SAME: u32 = 128;
+const INFO_SOFT_LOCKED: u32 = 256;
 
 const CREATE_BIOMETRY: u32 = 1;
 const CREATE_PRESENCE: u32 = 2;
@@ -309,6 +317,14 @@ struct Lock {
 
 #[repr(C)]
 #[allow(dead_code)]
+struct SoftLock {
+    flags: u32,
+    uid: u32,
+    reserved: [u32; 6],
+}
+
+#[repr(C)]
+#[allow(dead_code)]
 struct NewBag {
     head: [u32; 8],
     uuid: [u8; 16],
@@ -361,6 +377,10 @@ static_assert!(core::mem::size_of::<Unlock>() == 160);
 static_assert!(core::mem::size_of::<Lock>() == 32);
 const IOC_UNLOCK: u32 = _IOWR::<Unlock>(MAGIC, 0x0b);
 const IOC_LOCK: u32 = _IOW::<Lock>(MAGIC, 0x0c);
+static_assert!(core::mem::size_of::<SoftLock>() == 32);
+const IOC_SOFTLOCK: u32 = _IOW::<SoftLock>(MAGIC, 0x11);
+/// SEP_KEY_SOFTLOCK: lift it instead (root: the unlock helper).
+const SOFTLOCK_CLEAR: u32 = 1;
 /// PAM's try with the login password: sent to the enclave only if the record
 /// says the bag's password is the login password, cleared when it is not.
 const UNLOCK_LOGIN: u32 = 1;
@@ -527,6 +547,26 @@ static NEXT_FILE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// callbacks, so its context is destroyed at its next callback or its close.
 static SLEEP_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Counts soft locks (SEP_KEY_SOFTLOCK, architecture 2.10.2): a credit given
+/// before one is gone, as with a sleep.
+static SOFT_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Per uid: the soft lock and the password-required rule (architecture
+/// 2.10.2-3), kept in memory only (a boot starts with none of it).
+#[derive(Clone, Copy)]
+pub(crate) struct SoftState {
+    uid: u32,
+    /// Ops refused (EKEYEXPIRED) while the bag stays open in the enclave.
+    soft_locked: bool,
+    /// The bag is to be locked for real at the next op (ENOKEY then until
+    /// the password): set from contexts that cannot send to the enclave.
+    lock_pending: bool,
+    /// Boottime of the last unlock by password; 0: none this boot.
+    last_password_ns: u64,
+    /// Failed matches in a row.
+    failed: u32,
+}
+
 /// A file's AUTH: the context it made, whether its verify still runs, and the
 /// credit a match gave.
 #[derive(Default)]
@@ -540,6 +580,10 @@ struct AuthState {
     credit_until_ns: Option<u64>,
     /// The [`SLEEP_EPOCH`] the credit was given in.
     credit_epoch: u64,
+    /// The [`SOFT_EPOCH`] it was given in: a soft lock ends it.
+    credit_soft_epoch: u64,
+    /// Ops a window credit has served ([`crate::module_parameters::credit_max_uses`]).
+    uses: u32,
     /// The last verify's end, for AUTH_POLL after it.
     last: u32,
     last_status: u32,
@@ -548,8 +592,10 @@ struct AuthState {
 impl AuthState {
     fn credit_left_ns(&self) -> Option<u64> {
         let until = self.credit_until_ns?;
-        if self.credit_epoch != SLEEP_EPOCH.load(core::sync::atomic::Ordering::Acquire) {
-            // the system slept since the match
+        if self.credit_epoch != SLEEP_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+            || self.credit_soft_epoch != SOFT_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+        {
+            // the system slept, or a soft lock came, since the match
             return None;
         }
         let now = crate::shim::boottime_ns();
@@ -621,6 +667,9 @@ impl SepData {
                 if m & crate::userbag::FLAG_LOGIN_SAME != 0 {
                     flags |= INFO_LOGIN_SAME;
                 }
+                if self.soft_get(file.uid).is_some_and(|s| s.soft_locked) {
+                    flags |= INFO_SOFT_LOCKED;
+                }
             }
         }
         // SAFETY: a shim callback for this file.
@@ -640,6 +689,7 @@ impl SepData {
     }
 
     fn key_create(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        self.key_gate(file.uid)?;
         // type, class, flags, sep_status, blob_len, pub_len
         let kt = img.word(0);
         let class = match img.word(1) {
@@ -693,6 +743,7 @@ impl SepData {
     }
 
     fn key_sign(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        self.key_gate(file.uid)?;
         // blob_len, data_len, sig_len, sep_status
         let blob = blob_in(img, 0)?;
         let (_kt, kind, public) = parse_blob(blob)?;
@@ -737,6 +788,7 @@ impl SepData {
     }
 
     fn key_ecdh(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        self.key_gate(file.uid)?;
         // blob_len, peer_len, secret_len, sep_status
         let blob = blob_in(img, 0)?;
         let (_kt, kind, public) = parse_blob(blob)?;
@@ -802,6 +854,7 @@ impl SepData {
     }
 
     fn key_attest(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        self.key_gate(file.uid)?;
         // attester_len, subject_len, nonce_len, sep_status, statement_len,
         // reserved[3]
         if img.word(5) != 0 || img.word(6) != 0 || img.word(7) != 0 {
@@ -881,6 +934,7 @@ impl SepData {
             IOC_BAG_LIST => (core::mem::size_of::<BagList>(), |s, f, i| s.key_bag_list(f, i)),
             IOC_BAG_DELETE => (core::mem::size_of::<BagDelete>(), |s, f, i| s.key_bag_delete(f, i)),
             IOC_BAG_USE => (core::mem::size_of::<BagUse>(), |s, f, i| s.key_bag_use(f, i)),
+            IOC_SOFTLOCK => (core::mem::size_of::<SoftLock>(), |s, f, i| s.key_softlock(f, i)),
             _ => return Err(ENOTTY),
         };
         if !self.sks_ready() {
@@ -1108,6 +1162,8 @@ impl SepData {
             window_s,
             credit_until_ns: None,
             credit_epoch: 0,
+            credit_soft_epoch: 0,
+            uses: 0,
             last: AUTH_PENDING,
             last_status: 0,
         };
@@ -1147,6 +1203,8 @@ impl SepData {
                         let s = if auth.window { auth.window_s } else { AUTH_HOLD_S };
                         auth.credit_until_ns = Some(at + u64::from(s) * 1_000_000_000);
                         auth.credit_epoch = epoch;
+                        auth.credit_soft_epoch = SOFT_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+                        auth.uses = 0;
                         auth.last = AUTH_MATCH;
                     }
                     crate::bio::KeyAuthState::NoMatch => {
@@ -1220,7 +1278,9 @@ impl SepData {
     fn key_credit_used(&self, file: &KeyFile, status: i8) {
         // SAFETY: a shim callback for this file.
         let auth = unsafe { file.auth() };
-        if !auth.window || status != 0 {
+        auth.uses = auth.uses.saturating_add(1);
+        let max = *crate::module_parameters::credit_max_uses.value();
+        if !auth.window || status != 0 || (max != 0 && auth.uses >= max) {
             self.key_auth_forget(auth);
             auth.last = AUTH_IDLE;
         }
@@ -1447,6 +1507,7 @@ impl SepData {
             return Err(errno::nokey());
         }
         if self.bag_secret(uid).is_some_and(|s| *s == *secret) {
+            self.soft_password(uid);
             return Ok(());
         }
         let status = if uid as i32 == BIO_USER {
@@ -1462,6 +1523,7 @@ impl SepData {
             return Err(EACCES);
         }
         self.bag_secret_set(uid, &secret)?;
+        self.soft_password(uid);
         if flags & UNLOCK_SET_LOGIN_SAME != 0 {
             crate::userbag::update_home_flags(uid, crate::userbag::FLAG_LOGIN_SAME, 0)?;
         }
@@ -1531,6 +1593,19 @@ impl SepData {
             return Err(EINVAL);
         }
         let uid = Self::key_target_uid(file, img.word(1))?;
+        self.lock_uid(uid)
+    }
+
+    /// Closes `uid`'s password-mode bag for real (SEP_KEY_LOCK, and the
+    /// password-required rule): the enclave locks it, the password is
+    /// forgotten. EINVAL in stored mode.
+    pub(crate) fn lock_uid(&self, uid: u32) -> Result<()> {
+        if let Some(mut s) = self.soft_get(uid) {
+            s.soft_locked = false;
+            s.lock_pending = false;
+            s.last_password_ns = 0;
+            let _ = self.soft_put(s);
+        }
         if uid as i32 != BIO_USER {
             return self.user_bag_lock(&mut self.user_bags.lock(), uid);
         }
@@ -2018,5 +2093,114 @@ unsafe extern "C" fn key_ioctl(ctx: *mut c_void, fctx: *mut c_void, cmd: c_uint,
             0
         }
         Err(e) => e.to_errno() as c_long,
+    }
+}
+
+/// The soft lock and the password-required rule (architecture 2.10.2-3).
+impl SepData {
+    fn soft_get(&self, uid: u32) -> Option<SoftState> {
+        self.soft.lock().iter().find(|s| s.uid == uid).copied()
+    }
+
+    fn soft_put(&self, st: SoftState) -> Result<()> {
+        let mut list = self.soft.lock();
+        if let Some(s) = list.iter_mut().find(|s| s.uid == st.uid) {
+            *s = st;
+            return Ok(());
+        }
+        list.push(st, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    fn soft_or_new(&self, uid: u32) -> SoftState {
+        self.soft_get(uid).unwrap_or(SoftState {
+            uid,
+            soft_locked: false,
+            lock_pending: false,
+            last_password_ns: 0,
+            failed: 0,
+        })
+    }
+
+    /// The password opened `uid`'s bag: the soft lock and the failed-match
+    /// count go, the 48 h clock starts again.
+    fn soft_password(&self, uid: u32) {
+        let mut s = self.soft_or_new(uid);
+        s.soft_locked = false;
+        s.lock_pending = false;
+        s.failed = 0;
+        s.last_password_ns = crate::shim::boottime_ns();
+        let _ = self.soft_put(s);
+    }
+
+    /// Before an op on `uid`'s keys: the real lock the rule asked for, the 48 h
+    /// rule, then the soft lock (EKEYEXPIRED).
+    fn key_gate(&self, uid: u32) -> Result<()> {
+        let Some(mut s) = self.soft_get(uid) else {
+            return Ok(());
+        };
+        let hours = *crate::module_parameters::password_every_h.value();
+        if hours != 0 && s.last_password_ns != 0 && self.bag_secret(uid).is_some() {
+            let age = crate::shim::boottime_ns().saturating_sub(s.last_password_ns);
+            if age > u64::from(hours) * 3_600_000_000_000 {
+                dev_info!(self.dev, "sep-key: uid {}'s bag: {} h without its password, locked\n", uid, hours);
+                s.lock_pending = true;
+                let _ = self.soft_put(s);
+            }
+        }
+        if s.lock_pending {
+            let _ = self.lock_uid(uid);
+            return Err(errno::nokey());
+        }
+        if s.soft_locked {
+            return Err(errno::keyexpired());
+        }
+        Ok(())
+    }
+
+    /// A verify of [`BIO_USER`]'s finger ended (SEP_KEY_AUTH's or fprintd's,
+    /// [`SepData::finish_verify`]): a match lifts the soft lock and the
+    /// count; failed matches in a row past the param ask for the real lock,
+    /// done at the next op (this runs on the capture worker).
+    pub(crate) fn key_match_outcome(&self, matched: bool) {
+        let uid = BIO_USER as u32;
+        let mut s = self.soft_or_new(uid);
+        if matched {
+            s.soft_locked = false;
+            s.failed = 0;
+        } else {
+            s.failed = s.failed.saturating_add(1);
+            let max = *crate::module_parameters::failed_matches_lock.value();
+            if max != 0 && s.failed >= max && self.bag_secret(uid).is_some() {
+                dev_info!(self.dev, "sep-key: uid {}'s bag: {} failed matches, locked\n", uid, s.failed);
+                s.lock_pending = true;
+                s.failed = 0;
+            }
+        }
+        let _ = self.soft_put(s);
+    }
+
+    /// SEP_KEY_SOFTLOCK: `uid`'s ops are refused (EKEYEXPIRED) and every
+    /// credit ends while its bag stays open; a match or the password lifts
+    /// it, or SOFTLOCK_CLEAR (root only: the unlock helper).
+    fn key_softlock(&self, file: &KeyFile, img: &mut Image) -> Result<()> {
+        let flags = img.word(0);
+        if flags & !SOFTLOCK_CLEAR != 0 || (2..8).any(|i| img.word(i) != 0) {
+            return Err(EINVAL);
+        }
+        let uid = Self::key_target_uid(file, img.word(1))?;
+        let mut s = self.soft_or_new(uid);
+        if flags & SOFTLOCK_CLEAR != 0 {
+            if !crate::shim::capable_admin() {
+                return Err(EPERM);
+            }
+            s.soft_locked = false;
+        } else {
+            s.soft_locked = true;
+            SOFT_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        }
+        self.soft_put(s)?;
+        dev_info!(self.dev, "sep-key: uid {}'s bag {}\n", uid, if s.soft_locked { "soft-locked" } else { "soft lock lifted" });
+        Ok(())
     }
 }

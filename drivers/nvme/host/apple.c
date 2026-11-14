@@ -236,6 +236,17 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
 
+/*
+ * Bench (Tanabota notes/sleep/51): macOS shuts the t6020 controller down for sleep but
+ * leaves ANS2 and the storage PCIe words on for the sleep engine (at its commit: ans2
+ * 0x1f0003ff, apcie_st 0xff, apcie_st_sys 0x1f0003ff). Without this, genpd turns them
+ * off in the noirq phase once the controller has suspended.
+ */
+static bool sleep_keep_ps;
+module_param(sleep_keep_ps, bool, 0644);
+MODULE_PARM_DESC(sleep_keep_ps,
+		 "Bench: leave the controller's power domains on across system sleep, as macOS");
+
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
 
@@ -1780,6 +1791,10 @@ static int apple_nvme_suspend(struct device *dev)
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
+
+	/* Shut down, its CPU stopped, its domains left on: macOS's state at the commit. */
+	if (sleep_keep_ps)
+		apple_nvme_keep_link_powered(anv);
 
 	return ret;
 }

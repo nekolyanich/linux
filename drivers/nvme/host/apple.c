@@ -247,6 +247,11 @@ module_param(sleep_keep_ps, bool, 0644);
 MODULE_PARM_DESC(sleep_keep_ps,
 		 "Bench: leave the controller's power domains on across system sleep, as macOS");
 
+/* Bench: macOS gives ANS AP/IOP 0x201 for sleep (Tanabota census), not the RTKit shutdown. */
+static bool sleep_idle;
+module_param(sleep_idle, bool, 0644);
+MODULE_PARM_DESC(sleep_idle, "Bench: idle the ANS firmware (0x201) instead of shutting it down at suspend");
+
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
 
@@ -1787,7 +1792,12 @@ static int apple_nvme_suspend(struct device *dev)
 	apple_nvme_disable(anv, true);
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		ret = apple_rtkit_shutdown(anv->rtk);
+		if (sleep_idle) {
+			ret = apple_rtkit_idle(anv->rtk);
+			dev_info(dev, "bench: ANS idled (0x201): %d\n", ret);
+		} else {
+			ret = apple_rtkit_shutdown(anv->rtk);
+		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}

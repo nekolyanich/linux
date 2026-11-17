@@ -250,6 +250,13 @@ MODULE_PARM_DESC(sleep_keep_ps,
 /* Bench: macOS gives ANS AP/IOP 0x201 for sleep (Tanabota census), not the RTKit shutdown. */
 static bool sleep_idle;
 module_param(sleep_idle, bool, 0644);
+
+/*
+ * Bench (note 77 §14.18): the reset work frees RTKit's buffers (apple_rtkit_reinit -> the SART's remove) while
+ * ANS2's reset is asserted; after an S3 wake that SART access raises an SError. 1: reinit first, then the reset.
+ */
+static bool bench_reinit_first;
+module_param(bench_reinit_first, bool, 0644);
 MODULE_PARM_DESC(sleep_idle, "Bench: idle the ANS firmware (0x201) instead of shutting it down at suspend");
 
 static_assert(sizeof(struct nvme_command) == 64);
@@ -1136,13 +1143,22 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
+		if (bench_reinit_first) {
+			dev_info(anv->dev, "bench: RTKit reinit before the reset\n");
+			ret = apple_rtkit_reinit(anv->rtk);
+			if (ret)
+				goto out;
+		}
+
 		ret = reset_control_assert(anv->reset);
 		if (ret)
 			goto out;
 
-		ret = apple_rtkit_reinit(anv->rtk);
-		if (ret)
-			goto out;
+		if (!bench_reinit_first) {
+			ret = apple_rtkit_reinit(anv->rtk);
+			if (ret)
+				goto out;
+		}
 
 		ret = reset_control_deassert(anv->reset);
 		if (ret)

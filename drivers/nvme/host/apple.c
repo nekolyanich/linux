@@ -267,6 +267,13 @@ module_param(bench_reinit_first, bool, 0644);
 static int bench_ans_tunables;
 module_param(bench_ans_tunables, int, 0644);
 
+/*
+ * Bench (review 8 §3): ANS's -62 after the wake is the AP_PWR_STATE ON wait (1 s), and macOS sends AP ON 97 s
+ * after its HELLO. t6020: the RTKit handshake timeout of the reset work's boot, in ms (0: RTKit's 1 s).
+ */
+static unsigned int bench_ans_handshake_ms;
+module_param(bench_ans_handshake_ms, uint, 0644);
+
 struct apple_ans_tunable {
 	u32 off, mask, val;
 };
@@ -1242,7 +1249,16 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
-		ret = apple_rtkit_boot(anv->rtk);
+		if (bench_ans_handshake_ms &&
+		    of_device_is_compatible(anv->dev->of_node, "apple,t6020-nvme-ans2")) {
+			dev_info(anv->dev, "bench: RTKit handshake timeout %u ms for this boot\n",
+				 bench_ans_handshake_ms);
+			apple_rtkit_set_handshake_timeout(anv->rtk, bench_ans_handshake_ms);
+			ret = apple_rtkit_boot(anv->rtk);
+			apple_rtkit_set_handshake_timeout(anv->rtk, 0);
+		} else {
+			ret = apple_rtkit_boot(anv->rtk);
+		}
 	} else {
 		ret = apple_rtkit_wake(anv->rtk);
 	}

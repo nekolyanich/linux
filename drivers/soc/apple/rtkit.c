@@ -814,6 +814,9 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 
 int apple_rtkit_boot(struct apple_rtkit *rtk)
 {
+	/* Bench (note 77 §14.20, review 8 §3): the steps' times, printed with a raised timeout or a failed AP ON. */
+	bool report = rtk->handshake_timeout_ms != APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
+	ktime_t t0 = ktime_get(), t1, t2;
 	int ret;
 
 	if (apple_rtkit_is_running(rtk))
@@ -833,7 +836,16 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	if (ret)
 		return ret;
 
-	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+	t1 = ktime_get();
+	ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+	t2 = ktime_get();
+	if (ret)
+		dev_err(rtk->dev, "RTKit: AP power ON failed: %d after %lld ms (map and IOP ack took %lld ms, timeout %u ms)\n",
+			ret, ktime_ms_delta(t2, t1), ktime_ms_delta(t1, t0), rtk->handshake_timeout_ms);
+	else if (report)
+		dev_info(rtk->dev, "RTKit: AP power ON acked after %lld ms (map and IOP ack took %lld ms, timeout %u ms)\n",
+			 ktime_ms_delta(t2, t1), ktime_ms_delta(t1, t0), rtk->handshake_timeout_ms);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
 

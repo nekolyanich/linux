@@ -257,6 +257,79 @@ module_param(sleep_idle, bool, 0644);
  */
 static bool bench_reinit_first;
 module_param(bench_reinit_first, bool, 0644);
+
+/*
+ * Bench (note 77 §14.20): the ADT's /arm-io/ans tunables. iBoot applies them at boot and an S3 power loss
+ * takes them. At the wake macOS writes afc-aiu-ans-dual-tunables right after ANS2's power-on, and
+ * storage-lane-common-tunables before the SART and RUN (pd1110). The values are t6020 j416s's, at the ADT's
+ * reg 4 and 5. Bits: 1 reads and prints them, 2 applies the AIU ones, 4 the lane one (where a word differs).
+ */
+static int bench_ans_tunables;
+module_param(bench_ans_tunables, int, 0644);
+
+struct apple_ans_tunable {
+	u32 off, mask, val;
+};
+
+static const struct apple_ans_tunable apple_ans_aiu_tunables[] = {
+	{ 0x000, 0x00000003, 0x00000001 }, { 0x00c, 0x000fffff, 0x0000000d },
+	{ 0x010, 0x000fffff, 0x0000000c }, { 0x014, 0x00000fff, 0x00000001 },
+	{ 0x018, 0x00000fff, 0x00000001 }, { 0x01c, 0x00000fff, 0x00000003 },
+	{ 0x020, 0x00000fff, 0x00000003 }, { 0x024, 0x00000fff, 0x00000003 },
+	{ 0x028, 0x00000fff, 0x00000003 }, { 0x02c, 0x00000fff, 0x00000003 },
+	{ 0x030, 0x00000fff, 0x00000003 }, { 0x034, 0x00000fff, 0x00000003 },
+	{ 0x108, 0x00000003, 0x00000001 }, { 0x10c, 0x000fffff, 0x0000000d },
+	{ 0x110, 0x000fffff, 0x0000000c }, { 0x114, 0x00000fff, 0x00000001 },
+	{ 0x118, 0x00000fff, 0x00000001 }, { 0x11c, 0x00000fff, 0x00000003 },
+	{ 0x120, 0x00000fff, 0x00000003 }, { 0x124, 0x00000fff, 0x00000003 },
+	{ 0x128, 0x00000fff, 0x00000003 }, { 0x12c, 0x00000fff, 0x00000003 },
+	{ 0x130, 0x00000fff, 0x00000003 }, { 0x134, 0x00000fff, 0x00000003 },
+	{ 0x400, 0xc00103ff, 0xc0010010 }, { 0xa00, 0x01ffffff, 0x01ffffff },
+};
+
+static const struct apple_ans_tunable apple_ans_lane_tunables[] = {
+	{ 0x4104, 0x00001000, 0x00000000 },
+};
+
+static void apple_nvme_bench_tunables_one(struct apple_nvme *anv, const char *name, phys_addr_t pa,
+					  size_t size, const struct apple_ans_tunable *t, int n, bool apply)
+{
+	void __iomem *base = ioremap_np(pa, size);
+	int i, off = 0, wrong = 0;
+
+	if (!base) {
+		dev_err(anv->dev, "bench: ANS %s tunables: no mapping of %pa\n", name, &pa);
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		u32 v = readl(base + t[i].off);
+
+		if ((v & t[i].mask) == t[i].val)
+			continue;
+		off++;
+		dev_info(anv->dev, "bench: ANS %s +%#x = %#x, the ADT wants %#x under %#x\n", name,
+			 t[i].off, v, t[i].val, t[i].mask);
+		if (!apply)
+			continue;
+		writel((v & ~t[i].mask) | t[i].val, base + t[i].off);
+		if ((readl(base + t[i].off) & t[i].mask) != t[i].val)
+			wrong++;
+	}
+	dev_info(anv->dev, "bench: ANS %s tunables: %d of %d off the ADT%s, %d read back wrong\n", name, off, n,
+		 apply && off ? ", written" : "", wrong);
+	iounmap(base);
+}
+
+/* After ANS2's reset is released, before RUN. */
+static void apple_nvme_bench_tunables(struct apple_nvme *anv)
+{
+	if (!bench_ans_tunables || !of_device_is_compatible(anv->dev->of_node, "apple,t6020-nvme-ans2"))
+		return;
+	apple_nvme_bench_tunables_one(anv, "aiu", 0x349000000, 0x18000, apple_ans_aiu_tunables,
+				      ARRAY_SIZE(apple_ans_aiu_tunables), bench_ans_tunables & 2);
+	apple_nvme_bench_tunables_one(anv, "lane", 0x34bb90000, 0xc000, apple_ans_lane_tunables,
+				      ARRAY_SIZE(apple_ans_lane_tunables), bench_ans_tunables & 4);
+}
 MODULE_PARM_DESC(sleep_idle, "Bench: idle the ANS firmware (0x201) instead of shutting it down at suspend");
 
 static_assert(sizeof(struct nvme_command) == 64);
@@ -1163,6 +1236,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		ret = reset_control_deassert(anv->reset);
 		if (ret)
 			goto out;
+
+		apple_nvme_bench_tunables(anv);
 
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);

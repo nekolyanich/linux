@@ -395,6 +395,20 @@ impl rtkit::Operations for PmpData {
 #[allow(dead_code)]
 struct PmpDriver(Arc<PmpData>);
 
+// pmp-export.c: the PMP across a system sleep (aurora's, by function)
+extern "C" {
+    fn apple_pmp_register(dev: *mut bindings::device, rtk: *mut bindings::apple_rtkit) -> kernel::ffi::c_int;
+    fn apple_pmp_unregister(dev: *mut bindings::device);
+    static apple_pmp_pm_ops: bindings::dev_pm_ops;
+}
+
+impl Drop for PmpDriver {
+    fn drop(&mut self) {
+        // SAFETY: the device this driver was bound to; a no-op if it never registered.
+        unsafe { apple_pmp_unregister(self.0.dev.as_raw()) };
+    }
+}
+
 kernel::of_device_table!(
     OF_TABLE,
     (),
@@ -406,6 +420,11 @@ impl platform::Driver for PmpDriver {
     type Data<'bound> = PmpDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        // SAFETY: a static the shim defines and never changes.
+        Some(unsafe { &*core::ptr::addr_of!(apple_pmp_pm_ops) })
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -442,6 +461,16 @@ impl platform::Driver for PmpDriver {
         data.rtkit.lock().as_mut().set(Some(rtkit));
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
+        let rtk = {
+            let guard = data.rtkit.lock();
+            guard.as_ref().map(|r| r.as_raw()).ok_or(ENODEV)?
+        };
+        // SAFETY: the bound device, and its RTKit handle, which lives as long as `data`;
+        // unregistered in `drop` before either goes.
+        let ret = unsafe { apple_pmp_register(dev.as_raw(), rtk) };
+        if ret != 0 {
+            dev_warn!(dev, "no system sleep for the PMP: {}\n", ret);
+        }
         Ok(PmpDriver(data))
     }
 }

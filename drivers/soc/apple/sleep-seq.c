@@ -503,6 +503,18 @@ EXPORT_SYMBOL_GPL(apple_sleep_sep_early_wired);
 static u8 aseq_sep_gate;
 static unsigned int aseq_dispext_on(struct apple_sleep_seq *s);
 
+/*
+ * Bench (apple_sleep.smc_crumb, with hybrid bit 28): crumb 0x62's spot, the last write before
+ * commit 2 without bits 29/30, becomes 0xa0 | the SMC's sleep steps that went through:
+ * bit 0 slpw, bit 1 pmVC (or not asked), bit 2 WKTP = 2 (or not asked), bit 3 slpa (or skipped),
+ * bit 4 the AP idle notice. 0xbf: all of them. A failed slpw, pmVC, slpa or notice refuses the
+ * sleep before the entry, so in an entry these show WKTP's result and confirm the rest.
+ */
+static bool smc_crumb;
+module_param(smc_crumb, bool, 0444);
+MODULE_PARM_DESC(smc_crumb, "bench: crumb 0x62's spot carries the SMC sleep steps' results (0xa0 | bits)");
+static u8 aseq_smc_bits;
+
 void apple_sleep_sep_gate_set(u8 gate)
 {
 	WRITE_ONCE(aseq_sep_gate, gate);
@@ -1658,6 +1670,8 @@ static void aseq_crumb(struct apple_sleep_seq *s, u64 val, u32 extra_bit)
 
 	if (val == 0x63 && (READ_ONCE(hybrid) & ASEQ_HYBRID_STATE_DUMP))
 		c = aseq_ps_crumb;
+	if (val == 0x62 && smc_crumb)
+		c = 0xa0 | (READ_ONCE(aseq_smc_bits) & 0x1f);
 	aseq_crumb_raw(s, c, extra_bit);
 }
 
@@ -2412,6 +2426,7 @@ static struct apple_smc *aseq_smc(struct apple_sleep_seq *s)
 	return dev_get_drvdata(s->smc_dev);
 }
 
+
 /* Before any device is told, as macOS's slpw opens its device round */
 static int aseq_smc_warn(struct apple_sleep_seq *s)
 {
@@ -2423,9 +2438,15 @@ static int aseq_smc_warn(struct apple_sleep_seq *s)
 		dev_err(s->dev, "refused: smc_notify without a bound SMC\n");
 		return -ENODEV;
 	}
+	aseq_smc_bits = 0;
 	ret = apple_smc_sleep_seq_warn(smc);
 	if (ret)
 		return ret;
+	aseq_smc_bits |= BIT(0);
+	if (!(smc_notify & SEQ_SMC_PMVC))
+		aseq_smc_bits |= BIT(1);
+	if (!(smc_notify & SEQ_SMC_WKTP))
+		aseq_smc_bits |= BIT(2);
 	if (smc_notify & SEQ_SMC_PMVC) {
 		__le32 v = cpu_to_le32(pmvc);
 
@@ -2433,11 +2454,14 @@ static int aseq_smc_warn(struct apple_sleep_seq *s)
 		dev_info(s->dev, "SMC: pmVC = %#x (bytes %4ph): %d\n", pmvc, &v, ret);
 		if (ret)
 			return ret;
+		aseq_smc_bits |= BIT(1);
 	}
 	if (smc_notify & SEQ_SMC_WKTP) {
 		ret = apple_smc_write(smc, SMC_KEY(WKTP), &wake_type, sizeof(wake_type));
 		if (ret)
 			dev_err(s->dev, "WKTP = 2: %d\n", ret);
+		else
+			aseq_smc_bits |= BIT(2);
 	}
 	dev_info(s->dev, "SMC: slpw%s\n", smc_notify & SEQ_SMC_WKTP ? ", WKTP = 2" : "");
 	if (READ_ONCE(hybrid) & APPLE_SLEEP_HYBRID_SMC_EDGE)
@@ -2545,6 +2569,15 @@ static int aseq_prepare_late(void)
 	apple_sleep_bench_probe(smc, "before slpa", true);
 	ret = apple_smc_sleep_seq_commit(smc, SEQ_SMC_ARM_US, SEQ_SMC_IDLE_US,
 					 smc_notify & SEQ_SMC_NO_SLPA);
+	{
+		int slpa, notice;
+
+		apple_smc_sleep_seq_rets(smc, &slpa, &notice);
+		if (!slpa)
+			aseq_smc_bits |= BIT(3);
+		if (!notice)
+			aseq_smc_bits |= BIT(4);
+	}
 	if (ret)
 		dev_err(s->dev, "refused: the SMC didn't take slpa and the notice: %d\n", ret);
 

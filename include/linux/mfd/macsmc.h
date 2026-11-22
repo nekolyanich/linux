@@ -137,6 +137,9 @@ struct apple_smc {
 	bool sleep_warned;
 	/* WKTP exists and is writable: a full wake writes it 0 (aurora ae550867) */
 	bool has_wktp;
+	/* Bench: the last sleep commit's slpa and AP idle notice results */
+	int seq_slpa_ret;
+	int seq_notice_ret;
 
 	struct mutex mutex;
 	spinlock_t lock;
@@ -294,6 +297,7 @@ void apple_smc_bench_edge_keys(struct apple_smc *smc, const char *tag, bool poll
 int apple_smc_bench_read_line(struct apple_smc *smc, const smc_key *keys, int n, char *buf, size_t size,
 			      bool polled);
 int apple_smc_sleep_seq_warn(struct apple_smc *smc);
+void apple_smc_sleep_seq_rets(struct apple_smc *smc, int *slpa, int *notice);
 int apple_smc_sleep_seq_commit(struct apple_smc *smc, unsigned int arm_us, unsigned int idle_us,
 			       bool skip_slpa);
 

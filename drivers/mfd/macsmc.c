@@ -631,12 +631,15 @@ int apple_smc_sleep_seq_commit(struct apple_smc *smc, unsigned int arm_us, unsig
 		dev_info(smc->dev, "bench: MBSE = slpa skipped, the AP idle notice only\n");
 	else
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
+	smc->seq_slpa_ret = ret;
+	smc->seq_notice_ret = -EINVAL;
 	if (ret) {
 		dev_err(smc->dev, "Failed to issue MBSE = slpa: %d\n", ret);
 	} else {
 		apple_sleep_bench_probe(smc, "after slpa", false);
 		udelay(arm_us);
 		ret = apple_smc_notice_idle(smc);
+		smc->seq_notice_ret = ret;
 		if (!ret)
 			udelay(idle_us);
 	}
@@ -645,6 +648,14 @@ int apple_smc_sleep_seq_commit(struct apple_smc *smc, unsigned int arm_us, unsig
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_smc_sleep_seq_commit);
+
+/* Bench: what the last commit's slpa and AP idle notice returned */
+void apple_smc_sleep_seq_rets(struct apple_smc *smc, int *slpa, int *notice)
+{
+	*slpa = smc->seq_slpa_ret;
+	*notice = smc->seq_notice_ret;
+}
+EXPORT_SYMBOL_GPL(apple_smc_sleep_seq_rets);
 
 static void apple_smc_bench_key_name(char *out, smc_key key)
 {

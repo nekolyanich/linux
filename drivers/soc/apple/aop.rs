@@ -24,7 +24,10 @@ use kernel::{
         Device,
         DmaMask, //
     },
-    error::from_err_ptr,
+    error::{
+        from_err_ptr,
+        to_result, //
+    },
     io::{
         io_project,
         Io,
@@ -53,8 +56,19 @@ use kernel::{
         aref::ARef,
         Arc,
         ArcBorrow,
+        atomic::{
+            Acquire,
+            Atomic,
+            Relaxed,
+            Release, //
+        },
         CondVar,
+        CondVarTimeoutResult,
         Mutex, //
+    },
+    time::{
+        msecs_to_jiffies,
+        Jiffies, //
     },
     types::ForeignOwnable,
     workqueue::{
@@ -81,12 +95,14 @@ const AFK_OPC_INIT_UNK: u64 = 0x8c;
 const AFK_OPC_SEND: u64 = 0xa2;
 const AFK_OPC_START_ACK: u64 = 0x86;
 const AFK_OPC_SHUTDOWN_ACK: u64 = 0xc1;
+const AFK_OPC_SLEEP_ACK: u64 = 0x87;
 const AFK_OPC_RECV: u64 = 0x85;
 const AFK_MSG_GET_BUF_ACK: u64 = 0xa1 << 48;
 const AFK_MSG_INIT: u64 = AFK_OPC_INIT << 48;
 const AFK_MSG_INIT_ACK: u64 = 0xa0 << 48;
 const AFK_MSG_START: u64 = 0xa3 << 48;
 const AFK_MSG_SHUTDOWN: u64 = 0xc0 << 48;
+const AFK_MSG_SLEEP: u64 = 0xa4 << 48;
 const AFK_RB_BLOCK_STEP: usize = 0x40;
 const EPIC_TYPE_NOTIFY: u32 = 0;
 const EPIC_CATEGORY_REPORT: u8 = 0x00;
@@ -99,6 +115,39 @@ const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
+
+// System sleep (aurora's AOP sleep, by function, and native5's t6020 bench pieces; Tanabota
+// m2pro-73-port.md, batch 9). Off unless a sleep reaches the firmware or apple_sleep.aop_sleep.
+/// macOS 13's t6020 order of its AFK SLEEPs (Tanabota pd632): 0x26 first, 0x23 and 0x24 not at
+/// all. Only the bench's AOPORDER group (apple_sleep.groups bit 62) uses it.
+const AOP_SLEEP_ORDER_MACOS_T6020: &[u8] = &[0x26, 0x21, 0x20, 0x22, 0x2b, 0x25, 0x2c, 0x29, 0x2a, 0x28, 0x2d, 0x27];
+/// The EPIC notices macOS 13 puts on these t6020 endpoints between its first AFK SLEEP (0x26) and
+/// the others (pd632, 1 of 1): ring magic "AOP ", the channel here, type 0 (notify), EPIC v2
+/// header with category 0x10 and subtype 4, and 12 bytes of zeros. Only the bench's AOPSEND
+/// group (bit 63) sends them.
+const AOP_SLEEP_NOTICES_MACOS_T6020: &[(u8, u32)] = &[
+    (0x21, 0x1000_0007),
+    (0x22, 0x1000_0008),
+    (0x25, 0),
+    (0x29, 0x1000_0010),
+    (0x2a, 0x1000_0005),
+    (0x2b, 0x1000_000d),
+    (0x2c, 0x1000_000c),
+    (0x2d, 0x1000_0009),
+];
+const AOP_SLEEP_NOTICE_SUBTYPE: u16 = 4;
+/// The channel the t6020 firmware announces "wakehint" on (pd633).
+const AOP_WAKEHINT_CHANNEL_T6020: u32 = 0x1000_0001;
+const AOP_SLEEP_NOTICE_LEN: usize = 12;
+/// Bound on the answer to each stop or start around a system sleep.
+const AFK_SLEEP_TIMEOUT_MS: u32 = 1000;
+
+/// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one of this driver's.
+fn afk_endpoint_index(ep: u8) -> Option<usize> {
+    ep.checked_sub(AFK_ENDPOINT_START)
+        .map(usize::from)
+        .filter(|&i| i < AFK_ENDPOINT_COUNT as usize)
+}
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -178,6 +227,19 @@ impl<T: Unpin> FutureValue<T> {
         }
         ret_guard.take().unwrap()
     }
+    /// Waits at most `timeout_ms` for the value, uninterruptibly: `None` if it did not arrive.
+    fn wait_timeout(&self, timeout_ms: u32) -> Option<T> {
+        let mut left: Jiffies = msecs_to_jiffies(timeout_ms);
+        let mut ret_guard = self.val.lock();
+        while ret_guard.is_none() {
+            match self.completion.wait_timeout(&mut ret_guard, left) {
+                CondVarTimeoutResult::Timeout => break,
+                CondVarTimeoutResult::Woken { jiffies }
+                | CondVarTimeoutResult::Signal { jiffies } => left = jiffies,
+            }
+        }
+        ret_guard.take()
+    }
     fn reset(&self) {
         *self.val.lock() = None;
     }
@@ -202,6 +264,8 @@ struct AFKEndpoint {
     seq: u16,
     calls: [Option<Arc<FutureValue<CallResult>>>; AOP_MAX_CALLS],
     call_returns: [Option<KVec<u8>>; AOP_MAX_CALLS],
+    /// The next send uses the ring magic "AOP " (macOS's sleep notices) instead of "IOP ".
+    tx_magic_aop: bool,
 }
 
 unsafe impl Send for AFKEndpoint {}
@@ -216,6 +280,7 @@ impl AFKEndpoint {
             seq: 0,
             calls: [const { None }; AOP_MAX_CALLS],
             call_returns: [const { None }; AOP_MAX_CALLS],
+            tx_magic_aop: false,
         }
     }
 
@@ -242,7 +307,8 @@ impl AFKEndpoint {
                 self.recv_get_buf(client.dev.clone(), rtkit, msg)?;
             }
             AFK_OPC_INIT_UNK => {} // no-op
-            AFK_OPC_START_ACK => {}
+            // Only a sleep waits for these; anything else leaves the value unread.
+            AFK_OPC_START_ACK | AFK_OPC_SLEEP_ACK => client.sleep_answered(self.index),
             AFK_OPC_INIT_RX => {
                 if self.rxbuf.is_some() {
                     dev_err!(
@@ -542,7 +608,7 @@ impl AFKEndpoint {
         }
         let payload_len = header.len() + data.len();
         let qeh = QEHeader {
-            magic: QE_MAGIC1,
+            magic: if self.tx_magic_aop { QE_MAGIC2 } else { QE_MAGIC1 },
             size: payload_len as u32,
             channel,
             ty,
@@ -636,6 +702,17 @@ struct AopData {
     endpoints: [Mutex<AFKEndpoint>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
     ep_shutdown: FutureValue<()>,
+    /// A sleep's AFK SLEEP or START answer, per endpoint
+    #[pin]
+    ep_sleep: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
+    /// Between a sleep's entry and its undo: new calls are refused
+    sleeping: Atomic<bool>,
+    /// The endpoints a sleep stopped, bit = index
+    sleep_stopped: Atomic<u32>,
+    /// The AP idle notice was sent and the wake notice is owed
+    ap_idle: Atomic<bool>,
+    /// The firmware crashed: it hears nothing more, and sleeps go on without it
+    crashed: Atomic<bool>,
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
     #[pin]
@@ -728,6 +805,11 @@ impl AopData {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
                     }),
                     ep_shutdown <- FutureValue::pin_init(),
+                    ep_sleep <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
+                    sleeping: Atomic::new(false),
+                    sleep_stopped: Atomic::new(0),
+                    ap_idle: Atomic::new(false),
+                    crashed: Atomic::new(false),
                     hid_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
                 }
@@ -810,6 +892,201 @@ impl AopData {
         Ok(())
     }
 
+    fn sleep_answered(&self, endpoint: u8) {
+        if let Some(index) = afk_endpoint_index(endpoint) {
+            self.ep_sleep[index].complete(());
+        }
+    }
+
+    /// Whether RTKit has endpoint `ep`: start() started every such AFK endpoint.
+    fn has_endpoint(&self, ep: u8) -> bool {
+        let mut guard = self.rtkit.lock();
+        match guard.as_mut().as_pin_mut() {
+            Some(rtk) => rtk.has_endpoint(ep),
+            None => false,
+        }
+    }
+
+    /// Sends `msg` to one endpoint and waits for its answer.
+    fn sleep_switch(&self, endpoint: u8, msg: u64) -> Result<()> {
+        let index = afk_endpoint_index(endpoint).ok_or(EINVAL)?;
+        self.ep_sleep[index].reset();
+        {
+            let mut guard = self.rtkit.lock();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            rtk.send_message(endpoint, msg)?;
+        }
+        self.ep_sleep[index]
+            .wait_timeout(AFK_SLEEP_TIMEOUT_MS)
+            .ok_or(ETIMEDOUT)
+    }
+
+    /// Tells the firmware about the AP's power state (RTKit's AP power ON/IDLE). Waits with
+    /// the RTKit lock dropped: the answer shares a worker with messages that take it.
+    fn ap_power(&self, on: bool) -> Result<()> {
+        let rtk = (*self.rtkit.lock())
+            .as_ref()
+            .map(|rtk| rtk.as_raw())
+            .ok_or(ENODEV)?;
+        // SAFETY: the handle lives until removal, which holds the device lock that system
+        // sleep also runs under.
+        to_result(unsafe { bindings::apple_rtkit_ap_power(rtk, on) })
+    }
+
+    /// Puts back what `sleep_enter` did: the wake notice, then the stopped endpoints started.
+    fn sleep_undo(&self) {
+        if self.crashed.load(Acquire) {
+            self.sleep_stopped.store(0, Relaxed);
+            self.ap_idle.store(false, Relaxed);
+            self.sleeping.store(false, Release);
+            return;
+        }
+        let stopped = self.sleep_stopped.xchg(0, Relaxed);
+        if self.ap_idle.xchg(false, Relaxed) {
+            if let Err(e) = self.ap_power(true) {
+                dev_err!(self.dev, "Wake notice not answered ({:?})", e);
+            }
+        }
+        for index in 0..AFK_ENDPOINT_COUNT as usize {
+            if stopped & (1 << index) == 0 {
+                continue;
+            }
+            let endpoint = AFK_ENDPOINT_START + index as u8;
+            if let Err(e) = self.sleep_switch(endpoint, AFK_MSG_START) {
+                dev_err!(self.dev, "Endpoint {:#04x} did not restart ({:?})", endpoint, e);
+            }
+        }
+        self.sleeping.store(false, Release);
+        if stopped != 0 {
+            dev_dbg!(self.dev, "AP on notice sent and endpoints restarted after a sleep\n");
+        }
+    }
+
+    /// macOS's sleep notices (the bench's AOPSEND group): one EPIC notify per endpoint, each
+    /// waited for. One that isn't there, or doesn't answer, is logged and skipped. A call left
+    /// unanswered keeps its tag until its answer comes (asahi's call slots have no abandon).
+    fn sleep_notices(&self) {
+        // SAFETY: only reads a bench switch (sleep-seq's aop_quiet).
+        let quiet = unsafe { bindings::apple_sleep_bench_aop_quiet() };
+        for &(ep, channel) in AOP_SLEEP_NOTICES_MACOS_T6020 {
+            // aop_quiet bit 0: wakehint on its announced channel (pd633 answered 0xe00002c7 on 0).
+            let channel = if ep == 0x25 && quiet & 1 != 0 {
+                AOP_WAKEHINT_CHANNEL_T6020
+            } else {
+                channel
+            };
+            let Some(idx) = afk_endpoint_index(ep) else {
+                continue;
+            };
+            if !self.has_endpoint(ep) {
+                dev_info!(self.dev, "sleep notice: endpoint {:#04x} not there, skipped\n", ep);
+                continue;
+            }
+            let call = {
+                let mut rtk_guard = self.rtkit.lock();
+                let Some(mut rtk) = rtk_guard.as_mut().as_pin_mut() else {
+                    return;
+                };
+                let mut ep_guard = self.endpoints[idx].lock();
+                ep_guard.tx_magic_aop = true;
+                let r = ep_guard.epic_notify(
+                    self,
+                    rtk.as_mut(),
+                    channel,
+                    AOP_SLEEP_NOTICE_SUBTYPE,
+                    &[0u8; AOP_SLEEP_NOTICE_LEN],
+                    None,
+                );
+                ep_guard.tx_magic_aop = false;
+                r
+            };
+            match call {
+                Err(e) => dev_err!(self.dev, "sleep notice: endpoint {:#04x} not sent ({:?})\n", ep, e),
+                Ok(call) => match call.wait_timeout(AFK_SLEEP_TIMEOUT_MS) {
+                    Some(res) => dev_info!(
+                        self.dev,
+                        "sleep notice: endpoint {:#04x} channel {:#x} answered {:#x}\n",
+                        ep,
+                        channel,
+                        res.retcode
+                    ),
+                    None => dev_err!(
+                        self.dev,
+                        "sleep notice: endpoint {:#04x} channel {:#x} not answered in {} ms\n",
+                        ep,
+                        channel,
+                        AFK_SLEEP_TIMEOUT_MS
+                    ),
+                },
+            }
+        }
+    }
+
+    /// The AOP keeps running through a firmware-driven suspend: it stops its endpoints and
+    /// hears the AP's power state, then the reverse after a wake, with no firmware restart
+    /// (aurora, measured on T8140; native5's t6020 bench order and notices behind its groups).
+    fn sleep_enter(&self) -> Result<()> {
+        self.sleeping.store(true, Release);
+        if self.crashed.load(Acquire) {
+            dev_warn!(self.dev, "firmware crashed: sleeping without it\n");
+            return Ok(());
+        }
+        // SAFETY: only reads flags. The bench's AOPORDER group (t6020 sleep-seq bit 62).
+        let macos = unsafe { bindings::apple_sleep_bench_aop_macos_order() };
+        let all: KVec<u8> = {
+            let mut v = KVec::new();
+            for i in 0..AFK_ENDPOINT_COUNT {
+                v.push(AFK_ENDPOINT_START + i, GFP_KERNEL)?;
+            }
+            v
+        };
+        let order: &[u8] = if macos { AOP_SLEEP_ORDER_MACOS_T6020 } else { &all };
+        // SAFETY: only reads flags. The bench's AOPSEND group (bit 63): macOS's notices, after
+        // its first SLEEP.
+        let mut notices = unsafe { bindings::apple_sleep_bench_aop_notices() };
+        if notices && order.first() != Some(&0x26) {
+            self.sleep_notices();
+            notices = false;
+        }
+        let mut result = Ok(());
+        for &endpoint in order {
+            let Some(index) = afk_endpoint_index(endpoint) else {
+                continue;
+            };
+            if !self.has_endpoint(endpoint) {
+                continue;
+            }
+            result = self.sleep_switch(endpoint, AFK_MSG_SLEEP).inspect_err(|e| {
+                dev_err!(self.dev, "Endpoint {:#04x} did not stop ({:?})", endpoint, e);
+            });
+            if result.is_err() {
+                break;
+            }
+            self.sleep_stopped
+                .store(self.sleep_stopped.load(Relaxed) | (1 << index), Relaxed);
+            if notices && endpoint == 0x26 {
+                self.sleep_notices();
+                notices = false;
+            }
+        }
+        if notices {
+            self.sleep_notices();
+        }
+        if result.is_ok() {
+            // Set first: a notice without an answer may still have been taken.
+            self.ap_idle.store(true, Relaxed);
+            result = self.ap_power(false).inspect_err(|e| {
+                dev_err!(self.dev, "Sleep notice not answered ({:?})", e);
+            });
+        }
+        if result.is_err() {
+            self.sleep_undo();
+        } else {
+            dev_dbg!(self.dev, "Endpoints stopped and AP idle notice answered for a sleep\n");
+        }
+        result
+    }
+
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
@@ -842,6 +1119,9 @@ impl AopData {
 
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
+        if self.sleeping.load(Acquire) {
+            return Err(EBUSY);
+        }
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
@@ -858,6 +1138,9 @@ impl AOP for AopData {
         msg_bytes: &[u8],
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)> {
+        if self.sleeping.load(Acquire) {
+            return Err(EBUSY);
+        }
         let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
         let call = {
             let mut rtk_guard = self.rtkit.lock();
@@ -935,6 +1218,7 @@ impl rtkit::Operations for AopData {
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+        data.crashed.store(true, Release);
         dev_err!(data.dev, "AOP firmware crashed");
     }
 }
@@ -980,11 +1264,66 @@ kernel::of_device_table!(
     ]
 );
 
+/// # Safety
+///
+/// `dev` is a bound AOP device: its drvdata is the `AopDriver` probe returned.
+unsafe fn aop_from_dev<'a>(dev: *mut bindings::device) -> &'a AopData {
+    // SAFETY: by the caller's contract, drvdata is the boxed `AopDriver`.
+    let driver = unsafe { &*bindings::dev_get_drvdata(dev).cast::<AopDriver>() };
+    let data: *const dyn AOP = &*driver.0;
+    // SAFETY: probe made this `Arc<dyn AOP>` from an `Arc<AopData>`.
+    unsafe { &*data.cast::<AopData>() }
+}
+
+/// A sleep that reaches the firmware, or the bench's own switch (apple_sleep.aop_sleep). Off,
+/// suspend_late returns at once and the resume finds nothing to undo: the sensors, mic and ALS
+/// behave as before.
+///
+/// # Safety
+///
+/// Called by the PM core with a bound AOP device.
+unsafe extern "C" fn aop_suspend_late(dev: *mut bindings::device) -> c_int {
+    // SAFETY: only reads flags.
+    if !unsafe { bindings::pm_suspend_via_firmware() }
+        && !unsafe { bindings::apple_sleep_bench_aop_sleep() }
+    {
+        return 0;
+    }
+    // SAFETY: by this function's contract.
+    match unsafe { aop_from_dev(dev) }.sleep_enter() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// # Safety
+///
+/// Called by the PM core with a bound AOP device.
+unsafe extern "C" fn aop_resume(dev: *mut bindings::device) -> c_int {
+    // SAFETY: by this function's contract.
+    let aop = unsafe { aop_from_dev(dev) };
+    if aop.sleeping.load(Acquire) {
+        aop.sleep_undo();
+    }
+    0
+}
+
+static AOP_PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+    suspend_late: Some(aop_suspend_late),
+    resume: Some(aop_resume),
+    // SAFETY: all-zero is a valid `dev_pm_ops`: no callbacks.
+    ..unsafe { core::mem::zeroed() }
+};
+
 impl platform::Driver for AopDriver {
     type IdInfo = &'static AopHwConfig;
     type Data<'bound> = AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        Some(&AOP_PM_OPS)
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,

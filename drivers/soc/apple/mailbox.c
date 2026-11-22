@@ -32,6 +32,7 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
+#define APPLE_ASC_MBOX_CONTROL_RECV_ENABLE BIT(0)
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_ASC_MBOX_CONTROL_EMPTY BIT(17)
 
@@ -296,6 +297,40 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 	pm_runtime_put_autosuspend(mbox->dev);
 }
 EXPORT_SYMBOL(apple_mbox_stop);
+
+/*
+ * For firmware that powers itself down (the SEP's SLEEP, aurora): bit 0 of the
+ * receive control word, cleared so nothing more is taken from the outbox, set
+ * again at the wake. Only callers that ask.
+ */
+void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled)
+{
+	unsigned long flags;
+	u32 val;
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	val = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+	val = enabled ? val | APPLE_ASC_MBOX_CONTROL_RECV_ENABLE :
+			val & ~APPLE_ASC_MBOX_CONTROL_RECV_ENABLE;
+	writel_relaxed(val, mbox->regs + mbox->hw->i2a_control);
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_set_recv_enabled);
+
+/* No receive interrupt, so no handler reads the mailbox, until the release (nests). */
+void apple_mbox_hold_rx(struct apple_mbox *mbox)
+{
+	if (mbox->irq_recv_not_empty >= 0)
+		disable_irq(mbox->irq_recv_not_empty);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_hold_rx);
+
+void apple_mbox_release_rx(struct apple_mbox *mbox)
+{
+	if (mbox->irq_recv_not_empty >= 0)
+		enable_irq(mbox->irq_recv_not_empty);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_release_rx);
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index)
 {

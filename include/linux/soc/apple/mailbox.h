@@ -44,6 +44,9 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 
 int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
+void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled);
+void apple_mbox_hold_rx(struct apple_mbox *mbox);
+void apple_mbox_release_rx(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 		    bool atomic);

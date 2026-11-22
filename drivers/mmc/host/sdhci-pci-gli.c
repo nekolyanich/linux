@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/of.h>
 #include <linux/iopoll.h>
+#include <linux/soc/apple/sleep.h>
 #include "sdhci.h"
 #include "sdhci-cqhci.h"
 #include "sdhci-pci.h"
@@ -2044,6 +2045,44 @@ static const struct sdhci_ops sdhci_gl9755_ops = {
 	.uhs2_pre_detect_init   = sdhci_gli_pre_detect_init,
 };
 
+#ifdef CONFIG_PM_SLEEP
+/*
+ * Bench (native5 b4580cfa, 7325ec4b, 6d8cd853; Tanabota note 77 §14.33, apple_sleep.hybrid bit
+ * 10): the GL9755's vendor config (PECONF and the rest, past the header pci_restore_state()
+ * restores) is lost when the sleep takes the endpoint down. With it goes the card detect
+ * inversion Apple boards need, and a present card reads absent. Do the probe's setup again before
+ * the host resumes. Without the bit this is asahi's resume.
+ */
+static int sdhci_pci_gl9755_resume(struct sdhci_pci_chip *chip)
+{
+	if (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_SD_HW) {
+		struct sdhci_pci_slot *slot = chip->slots[0];
+		struct sdhci_host *host = slot->host;
+		struct pci_dev *pdev = chip->pdev;
+		ktime_t t0;
+		u32 present;
+		int ret;
+
+		gl9755_hw_setting(slot);
+		gl9755_vendor_init(host);
+
+		/*
+		 * The inversion is back, but the card detect debounce takes its time (b1e pd1609: no
+		 * card at the resume, present 2 s later), and the core's detect at mmc_bus_resume would
+		 * drop the card first. Wait for a present, stable card, at most 1.5 s.
+		 */
+		t0 = ktime_get();
+		ret = readl_poll_timeout(host->ioaddr + SDHCI_PRESENT_STATE, present,
+					 (present & (SDHCI_CARD_PRESENT | SDHCI_CD_STABLE)) ==
+					 (SDHCI_CARD_PRESENT | SDHCI_CD_STABLE), 10000, 1500000);
+		pci_info(pdev, "bench: gl9755 card detect after the setup again: %s after %lld ms, PRESENT %#010x\n",
+			 ret ? "no card" : "present", ktime_ms_delta(ktime_get(), t0), present);
+	}
+
+	return sdhci_pci_gli_resume(chip);
+}
+#endif
+
 const struct sdhci_pci_fixes sdhci_gl9755 = {
 	.quirks		= SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC,
 	.quirks2	= SDHCI_QUIRK2_BROKEN_DDR50,
@@ -2052,7 +2091,7 @@ const struct sdhci_pci_fixes sdhci_gl9755 = {
 	.remove_host	= sdhci_pci_uhs2_remove_host,
 	.ops            = &sdhci_gl9755_ops,
 #ifdef CONFIG_PM_SLEEP
-	.resume         = sdhci_pci_gli_resume,
+	.resume         = sdhci_pci_gl9755_resume,
 #endif
 };
 

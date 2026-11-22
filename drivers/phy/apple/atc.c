@@ -2903,9 +2903,15 @@ MODULE_DEVICE_TABLE(of, atcphy_match);
  * and let that SetLinkRate cycle them. Touching the PLL here instead made DCP
  * skip the link training on resume altogether.
  */
-static bool s2r_assume_cut = true;
-module_param(s2r_assume_cut, bool, 0644);
-MODULE_PARM_DESC(s2r_assume_cut, "treat a suspend to RAM as a power cut of the PHY's domain and restore it on resume");
+/*
+ * Off until aurora's dwc3 side comes with it (pre_host_resume and the mem
+ * notifier): the restore asserts the dwc3 reset and nothing here deasserts it
+ * (rv-crossbar, batch 7). With it on, a resume restores only after a real cut,
+ * told by the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
+ */
+static bool s2r_assume_cut;
+module_param(s2r_assume_cut, bool, 0444);
+MODULE_PARM_DESC(s2r_assume_cut, "bench: restore the PHY after a suspend to RAM whose power cut reset it (off: needs the dwc3 resume side)");
 
 static int atcphy_suspend_late(struct device *dev)
 {
@@ -2942,6 +2948,10 @@ static int atcphy_resume_early(struct device *dev)
 	if (!atcphy->pd_was_off)
 		return 0;
 	atcphy->pd_was_off = false;
+	/* A refused or aborted entry left the block as it was: nothing to restore. */
+	if (readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE) &
+	    PIPEHANDLER_DUMMY_PHY_EN)
+		return 0;
 	mode = atcphy->mode;
 
 	_atcphy_dwc3_reset_assert(atcphy);

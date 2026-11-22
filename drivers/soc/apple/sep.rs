@@ -2975,12 +2975,17 @@ impl platform::Driver for SepDriver {
             return Err(e);
         }
 
-        if let Err(e) = data.register_fv_kernel() {
-            dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+        // aurora's switches (sep.rs:3693/3699): both on by default, as before
+        if module_parameters::filevault_api.value() != 0 {
+            if let Err(e) = data.register_fv_kernel() {
+                dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+            }
         }
 
-        if let Err(e) = trusted::register(data.clone()) {
-            dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+        if module_parameters::trusted_keys.value() != 0 {
+            if let Err(e) = trusted::register(data.clone()) {
+                dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+            }
         }
 
         if let Err(e) = pm::register(data.clone()) {
@@ -3052,6 +3057,14 @@ module! {
         xart_writes: u8 {
             default: 1,
             description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",
+        },
+        trusted_keys: u8 {
+            default: 1,
+            description: "Register the SEP as a trusted-keys source at probe; 0: don't (as aurora's apple_sep.trusted_keys)",
+        },
+        filevault_api: u8 {
+            default: 1,
+            description: "Register the FileVault kernel API at probe; 0: don't (as aurora's apple_sep.filevault_api)",
         },
         partname_fallback: u8 {
             default: 0,

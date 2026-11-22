@@ -899,6 +899,8 @@ impl SepData {
                 Some(store)
             }
             Err(e) => {
+                // Bench crumbs: 0x55 the container not found yet (deferred), 0x56 the probe failed
+                pm::crumb(if e == EPROBE_DEFER { 0x55 } else { 0x56 });
                 dev_err!(
                     dev,
                     "xART gigalocker in the iBoot container is unavailable or invalid: {:?}\n",
@@ -1268,6 +1270,19 @@ impl SepData {
         );
         if !idle {
             dev_err!(self.dev, "early sleep refused: a request is still waiting for its reply\n");
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(EBUSY);
+        }
+        // An SKS, SCRD or SBIO exchange still owed (its waiter may be frozen) would lose its
+        // reply across the SLEEP (rv-sepkey): never waited for here, only tried. Held to the
+        // end of this function, so none can start meanwhile either.
+        let exchanges = (
+            self.sks_exchange_lock.try_lock(),
+            self.scrd_exchange_lock.try_lock(),
+            self.sbio_exchange_lock.try_lock(),
+        );
+        if exchanges.0.is_none() || exchanges.1.is_none() || exchanges.2.is_none() {
+            dev_err!(self.dev, "early sleep refused: an SKS, SCRD or SBIO exchange is in progress\n");
             self.set_sleep_gate(pm::SleepGate::Open);
             return Err(EBUSY);
         }
@@ -2954,7 +2969,10 @@ impl platform::Driver for SepDriver {
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
 
-        data.attach(&sep_node)?;
+        if let Err(e) = data.attach(&sep_node) {
+            pm::crumb(0x56);
+            return Err(e);
+        }
 
         if let Err(e) = data.register_fv_kernel() {
             dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
@@ -2971,6 +2989,8 @@ impl platform::Driver for SepDriver {
         if data.registered.load(Relaxed) {
             SepData::arm_settle(&data);
         }
+        // Bench crumb: the driver is bound (0x57), so the early SLEEP is wired if asked for
+        pm::crumb(0x57);
 
         Ok(SepDriver(data))
     }

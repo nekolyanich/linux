@@ -100,6 +100,7 @@
 #include "spinlock.c"
 #include "string.c"
 #include "srcu.c"
+#include "suspend.c"
 #include "sync.c"
 #include "task.c"
 #include "time.c"

@@ -274,6 +274,11 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_start_ep(self.rtk, endpoint) })
     }
 
+    /// The C RTKit handle, for the C calls this abstraction doesn't wrap (the AP power notices).
+    pub fn as_raw(&self) -> *mut bindings::apple_rtkit {
+        self.rtk
+    }
+
     /// Sends a message to a given endpoint.
     pub fn send_message(self: Pin<&mut Self>, endpoint: u8, message: u64) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

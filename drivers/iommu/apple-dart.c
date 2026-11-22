@@ -246,6 +246,10 @@ struct apple_dart {
 	 */
 	u32 held : 1;
 	u32 held_skipped : 1;
+	/* Its host sets its port clock up again after a real sleep, then resumes it. */
+	u32 host_resumes : 1;
+	/* Its block can't answer (its host is down): no command, IRQ or register access. */
+	bool commands_gated;
 
 	dma_addr_t dma_min;
 	dma_addr_t dma_max;
@@ -527,6 +531,10 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 	u32 command_reg;
 
 	spin_lock_irqsave(&stream_map->dart->lock, flags);
+	if (stream_map->dart->commands_gated) {
+		spin_unlock_irqrestore(&stream_map->dart->lock, flags);
+		return -EHOSTDOWN;
+	}
 	if (stream_map->dart->held) {
 		stream_map->dart->held_skipped = 1;
 		spin_unlock_irqrestore(&stream_map->dart->lock, flags);
@@ -565,6 +573,10 @@ apple_dart_t8110_hw_tlb_command(struct apple_dart_stream_map *stream_map,
 	int sid;
 
 	spin_lock_irqsave(&dart->lock, flags);
+	if (dart->commands_gated) {
+		spin_unlock_irqrestore(&dart->lock, flags);
+		return -EHOSTDOWN;
+	}
 	if (dart->held) {
 		dart->held_skipped = 1;
 		spin_unlock_irqrestore(&dart->lock, flags);
@@ -1468,12 +1480,14 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 	irqreturn_t ret;
 	struct apple_dart *dart = dev;
 
+	if (READ_ONCE(dart->commands_gated))
+		return IRQ_NONE;
 	/* Held across its block's power cycle: its registers aren't there (the line is shared) */
 	if (dart->held)
 		return IRQ_NONE;
 
 	WARN_ON(pm_runtime_get_sync(dart->dev) < 0);
-	ret = dart->hw->irq_handler(irq, dev);
+	ret = READ_ONCE(dart->commands_gated) ? IRQ_NONE : dart->hw->irq_handler(irq, dev);
 	pm_runtime_put(dart->dev);
 	return ret;
 }
@@ -1777,6 +1791,9 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	/* Locked DARTs can't be restored so skip saving their registers. */
 	if (dart->locked)
 		return 0;
+	/* Saved by its host already, and its block no longer answers. */
+	if (READ_ONCE(dart->commands_gated))
+		return 0;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		dart->save_tcr[sid] = readl(dart->regs + DART_TCR(dart, sid));
@@ -1796,6 +1813,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 
 	/* Locked DARTs can't be restored, and they should not need it */
 	if (dart->locked)
+		return 0;
+	/* Its block can't answer yet: apple_dart_host_resume() restores it. */
+	if (READ_ONCE(dart->commands_gated))
 		return 0;
 
 	ret = apple_dart_hw_reset(dart);
@@ -2092,8 +2112,19 @@ static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
 
 static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 {
+	struct apple_dart *dart = dev_get_drvdata(dev);
 	int ret;
 
+	/*
+	 * After a real sleep a DART clocked by its host's port reads nothing
+	 * until the host sets the port up again (bench_resume of pcie-apple, t602x):
+	 * gated until then, and apple_dart_host_resume() restores it.
+	 */
+	if (dart->host_resumes && pm_resume_via_firmware()) {
+		scoped_guard(spinlock_irqsave, &dart->lock)
+			WRITE_ONCE(dart->commands_gated, true);
+		return pm_runtime_force_resume(dev);
+	}
 	if (!apple_dart_fw_sleep(dev) || apple_dart_held(dev))
 		return 0;
 	ret = pm_runtime_force_resume(dev);
@@ -2113,6 +2144,70 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 			 pm_runtime_status_suspended(dev) ? "suspended" : "active");
 	return ret;
 }
+
+/*
+ * A host whose port clocks this DART (native5, the t602x internal PCIe DARTs
+ * under pcie-apple's bench_resume): it gates the DART before its own teardown,
+ * and ungates and restores it once its port is up again. Nothing calls these
+ * unless pcie-apple's bench switches are set.
+ */
+int apple_dart_quiesce_commands(struct device *dev)
+{
+	struct apple_dart *dart;
+
+	if (dev->driver != &apple_dart_driver.driver)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (!dart)
+		return -ENODEV;
+	/* Finish any in-flight command before the port clock is stopped. */
+	scoped_guard(spinlock_irqsave, &dart->lock)
+		WRITE_ONCE(dart->commands_gated, true);
+	/* The fault handler can take dart->lock while acknowledging errors. */
+	if (dart->irq > 0)
+		synchronize_irq(dart->irq);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_quiesce_commands);
+
+int apple_dart_set_host_resumes(struct device *dev)
+{
+	struct apple_dart *dart;
+
+	if (dev->driver != &apple_dart_driver.driver)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (!dart)
+		return -EPROBE_DEFER;
+	if (dart->locked)
+		return -EINVAL;
+	dart->host_resumes = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_set_host_resumes);
+
+int apple_dart_host_resume(struct device *dev)
+{
+	struct apple_dart *dart;
+	int ret;
+
+	if (dev->driver != &apple_dart_driver.driver)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (!dart || !dart->host_resumes)
+		return -EINVAL;
+	if (!READ_ONCE(dart->commands_gated))
+		return 0;
+	scoped_guard(spinlock_irqsave, &dart->lock)
+		WRITE_ONCE(dart->commands_gated, false);
+	ret = apple_dart_resume(dev);
+	if (ret)
+		dev_err(dev, "restore after its host came back failed: %d\n", ret);
+	else
+		dev_info(dev, "restored after its host came back\n");
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_host_resume);
 
 static const struct dev_pm_ops apple_dart_pm_ops = {
 	SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend, apple_dart_sys_resume)

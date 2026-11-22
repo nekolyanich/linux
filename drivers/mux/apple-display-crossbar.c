@@ -597,44 +597,76 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
  * crossbar's domain is in no edge on-list (notes/sleep/40 §2.3), so a cut loses the selects, and
  * the mux core skips a repeat select of the same state. The fixed HDMI route (dcpext0 -> atc3
  * dpphy, selected once at probe) has nobody else to put it back; dp-switch reselects its own
- * routes at PM_POST_SUSPEND. For each selected output whose 0x030 fields no longer hold its
- * dispext: write them again, route a dpphy output again, and leave a dpin output pending for
- * its link's next apple_dpxbar_finish(). A sleep that kept the registers (s2idle) reads 0x030
- * once and writes nothing.
+ * routes after the wake. This runs in resume_early, before any device's normal resume (DCP's
+ * modeset) and before PM_POST_SUSPEND: the order holds by PM phase (this tree has no
+ * mux-controls device link).
+ *
+ * A routed output lost its state if its 0x030 fields don't hold its dispext or its 0x034 enable
+ * is clear (dispext0's fields are 0 at reset, so 0x030 alone can't tell for it). A lost or
+ * pending output is selected again; a lost dpphy output is routed again; a dpin output gets its
+ * glue back (CFG 3, MODE 1, CTRL 5, then EN 0 and its status wait, as at select:
+ * dcp_dptx_xbar_select() skips a reselect while it holds the output) and stays pending for its
+ * link's next apple_dpxbar_finish(). A sleep that kept the registers (s2idle) reads two words and
+ * writes nothing but the glue of an output that was pending anyway.
  */
 static __maybe_unused int apple_dpxbar_resume_early(struct device *dev)
 {
 	struct mux_chip *mux_chip = dev_get_drvdata(dev);
 	struct apple_dpxbar *dpxbar;
 	unsigned long flags;
-	u32 sel;
+	unsigned int glue = 0;
+	u32 sel, en;
 
 	if (!mux_chip || mux_chip->ops != &apple_dpxbar_t602x_ops)
 		return 0;
 	dpxbar = mux_chip_priv(mux_chip);
 	spin_lock_irqsave(&dpxbar->lock, flags);
 	sel = readl(dpxbar->regs + T602X_REG_030);
+	en = readl(dpxbar->regs + T602X_REG_034);
 	for (unsigned int index = 0; index < MUX_MAX; index++) {
 		int state = dpxbar->selected_dispext[index];
 		const unsigned int *shift = apple_dpxbar_t602x_out[index].sel_shift;
+		u32 atc_bit = apple_dpxbar_t602x_out[index].atc_bit;
 		u32 mask = 0xf << shift[0] | 0xf << shift[1];
 		u32 want = (u32)state << shift[0] | (u32)state << shift[1];
+		bool pending = dpxbar->route_pending[index];
 
-		if (state < 0 || (sel & mask) == want)
+		if (state < 0)
 			continue;
+		if (!pending && (sel & mask) == want && (en & atc_bit))
+			continue;
+		if (!pending)
+			dev_info(dpxbar->dev, "%s: lost in the sleep: 0x030 %#x 0x034 %#x\n",
+				 apple_dpxbar_names[index], sel, en);
 		dpxbar_mask32(dpxbar, T602X_REG_030, mask, want);
 		udelay(10);
 		if (index == MUX_DPPHY) {
-			apple_dpxbar_t602x_route(dpxbar, index);
+			if (!pending)
+				apple_dpxbar_t602x_route(dpxbar, index);
 		} else {
-			dpxbar_clear32(dpxbar, T602X_REG_034, apple_dpxbar_t602x_out[index].atc_bit);
+			dpxbar_clear32(dpxbar, T602X_REG_034, atc_bit);
 			dpxbar->route_pending[index] = true;
+			if (dpxbar->dpin[index - MUX_DPIN0])
+				glue |= BIT(index);
 		}
-		dev_info(dpxbar->dev, "%s: dispext%u,%u selected again after sleep (0x030 %#x)%s\n",
-			 apple_dpxbar_names[index], state >> 1, state & 1, sel,
-			 index == MUX_DPPHY ? ", routed" : ", route pending");
+		dev_info(dpxbar->dev, "%s: dispext%u,%u selected again after sleep%s\n",
+			 apple_dpxbar_names[index], state >> 1, state & 1,
+			 index == MUX_DPPHY ? (pending ? "" : ", routed") : ", route pending");
 	}
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
+
+	/* The dpin glue as apple_dpxbar_set_t602x() sets it, its enable wait sleeping */
+	for (unsigned int index = MUX_DPIN0; index < MUX_MAX; index++) {
+		void __iomem *dpin = dpxbar->dpin[index - MUX_DPIN0];
+
+		if (!(glue & BIT(index)))
+			continue;
+		writel(3, dpin + DPIN_CFG);
+		writel(1, dpin + DPIN_MODE);
+		writel(5, dpin + DPIN_CTRL);
+		writel(0, dpin + DPIN_EN);
+		apple_dpxbar_dpin_wait(dpxbar, dpin, 0);
+	}
 	return 0;
 }
 

@@ -248,7 +248,14 @@ struct apple_dart {
 	u32 held_skipped : 1;
 	/* Its host sets its port clock up again after a real sleep, then resumes it. */
 	u32 host_resumes : 1;
-	/* Its block can't answer (its host is down): no command, IRQ or register access. */
+	/*
+	 * Its block can't answer (its host is down): no command, IRQ or register access.
+	 * A gated command returns -EHOSTDOWN and is not recorded for a redo: the host's
+	 * apple_dart_host_resume() runs the full apple_dart_resume() instead. The gate is
+	 * checked before the hold, so a DART both held and gated would lose the hold's
+	 * redo (held_skipped stays 0). No DART is both today (the PCIe DARTs are gated,
+	 * SIO's is held); one that becomes both needs the redo set here too.
+	 */
 	bool commands_gated;
 
 	dma_addr_t dma_min;

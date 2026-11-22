@@ -383,7 +383,7 @@ struct apple_sleep_seq {
 	unsigned long *dispext_rows;
 	/* the rows of dispext1 among them; the rest are dispext0's */
 	unsigned long *dispext1_rows;
-	/* bit d: dcpext<d> has a driver bound, which owns it: its rows never run (rv-dpswitch Q4 #1) */
+	/* bit d: dcpext<d> is in the DT, so its driver owns it: its rows never run (rv-dpswitch Q4 #1) */
 	u8 dispext_bound;
 	bool dispext_done;
 	bool dispext_settled;
@@ -2062,16 +2062,19 @@ static int aseq_dispext_mark(struct apple_sleep_seq *s)
 }
 
 /*
- * Which external DCPs a driver has bound (rv-dpswitch round 2, Q4 #1): the dcpext node whose
- * coproc registers hold this table's dcpextN-asc block. The rows of a bound one are its driver's
- * (its own stop and power-down, or none): they don't run, at boot, .begin or the entry, and the
- * PMP report keeps its request. The bench leaves dcpext unbound (BENCH_DT_DELPROP), so nothing
- * changes there. Called in process context (boot work, .begin).
+ * Which external DCPs a driver owns (rv-dpswitch round 2, Q4 #1; its batch 15 review): an
+ * available `apple,dcpext` node whose coproc registers hold this table's dcpextN-asc block (by
+ * reg-name). Ownership goes by the DT, not by binding: appledrm is a module on m2pro, so the
+ * boot rows (1 s after the PMP report) may run before dcpext binds, and dispext_done blocks any
+ * undo. The rows of an owned one don't run, at boot, .begin or the entry, and the PMP report
+ * keeps its request. The bench deletes dcpext's compatible (BENCH_DT_DELPROP), so nothing
+ * changes there. Whether a driver is bound only goes to the log. Process context (boot work,
+ * .begin).
  */
 static void aseq_dispext_owned(struct apple_sleep_seq *s)
 {
 	const struct apple_sleep_seq_soc *soc = s->soc;
-	u8 bound = 0;
+	u8 owned = 0, bound = 0;
 
 	for (unsigned int d = 0; d < soc->ndispext && d < 2; d++) {
 		int index = of_property_match_string(s->dev->of_node, "reg-names",
@@ -2088,6 +2091,7 @@ static void aseq_dispext_owned(struct apple_sleep_seq *s)
 			if (!of_device_is_available(np) || of_address_to_resource(np, 0, &r) ||
 			    !resource_overlaps(&r, &asc))
 				continue;
+			owned |= BIT(d);
 			pdev = of_find_device_by_node(np);
 			if (pdev && device_is_bound(&pdev->dev))
 				bound |= BIT(d);
@@ -2095,9 +2099,10 @@ static void aseq_dispext_owned(struct apple_sleep_seq *s)
 				put_device(&pdev->dev);
 		}
 	}
-	if (bound != s->dispext_bound)
-		dev_info(s->dev, "dispext: external DCPs with a driver (rows skipped): %#x\n", bound);
-	s->dispext_bound = bound;
+	if (owned != s->dispext_bound)
+		dev_info(s->dev, "dispext: external DCPs a driver owns (rows skipped): %#x, bound now %#x\n",
+			 owned, bound);
+	s->dispext_bound = owned;
 }
 
 /* Each external DCP's CPU control and status (only with its cpu0 word not off) and its PS words */
@@ -2157,10 +2162,11 @@ static void aseq_dispext_run(struct apple_sleep_seq *s, const char *when)
 	unsigned int i, n = 0;
 	unsigned long flags;
 
+	unsigned int d = 0;
+
 	if (s->dispext_done)
 		return;
 	aseq_dispext_owned(s);
-	unsigned int d = 0;
 
 	for_each_set_bit(i, s->dispext_rows, s->soc->nentry) {
 		const struct apple_sleep_op *op = &s->soc->entry[i];

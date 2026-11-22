@@ -1093,8 +1093,13 @@ impl AopData {
                 continue;
             }
             // One the last undo couldn't start again is still stopped: the undo retries it.
+            // Unless its START_ACK came late (it's in ep_sleep): then it runs, and is slept.
             if self.sleep_stopped.load(Relaxed) & (1 << index) != 0 {
-                continue;
+                if self.ep_sleep[index].val.lock().is_none() {
+                    continue;
+                }
+                self.sleep_stopped
+                    .store(self.sleep_stopped.load(Relaxed) & !(1 << index), Relaxed);
             }
             // Marked before the wait: a SLEEP that went out but wasn't answered may still have
             // stopped it, so the undo STARTs every endpoint a SLEEP was sent to (rv-dpaudio).

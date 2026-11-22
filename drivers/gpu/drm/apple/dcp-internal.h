@@ -135,6 +135,9 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+	/* Bench (native5): the RTKit idle at the end of the suspend ran, and its result */
+	bool bench_idle_ran;
+	int bench_idle_ret;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

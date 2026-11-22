@@ -152,6 +152,7 @@ bool apple_sleep_bench_aop_macos_order(void);
 #define APPLE_SLEEP_HYBRID_PCIE_MSI	BIT(13)	/* t602x PCIe ports' MSI doorbell set up again at resume */
 #define APPLE_SLEEP_HYBRID_SMC_EDGE	BIT(14)	/* the SMC's sleep keys read after slpw and before slpa (note 84 §36 R2) */
 #define APPLE_SLEEP_HYBRID_PS_RESTORE	BIT(15)	/* unowned SIO/peripheral PS words on at .enter raised again at .wake (note 77 §14.128) */
+#define APPLE_SLEEP_HYBRID_DCP_EL2	BIT(26)	/* native (EL2): the internal DCP restarted after the cut (task 146) */
 u32 apple_sleep_bench_hybrid(void);
 /* The SMC's driver, after waka at the wake: true and pmVC's value to write again (smc_notify bit 3) */
 bool apple_sleep_bench_pmvc_wake(u32 *value);

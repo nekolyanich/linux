@@ -21,12 +21,17 @@
 #include <linux/phy/apple-atc.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dp-switch.h>
+#include <linux/iopoll.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/workqueue.h>
+
+#include <asm/virt.h>
 
 #include <drm/drm_eld.h>
 #include <drm/drm_fb_dma_helper.h>
@@ -1680,6 +1685,234 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	destroy_piodma_device(dcp);
 }
 
+/*
+ * The DCP's restart after a power cut on the t6020 bench (native5, sleep/t6020-dcp-native, by
+ * function): only at EL2 with apple_sleep.hybrid bits 26 and 9, on the internal DCP. The
+ * configuration every native run with frames after a cut used (task 146: bench_idle 0x268f1388,
+ * bench_afk_open 5), and only its live steps: at the end of the suspend, A500 and an RTKit idle
+ * with the AFK queues stopped between the AP and IOP requests (sleep-seq's table then stops the
+ * CPU); at the resume, the display block's power cycled as macOS does between its boots, the
+ * RTKit session restarted warm with its OSLOG counters echoed, the CPU run and the AFK queues
+ * started again. The bind-time AFK accept/open, the bench's register prints and the hybrid
+ * bit 27 table stop are not carried; nothing here runs on a daily boot.
+ */
+#define DCP_BENCH_EL2_IDLE_MS	5000
+
+static bool dcp_bench_el2(void)
+{
+	return is_kernel_in_hyp_mode() &&
+	       (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_DCP_EL2) &&
+	       (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_DCP_BOOT);
+}
+
+/* The internal DCP only: the HV arms never had the external ones bound */
+static bool dcp_bench_el2_on(struct apple_dcp *dcp)
+{
+	return dcp_bench_el2() && !of_device_is_compatible(dcp->dev->of_node, "apple,dcpext") &&
+	       dcp->coproc_reg && !IS_ERR_OR_NULL(dcp->rtk);
+}
+
+/* The AFK ring endpoints this driver started; macOS stops them between AP and IOP idle */
+static unsigned int dcp_bench_afk_eps(struct apple_dcp *dcp, struct apple_dcp_afkep **eps,
+				      unsigned int max)
+{
+	struct apple_dcp_afkep *all[] = { dcp->systemep, dcp->ibootep, dcp->dcpavservep,
+					  dcp->avep, dcp->dptxep };
+	unsigned int n = 0, i, j;
+
+	for (i = 0; i < ARRAY_SIZE(all) && n < max; i++) {
+		if (IS_ERR_OR_NULL(all[i]) || !completion_done(&all[i]->started))
+			continue;
+		for (j = 0; j < n && eps[j] != all[i]; j++)
+			;
+		if (j == n)
+			eps[n++] = all[i];
+	}
+	return n;
+}
+
+/* 0xa4 stops a started queue and 0xa3 starts it again (aurora's aop_queue_stop) */
+static void dcp_bench_afk_queue_op(struct apple_dcp *dcp, u16 op, const char *when)
+{
+	struct apple_dcp_afkep *eps[8];
+	unsigned int n = dcp_bench_afk_eps(dcp, eps, ARRAY_SIZE(eps)), i;
+
+	for (i = 0; i < n; i++)
+		afk_bench_queue_op(eps[i], op);
+	dev_info(dcp->dev, "bench: afk queue %#x %s: %u endpoints\n", op, when, n);
+}
+
+static void dcp_bench_afk_stop(void *data)
+{
+	dcp_bench_afk_queue_op(data, 0xa4, "after the AP idle request");
+}
+
+/*
+ * macOS idles a DCP over RTKit with interrupts on, AP then IOP 0x201, before its CPU stop
+ * (pdD1); the table's polled idle never got the AP ack (b1i, 9 of 9). So the idle runs here,
+ * last in the suspend, after A500 drained the AP link; the table then only stops the CPU.
+ */
+static void dcp_bench_idle_at_suspend(struct apple_dcp *dcp)
+{
+	ktime_t t0;
+	int ret;
+
+	dcp->bench_idle_ran = false;
+	if (!dcp_bench_el2_on(dcp) || !apple_rtkit_is_running(dcp->rtk))
+		return;
+	t0 = ktime_get();
+	ret = iomfb_s2r_link_sleep(dcp);
+	dev_info(dcp->dev, "bench: dcp link sleep A500: %d after %lld ms\n", ret,
+		 ktime_ms_delta(ktime_get(), t0));
+	t0 = ktime_get();
+	dcp->bench_idle_ret = apple_rtkit_bench_idle(dcp->rtk, DCP_BENCH_EL2_IDLE_MS,
+						     dcp_bench_afk_stop, dcp);
+	dcp->bench_idle_ran = true;
+	dev_info(dcp->dev, "bench: dcp idle at suspend: %d after %lld ms\n", dcp->bench_idle_ret,
+		 ktime_ms_delta(ktime_get(), t0));
+}
+
+static void __iomem *dcp_bench_ps_node_map(struct device_node *ps)
+{
+	struct device_node *pmgr = of_get_parent(ps);
+	struct resource res;
+	void __iomem *p = NULL;
+	u32 off;
+
+	if (pmgr && !of_property_read_u32_index(ps, "reg", 0, &off) &&
+	    !of_address_to_resource(pmgr, 0, &res))
+		p = (res.flags & IORESOURCE_MEM_NONPOSTED) ? ioremap_np(res.start + off, 4) :
+							      ioremap(res.start + off, 4);
+	of_node_put(pmgr);
+	return p;
+}
+
+static int dcp_bench_ps_set(void __iomem *p, u32 val, u32 actual)
+{
+	u32 v;
+
+	writel(val, p);
+	return readl_poll_timeout(p, v, ((v >> 4) & 0xf) == actual, 10, 10000);
+}
+
+static struct device *dcp_bench_dart_dev(struct device_node *np, const char *prop)
+{
+	struct of_phandle_args args;
+	struct platform_device *pdev;
+
+	if (!np || of_parse_phandle_with_args(np, prop, "#iommu-cells", 0, &args))
+		return NULL;
+	pdev = of_find_device_by_node(args.np);
+	of_node_put(args.np);
+	return pdev ? &pdev->dev : NULL;
+}
+
+/*
+ * Between its boots 1 and 2 at the wake, macOS powers the whole display block off and on
+ * (pdD1/pdD6: cpu0 0xf0400ff, 0xf0403f0; fe and sys 0x3f0; then sys and fe 0 -> 0xf ->
+ * 0x1000000f and cpu0 0xf040000 -> 0xf04000f -> 0x1f04000f). Our restart never turns sys or fe
+ * off. The block's DARTs (dart-dcp0, and piodma's dart-disp0) lose their state with it: held
+ * with their runtime reference across it, and put back before the restart's RUN.
+ */
+static void dcp_bench_disp0_cycle(struct apple_dcp *dcp)
+{
+	struct device_node *np = dcp->dev->of_node, *cpu0, *fe = NULL, *sys = NULL, *child;
+	void __iomem *pc = NULL, *pf = NULL, *ps = NULL;
+	struct device *darts[2];
+	int held[2] = { -ENODEV, -ENODEV }, r[6] = { 0 }, i;
+
+	cpu0 = of_parse_phandle(np, "resets", 0);
+	if (cpu0)
+		fe = of_parse_phandle(cpu0, "power-domains", 0);
+	if (fe)
+		sys = of_parse_phandle(fe, "power-domains", 0);
+	if (cpu0 && fe && sys) {
+		pc = dcp_bench_ps_node_map(cpu0);
+		pf = dcp_bench_ps_node_map(fe);
+		ps = dcp_bench_ps_node_map(sys);
+	}
+	of_node_put(sys);
+	of_node_put(fe);
+	of_node_put(cpu0);
+	darts[0] = dcp_bench_dart_dev(np, "iommus");
+	child = of_get_child_by_name(np, "piodma");
+	darts[1] = dcp_bench_dart_dev(child, "iommus");
+	of_node_put(child);
+	if (!pc || !pf || !ps) {
+		dev_info(dcp->dev, "bench: disp0 cycle: PS words not mapped, skipped\n");
+		goto out;
+	}
+
+	for (i = 0; i < 2; i++)
+		if (darts[i])
+			held[i] = apple_dart_sleep_hold(darts[i]);
+	dev_info(dcp->dev, "bench: disp0 cycle: before cpu0 %#x fe %#x sys %#x, darts held %d %d\n",
+		 readl(pc), readl(pf), readl(ps), held[0], held[1]);
+
+	writel(0xf0400ff, pc);
+	r[0] = dcp_bench_ps_set(pc, 0xf0403f0, 0);
+	r[1] = dcp_bench_ps_set(pf, 0x3f0, 0);
+	r[2] = dcp_bench_ps_set(ps, 0x3f0, 0);
+	/* Off for a while, as macOS (~10 ms) and aurora's T6050 cycle (12 ms): a stopped core needs it */
+	msleep(12);
+	r[3] = dcp_bench_ps_set(ps, 0xf, 0xf);
+	writel(0x1000000f, ps);
+	r[4] = dcp_bench_ps_set(pf, 0xf, 0xf);
+	writel(0x1000000f, pf);
+	writel(0xf040000, pc);
+	r[5] = dcp_bench_ps_set(pc, 0xf04000f, 0xf);
+	writel(0x1f04000f, pc);
+
+	for (i = 0; i < 2; i++)
+		if (darts[i] && !held[i])
+			apple_dart_sleep_restore_lost(darts[i], true);
+	dev_info(dcp->dev, "bench: disp0 cycle: on cpu0 %#x fe %#x sys %#x (%d %d %d %d %d %d), darts restored\n",
+		 readl(pc), readl(pf), readl(ps), r[0], r[1], r[2], r[3], r[4], r[5]);
+out:
+	for (i = 0; i < 2; i++)
+		if (darts[i])
+			put_device(darts[i]);
+	if (pc)
+		iounmap(pc);
+	if (pf)
+		iounmap(pf);
+	if (ps)
+		iounmap(ps);
+}
+
+/*
+ * The sleep's table stopped the CPU (CPU_CONTROL 0) and nothing starts it again: without the
+ * restart dcp_poweron() waits on a firmware that isn't running. Start it from the image it
+ * kept: the display block cycled, RTKit restarted warm (its OSLOG counters echoed from here on,
+ * or it refuses its next idle), the run bit, the boot, and the AFK queues started again.
+ */
+static void dcp_bench_boot(struct apple_dcp *dcp)
+{
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	ktime_t t0 = ktime_get();
+	int ret;
+
+	if (!dcp_bench_el2_on(dcp) || (readl(control) & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+		return;
+
+	dcp_bench_disp0_cycle(dcp);
+	WRITE_ONCE(dcp->crashed, false);
+	apple_rtkit_set_oslog_echo(dcp->rtk, true);
+	ret = apple_rtkit_warm_restart(dcp->rtk);
+	if (ret) {
+		dev_err(dcp->dev, "bench: dcp-boot: RTKit warm restart failed: %d\n", ret);
+		return;
+	}
+	writel(APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+	ret = apple_rtkit_boot(dcp->rtk);
+	dev_info(dcp->dev, "bench: dcp-boot: boot %d after %lld ms: CPU_CONTROL %#x, rtkit %s\n",
+		 ret, ktime_ms_delta(ktime_get(), t0), readl(control),
+		 apple_rtkit_is_running(dcp->rtk) ? "running" : "not running");
+	/* As macOS after every AP ON: the queues stopped at suspend start again */
+	if (!ret)
+		dcp_bench_afk_queue_op(dcp, 0xa3, "after the boot");
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -1698,6 +1931,8 @@ static int dcp_platform_suspend(struct device *dev)
 	 * shutdown properly yet.
 	 */
 	device_set_wakeup_path(dev);
+	/* Last: the steps above still talk to the coprocessor (bench only) */
+	dcp_bench_idle_at_suspend(dcp);
 
 	return 0;
 }
@@ -1705,6 +1940,9 @@ static int dcp_platform_suspend(struct device *dev)
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	/* First: nothing below may talk to a firmware the sleep's table stopped (bench only) */
+	dcp_bench_boot(dcp);
 
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);

@@ -19,6 +19,7 @@
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/minmax.h>
@@ -1789,6 +1790,26 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 
 	return 0;
 }
+
+/*
+ * Its consumer's own power cycle, outside a system sleep: the registers saved and put back.
+ * Only for a device apple-dart is bound to.
+ */
+int apple_dart_state_save(struct device *dev)
+{
+	if (dev->driver != &apple_dart_driver.driver || !dev_get_drvdata(dev))
+		return -ENODEV;
+	return apple_dart_suspend(dev);
+}
+EXPORT_SYMBOL_GPL(apple_dart_state_save);
+
+int apple_dart_state_restore(struct device *dev)
+{
+	if (dev->driver != &apple_dart_driver.driver || !dev_get_drvdata(dev))
+		return -ENODEV;
+	return apple_dart_resume(dev);
+}
+EXPORT_SYMBOL_GPL(apple_dart_state_restore);
 
 static DEFINE_RUNTIME_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume, NULL);
 

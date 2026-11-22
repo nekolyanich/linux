@@ -56,6 +56,7 @@
 #include <linux/limits.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/irqchip/irq-apple-aic.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/cputype.h>
 #include <asm/exception.h>
@@ -343,6 +344,8 @@ struct aic_irq_chip {
 	int nr_die;
 	int max_die;
 
+	u32 *sleep_masks;
+
 	struct aic_info info;
 };
 
@@ -360,6 +363,47 @@ static u32 aic_ic_read(struct aic_irq_chip *ic, u32 reg)
 static void aic_ic_write(struct aic_irq_chip *ic, u32 reg, u32 val)
 {
 	writel_relaxed(val, ic->base + reg);
+}
+
+/*
+ * A sleep that a firmware engine finishes waits for the CPUs to stop, and a raised
+ * line ends WFI even with interrupts off. Every line is masked for that last step.
+ */
+void aic_sleep_mask_all(void)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 words = ic->max_irq >> 5, off = 0, reg, i;
+	u32 *saved = ic->sleep_masks;
+	int die;
+
+	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
+		for (i = 0; i < words; i++) {
+			reg = ic->info.mask_set + off + i * 4;
+			*saved++ = aic_ic_read(ic, reg);
+			aic_ic_write(ic, reg, U32_MAX);
+		}
+	}
+}
+
+void aic_sleep_restore(void)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 words = ic->max_irq >> 5, off = 0, i;
+	u32 *saved = ic->sleep_masks;
+	int die;
+
+	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
+		for (i = 0; i < words; i++, saved++) {
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, *saved);
+			aic_ic_write(ic, ic->info.mask_clr + off + i * 4, ~*saved);
+		}
+	}
+}
+
+/* Takes the next event, which also masks its line. */
+u32 aic_sleep_ack(void)
+{
+	return readl(aic_irqc->event + aic_irqc->info.event);
 }
 
 /*
@@ -1047,6 +1091,11 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		static_branch_disable(&use_local_fast_ipi);
 
 	irqc->info.die_stride = off - start_off;
+
+	irqc->sleep_masks = kcalloc(irqc->nr_die * (irqc->max_irq >> 5),
+				    sizeof(*irqc->sleep_masks), GFP_KERNEL);
+	if (WARN_ON(!irqc->sleep_masks))
+		goto err_unmap;
 
 	irqc->hw_domain = irq_domain_create_tree(of_fwnode_handle(node),
 						 &aic_irq_domain_ops, irqc);

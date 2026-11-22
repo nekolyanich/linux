@@ -15,6 +15,9 @@
 #include <asm/smp_plat.h>
 
 extern const struct cpu_operations smp_spin_table_ops;
+#ifdef CONFIG_HOTPLUG_CPU
+extern const struct cpu_operations smp_rvbar_spin_table_ops;
+#endif
 #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
 extern const struct cpu_operations acpi_parking_protocol_ops;
 #endif
@@ -24,6 +27,9 @@ static const struct cpu_operations *cpu_ops[NR_CPUS] __ro_after_init;
 
 static const struct cpu_operations *const dt_supported_cpu_ops[] __initconst = {
 	&smp_spin_table_ops,
+#ifdef CONFIG_HOTPLUG_CPU
+	&smp_rvbar_spin_table_ops,
+#endif
 	&cpu_psci_ops,
 	NULL,
 };
@@ -93,6 +99,22 @@ static const char *__init cpu_read_enable_method(int cpu)
 
 	return enable_method;
 }
+#ifdef CONFIG_HOTPLUG_CPU
+/*
+ * spin_table_park: the spin-table CPUs park, as with a boot object's mailbox, without one.
+ * For a hypervisor that owns the reset vectors (the m1n1 bench), where a parked CPU's way
+ * back is the hypervisor's, and nothing comes back without it.
+ */
+static bool spin_table_park __initdata;
+
+static int __init spin_table_park_setup(char *arg)
+{
+	spin_table_park = true;
+	return 0;
+}
+early_param("spin_table_park", spin_table_park_setup);
+#endif
+
 /*
  * Read a cpu's enable method and record it in cpu_ops.
  */
@@ -108,6 +130,19 @@ int __init init_cpu_ops(int cpu)
 		pr_warn("Unsupported enable-method: %s\n", enable_method);
 		return -EOPNOTSUPP;
 	}
+
+#ifdef CONFIG_HOTPLUG_CPU
+	/*
+	 * A boot object that sends a reset CPU back through its release address
+	 * says so with /chosen/aurora,s2r-mailbox. Its spin-table CPUs can then
+	 * leave the kernel, through the parking spin table.
+	 */
+	if (cpu_ops[cpu] == &smp_spin_table_ops &&
+	    (spin_table_park || of_property_present(of_chosen, "aurora,s2r-mailbox"))) {
+		cpu_ops[cpu] = &smp_rvbar_spin_table_ops;
+		pr_info_once("spin-table CPUs can park: the boot object brings them back\n");
+	}
+#endif
 
 	return 0;
 }

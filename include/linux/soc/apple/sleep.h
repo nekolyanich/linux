@@ -179,6 +179,8 @@ void apple_sleep_sep_early_set(struct device *dev, bool wired);
 /* An external DCP's driver stopped it for this sleep, or brought it back */
 void apple_sleep_dispext_down(struct device *dev, bool down);
 bool apple_sleep_sep_early_wired(void);
+/* The SEP driver's sleep gate for the entry crumb: 0 open, 1 draining, 2 told, 3 lost, 4 refused */
+void apple_sleep_sep_gate_set(u8 gate);
 
 
 /*
@@ -369,6 +371,10 @@ static inline void apple_sleep_dispext_down(struct device *dev, bool down)
 static inline bool apple_sleep_sep_early_wired(void)
 {
 	return false;
+}
+
+static inline void apple_sleep_sep_gate_set(u8 gate)
+{
 }
 
 static inline void apple_sleep_lid_closed_wake(void)

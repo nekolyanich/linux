@@ -1325,6 +1325,7 @@ impl SepData {
                 pm::crumb(0x5d);
                 let _ = pm::dart_hold(&self.dev, false);
                 self.set_sleep_gate(pm::SleepGate::Open);
+                pm::publish_refused();
                 dev_err!(self.dev, "early sleep: the enclave refused the SLEEP ({:#x}); sleep refused\n", r.param);
                 return Err(EBUSY);
             }

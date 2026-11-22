@@ -500,6 +500,15 @@ bool apple_sleep_sep_early_wired(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_sep_early_wired);
 
+static u8 aseq_sep_gate;
+static unsigned int aseq_dispext_on(struct apple_sleep_seq *s);
+
+void apple_sleep_sep_gate_set(u8 gate)
+{
+	WRITE_ONCE(aseq_sep_gate, gate);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_sep_gate_set);
+
 /* For sleep.c's co-processor registry, which refuses below EL2 off the bench */
 bool apple_sleep_seq_bench(void)
 {
@@ -1419,6 +1428,15 @@ static void aseq_pmu_run(struct apple_sleep_seq *s, const struct apple_sleep_op 
 	switch (op->kind) {
 	case SEQ_PMU_W8:
 		buf[0] = op->val;
+		/*
+		 * Bench, with crumbs on only (macOS's 0x50 otherwise): the entry's boot_stage
+		 * carries the SEP's sleep gate in bits 2:0 (0 open, 1 draining, 2 told: it took
+		 * the SLEEP, 3 lost, 4 refused) and bit 3: a dispext PS word still on.
+		 */
+		if (op->off == PMU_BOOT_STAGE && op->val == PMU_BOOT_STAGE_SLEEP &&
+		    apple_spmi_boot_crumb_on())
+			buf[0] = PMU_BOOT_STAGE_SLEEP | (READ_ONCE(aseq_sep_gate) & 7) |
+				 (aseq_dispext_on(s) ? 0x08 : 0);
 		ret = aseq_spmi(s, op->off, buf, 1, NULL, 0);
 		break;
 	case SEQ_PMU_R:
@@ -2181,6 +2199,27 @@ static void aseq_dispext_print(struct apple_sleep_seq *s, const char *when)
 		 readq(s->base[soc->report_blk] + soc->report_status));
 }
 
+/* How many of the dispext PS words (cpu0 and the rows it lowers) aren't at actual 0 */
+static unsigned int aseq_dispext_on(struct apple_sleep_seq *s)
+{
+	const struct apple_sleep_seq_soc *soc = s->soc;
+	unsigned int i, on = 0;
+
+	for_each_set_bit(i, s->dispext_rows, soc->nentry) {
+		const struct apple_sleep_op *op = &soc->entry[i];
+		u32 ps;
+
+		if (op->kind == SEQ_COPROC_STOP)
+			ps = readl(s->base[op->val >> 32] + (u32)op->val);
+		else if (op->kind == SEQ_PS_LOWER)
+			ps = readl(s->base[op->blk] + op->off);
+		else
+			continue;
+		on += !!FIELD_GET(PS_ACTUAL, ps);
+	}
+	return on;
+}
+
 /* One external DCP's request withdrawn from the PMP report, the others left as they are */
 static void aseq_dispext_report(struct apple_sleep_seq *s, unsigned int d)
 {
@@ -2557,6 +2596,9 @@ static int aseq_begin(suspend_state_t state)
 		aseq_dispext_owned(s);
 	/* No "down" left from an earlier sleep: their drivers set it again at their suspend */
 	WRITE_ONCE(aseq_dispext_down, 0);
+	/* Nor the SEP's refusal of one: its gate is set again by its .suspend */
+	if (READ_ONCE(aseq_sep_gate) == 4)
+		WRITE_ONCE(aseq_sep_gate, 0);
 	if (state == PM_SUSPEND_MEM && bench && dispext_off == 2 && s->dispext_rows) {
 		aseq_dispext_print(s, "begin");
 		aseq_dispext_run(s, "begin");

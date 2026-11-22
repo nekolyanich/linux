@@ -15,10 +15,16 @@
 
 #if IS_REACHABLE(CONFIG_SPMI_APPLE)
 int apple_spmi_boot_crumb(u8 stage);
+bool apple_spmi_boot_crumb_on(void);
 #else
 static inline int apple_spmi_boot_crumb(u8 stage)
 {
 	return -ENODEV;
+}
+
+static inline bool apple_spmi_boot_crumb_on(void)
+{
+	return false;
 }
 #endif
 

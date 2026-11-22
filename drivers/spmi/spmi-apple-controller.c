@@ -637,6 +637,13 @@ int apple_spmi_boot_crumb(u8 stage)
 }
 EXPORT_SYMBOL_GPL(apple_spmi_boot_crumb);
 
+/* Whether crumbs are on (native EL2 with boot_crumb): for writers that encode their own */
+bool apple_spmi_boot_crumb_on(void)
+{
+	return boot_crumb && is_kernel_in_hyp_mode();
+}
+EXPORT_SYMBOL_GPL(apple_spmi_boot_crumb_on);
+
 /* Write-only, the test-initrd's witness: 0x31..0x3f only */
 static int apple_spmi_pmu_stage_set(const char *val, const struct kernel_param *kp)
 {

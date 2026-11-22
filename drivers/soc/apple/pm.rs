@@ -96,6 +96,12 @@ pub(crate) fn gated(dev: &kernel::device::Device) -> bool {
     unsafe { sep_pm_gated(dev.as_raw().cast()) }
 }
 
+/// The enclave refused the last SLEEP (4 in sysfs and the bench's entry crumb).
+pub(crate) fn publish_refused() {
+    // SAFETY: no preconditions.
+    unsafe { sep_pm_set_gate(4) };
+}
+
 /// The gate as sysfs shows it (`sleep_gate`).
 pub(crate) fn publish_gate(gate: SleepGate) {
     // SAFETY: no preconditions.

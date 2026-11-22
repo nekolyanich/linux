@@ -262,11 +262,12 @@ const struct dev_pm_ops sep_pm_ops = {
 
 /* The driver's SleepGate (open, draining, told, lost), for sysfs; rv-sepkey's (d) */
 static u32 sep_pm_gate;
-static const char *const sep_pm_gate_names[] = { "open", "draining", "told", "lost" };
+static const char *const sep_pm_gate_names[] = { "open", "draining", "told", "lost", "refused" };
 
 void sep_pm_set_gate(u32 gate)
 {
 	WRITE_ONCE(sep_pm_gate, gate);
+	apple_sleep_sep_gate_set(gate);
 }
 
 static ssize_t sleep_gate_show(struct device *dev, struct device_attribute *attr, char *buf)

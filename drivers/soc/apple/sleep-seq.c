@@ -275,6 +275,8 @@ enum apple_sleep_op_kind {
 	SEQ_COPROC_STOP,	/* apple,coprocs[off]'s driver idles and stops it; then as SEQ_ASC_STOP if it runs */
 	SEQ_COPROC_IDLE,	/* apple,coprocs[off]'s driver's stop only; a later SEQ_COPROC_STOP of it then does nothing */
 	SEQ_SEP_SLEEP,		/* the SEP driver's staged SLEEP, sent; nonzero refuses the commit */
+	SEQ_CRUMB,		/* hybrid bit 28 (and bit off, if nonzero): PMU boot_stage <- val */
+	SEQ_ENTRY2,		/* hybrid bit 28: BUSY-latched PS words unlatched, ANS's bridge bit 0 put back, crumbs; before commit 1 */
 };
 
 /* SEQ_ASC_STOP's val: the CPU's PS word, block and offset */
@@ -901,6 +903,8 @@ static void aseq_core_regs(void)
 	isb();
 }
 
+static void aseq_boot_crumb(void);
+
 static void aseq_deep_request(bool last_of_cluster, bool boot)
 {
 	u64 v;
@@ -942,6 +946,8 @@ static void aseq_deep_request(bool last_of_cluster, bool boot)
 		dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
 		dsb(sy);
 	}
+	if (boot)
+		aseq_boot_crumb();
 	write_sysreg_s(v | CYC_OVRD_DEEP, SYS_IMP_APL_CYC_OVRD);
 }
 
@@ -1523,6 +1529,221 @@ static int aseq_coproc_stop(struct apple_sleep_seq *s, unsigned int i)
 }
 
 /* One step of the entry, after its word is saved. Interrupts off, no printing. */
+/*
+ * Hybrid bit 28 (note 86, cycle 2 of a boot cuts 0 of 6): aurora's T6040 second sleep of a boot "waited and the
+ * chip reset" because the wake had armed ANS's fabric bridge (+0x104/+0x108 bit 0, 05312c21) and left BUSY latched
+ * on PS words (apple_sleep_ps_unlatch). Here, right before commit 1: every PS word with BUSY (bit 11) and target and
+ * actual 0 is unlatched aurora's way (off | bit 12, wait BUSY clear, off); ANS's bridge (ADT pmgr reg[48+15],
+ * 0x349000000) is read while ANS is on, the first entry's words kept, and on a later entry bit 0 of +0x104/+0x108
+ * is put back to the first entry's. Crumbs (PMU boot_stage, after the table's 0x50): 0x5d a PS word still BUSY,
+ * 0x5e the bridge's bit 0 differed, 0x5f both, 0x5b none of them (the row ran, the ANS bridge read), 0x5a none and the bridge not read.
+ */
+#define ASEQ_HYBRID_ENTRY2	BIT(28)
+/*
+ * m2pro-7.3.4 (b5w): bit 28 is a witness only: its crumbs are the only write (PMU boot_stage). native14's
+ * actions (the unlatch, the bridge's bit 0 put back) are compiled out: native14 found nothing to act on (0x5b,
+ * 2 of 2), and no hybrid bit is free for them here. The crumb values keep native14's meaning, read before any
+ * action: 0x5d a word stays BUSY-latched, 0x5e the bridge's bit 0 differs from entry 1, 0x5f both.
+ */
+#define ASEQ_HYBRID_ENTRY2_ACT	0U
+#define ASEQ_PS_BUSY		BIT(11)
+#define ASEQ_PS_UNLATCH		BIT(12)
+#define ASEQ_PS_DEV_DISABLE	BIT(10)
+#define ASEQ_ANS_BRIDGE_PA	0x349000000ULL
+#define ASEQ_BRIDGE_104		0x104
+#define ASEQ_BRIDGE_108		0x108
+
+/*
+ * Hybrid bit 31 (native17/18): the state witnesses as boot_stage values only, no other PMU cell (note
+ * native16-pmu-cells.md). At each entry (entry2's row) the PS words are compared with the first entry's snapshot
+ * (TARGET, ACTUAL, BUSY). With hybrid bit 29 the post-commit-2 crumb (0x63's spot) names the first differing word
+ * (index = position in the DT's pmgr-pwrstate nodes, notes/sleep/ps-index-j416s.txt): 0x73 none, 0x81 + (idx - 32)
+ * for idx 32..47 (0x81..0x90), 0x91 any other. With bits 29 and 30 the crumb before cpu0's CYC_OVRD write (0x64's
+ * spot) names what differs in that word instead: 0x91 + (mask - 1), mask = 1 TARGET, 2 ACTUAL, 4 BUSY ORed
+ * (0x91..0x97), 0x73 none; the first word is the one the other arm names. With bit 30 alone that crumb is 0x66 + N,
+ * N = CPUs stopped by the table but not confirmed down (0..11), or 0x72 if it stopped fewer than nr_cpu_ids - 1.
+ */
+#define ASEQ_HYBRID_STATE_DUMP	BIT(31)
+static unsigned int aseq_entries;
+static u32 aseq_ans_first[3];
+static void __iomem *aseq_ans_bridge;
+static u32 *aseq_ps_first;
+static u8 aseq_ps_crumb = 0x73;
+static u8 aseq_ps_field = 0x73;
+
+static void aseq_dump_map(struct apple_sleep_seq *s)
+{
+	if (!(READ_ONCE(hybrid) & ASEQ_HYBRID_STATE_DUMP))
+		return;
+	if (!aseq_ps_first)
+		aseq_ps_first = kcalloc(s->nps, sizeof(u32), GFP_KERNEL);
+}
+
+static void aseq_dump_ps(struct apple_sleep_seq *s)
+{
+	unsigned int i, first = UINT_MAX, fields = 0;
+	const u32 mask = PS_TARGET | PS_ACTUAL | ASEQ_PS_BUSY;
+
+	if (!aseq_ps_first)
+		return;
+	for (i = 0; i < s->nps; i++) {
+		u32 v = readl(s->ps[i].reg) & mask;
+
+		if (!aseq_entries)
+			aseq_ps_first[i] = v;
+		else if (v != aseq_ps_first[i] && first == UINT_MAX) {
+			u32 x = v ^ aseq_ps_first[i];
+
+			first = i;
+			fields = (x & PS_TARGET ? 1 : 0) | (x & PS_ACTUAL ? 2 : 0) | (x & ASEQ_PS_BUSY ? 4 : 0);
+		}
+	}
+	if (first == UINT_MAX)
+		aseq_ps_crumb = aseq_ps_field = 0x73;
+	else {
+		aseq_ps_crumb = first >= 32 && first <= 47 ? 0x81 + (first - 32) : 0x91;
+		aseq_ps_field = 0x91 + (fields - 1);
+	}
+	pr_emerg("apple-sleep: entry2: entry %u: first PS word differing from entry 1: %d, fields %#x (crumbs %#x, %#x)\n",
+		 aseq_entries + 1, first == UINT_MAX ? -1 : (int)first, fields, aseq_ps_crumb, aseq_ps_field);
+}
+
+/*
+ * Entry-step crumbs (PMU boot_stage, one SPMI write each) with hybrid bit 28; 0x60 after the AIC mask (commit 1 is
+ * taken), 0x61 alarm armed, 0x62 before commit 2 (before its wait: inside the 0.52 ms gap's slack) always;
+ * 0x63 after commit 2 (hybrid bit 29) and 0x64 right before cpu0's CYC_OVRD write (hybrid bit 30) only when asked:
+ * a PMU write after commit 2 may collide with the engine's own SPMI traffic.
+ */
+static void aseq_crumb_raw(struct apple_sleep_seq *s, u8 c, u32 extra_bit)
+{
+	u32 h = READ_ONCE(hybrid);
+
+	if (!(h & ASEQ_HYBRID_ENTRY2) || (extra_bit && !(h & BIT(extra_bit))))
+		return;
+	aseq_spmi(s, PMU_BOOT_STAGE, &c, 1, NULL, 0);
+}
+
+static void aseq_crumb(struct apple_sleep_seq *s, u64 val, u32 extra_bit)
+{
+	u8 c = val;
+
+	if (val == 0x63 && (READ_ONCE(hybrid) & ASEQ_HYBRID_STATE_DUMP))
+		c = aseq_ps_crumb;
+	aseq_crumb_raw(s, c, extra_bit);
+}
+
+/* hybrid bit 30: crumb 0x64, right before cpu0's CYC_OVRD write (the last AP instruction before the WFI) */
+static void aseq_boot_crumb(void)
+{
+	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);
+
+	u8 c = 0x64;
+
+	if (!s)
+		return;
+	if ((READ_ONCE(hybrid) & (ASEQ_HYBRID_STATE_DUMP | BIT(29) | BIT(30))) ==
+	    (ASEQ_HYBRID_STATE_DUMP | BIT(29) | BIT(30))) {
+		c = aseq_ps_field;
+	} else if (READ_ONCE(hybrid) & ASEQ_HYBRID_STATE_DUMP) {
+		int stopped = atomic_read(&aseq_stopped), down = atomic_read(&aseq_down);
+
+		if (stopped < (int)nr_cpu_ids - 1)
+			c = 0x72;
+		else
+			c = 0x66 + clamp(stopped - down, 0, 11);
+	}
+	/* aseq_crumb() writes val; the state value is passed through the same hybrid-bit gating */
+	aseq_crumb_raw(s, c, 30);
+}
+
+static void aseq_entry2_map(void)
+{
+	if (!(READ_ONCE(hybrid) & ASEQ_HYBRID_ENTRY2) || aseq_ans_bridge)
+		return;
+	aseq_ans_bridge = ioremap_np(ASEQ_ANS_BRIDGE_PA, SZ_4K);
+}
+
+static void aseq_entry2(struct apple_sleep_seq *s)
+{
+	unsigned int i, still_busy = 0, unlatched = 0;
+	bool ans_on = false, differed = false, bridge_read = false;
+	u8 crumb = 0;
+
+	if (!(READ_ONCE(hybrid) & ASEQ_HYBRID_ENTRY2))
+		return;
+
+	for (i = 0; i < s->nps; i++) {
+		u32 v = readl(s->ps[i].reg), off;
+
+		if (s->ps[i].name && strstr(s->ps[i].name, "ans2") && FIELD_GET(PS_ACTUAL, v) == PS_ON)
+			ans_on = true;
+		if (!(v & ASEQ_PS_BUSY) || (v & (PS_ACTUAL | PS_TARGET)))
+			continue;
+		/* A switch still finishing reads BUSY for a moment: only one that stays is a latch */
+		if (!readl_poll_timeout_atomic(s->ps[i].reg, v, !(v & ASEQ_PS_BUSY), 1, 1000))
+			continue;
+		off = v & ~(PS_AUTO_ENABLE | PS_FLAGS | ASEQ_PS_BUSY | ASEQ_PS_UNLATCH | ASEQ_PS_DEV_DISABLE);
+		/* m2pro-7.3.4 (b5w): a witness only, aurora's unlatch with ASEQ_HYBRID_ENTRY2_ACT */
+		if (READ_ONCE(hybrid) & ASEQ_HYBRID_ENTRY2_ACT) {
+			writel(off | ASEQ_PS_UNLATCH, s->ps[i].reg);
+			readl_poll_timeout_atomic(s->ps[i].reg, v, !(v & ASEQ_PS_BUSY), 1, 5000);
+			writel(off, s->ps[i].reg);
+			unlatched++;
+		}
+		pr_emerg("apple-sleep: entry2: %s BUSY-latched%s: %#x -> %#x\n", s->ps[i].name,
+			 unlatched ? ", unlatched" : "", v, readl(s->ps[i].reg));
+	}
+	for (i = 0; i < s->nps; i++)
+		if (readl(s->ps[i].reg) & ASEQ_PS_BUSY)
+			still_busy++;
+
+	if (aseq_ans_bridge && ans_on) {
+		u32 w[3] = { readl(aseq_ans_bridge), readl(aseq_ans_bridge + ASEQ_BRIDGE_104),
+			     readl(aseq_ans_bridge + ASEQ_BRIDGE_108) };
+
+		if (!aseq_entries) {
+			memcpy(aseq_ans_first, w, sizeof(w));
+		} else {
+			unsigned int k;
+
+			for (k = 1; k < 3; k++) {
+				u32 off = k == 1 ? ASEQ_BRIDGE_104 : ASEQ_BRIDGE_108;
+
+				if ((w[k] ^ aseq_ans_first[k]) & BIT(0)) {
+					differed = true;
+					if (READ_ONCE(hybrid) & ASEQ_HYBRID_ENTRY2_ACT)
+						writel((w[k] & ~BIT(0)) | (aseq_ans_first[k] & BIT(0)),
+						       aseq_ans_bridge + off);
+				}
+			}
+		}
+		bridge_read = true;
+		pr_emerg("apple-sleep: entry2: entry %u: ANS bridge +0 %#x +104 %#x +108 %#x (first %#x %#x %#x)%s\n",
+			 aseq_entries + 1, w[0], w[1], w[2], aseq_ans_first[0], aseq_ans_first[1],
+			 aseq_ans_first[2], !differed ? "" :
+			 (READ_ONCE(hybrid) & ASEQ_HYBRID_ENTRY2_ACT) ? ", bit 0 put back" : ", bit 0 differs");
+	} else {
+		pr_emerg("apple-sleep: entry2: entry %u: ANS bridge not read (mapped %d, ANS on %d)\n",
+			 aseq_entries + 1, !!aseq_ans_bridge, ans_on);
+	}
+	pr_emerg("apple-sleep: entry2: entry %u: %u PS words unlatched, %u still BUSY\n", aseq_entries + 1,
+		 unlatched, still_busy);
+
+	if (still_busy && differed)
+		crumb = 0x5f;
+	else if (still_busy)
+		crumb = 0x5d;
+	else if (differed)
+		crumb = 0x5e;
+	else
+		crumb = bridge_read ? 0x5b : 0x5a;	/* ran, found nothing; 0x5a: but the ANS bridge was not read */
+	if (READ_ONCE(hybrid) & ASEQ_HYBRID_STATE_DUMP)
+		aseq_dump_ps(s);
+	if (aseq_spmi(s, PMU_BOOT_STAGE, &crumb, 1, NULL, 0))
+		pr_emerg("apple-sleep: entry2: crumb %#x not written\n", crumb);
+	aseq_entries++;
+}
+
 static void aseq_op_run(struct apple_sleep_seq *s, const struct apple_sleep_op *op, u64 found,
 			unsigned int step)
 {
@@ -1653,6 +1874,12 @@ static void aseq_op_run(struct apple_sleep_seq *s, const struct apple_sleep_op *
 		writel((wd2_s ? wd2_s : op->val) * WDT_TICKS_PER_S, reg + WDT_BITE);
 		writel(WDT_CTL_RESET, reg + WDT_CTL);
 		break;
+	case SEQ_ENTRY2:
+		aseq_entry2(s);
+		break;
+	case SEQ_CRUMB:
+		aseq_crumb(s, op->val, op->off);
+		break;
 	case SEQ_GATE:
 		break;
 	case SEQ_COPROC_IDLE:
@@ -1768,7 +1995,7 @@ static const char *const aseq_kind_names[] = {
 	[SEQ_DELAY] = "delay", [SEQ_DEADLINE] = "deadline", [SEQ_CPUS_STOP] = "cpus-stop",
 	[SEQ_BOOT_DEEP] = "boot-deep", [SEQ_PMU_W8] = "PMU-W8", [SEQ_PMU_R] = "PMU-R",
 	[SEQ_PMU_RTC_NOW] = "PMU-RTC-now", [SEQ_PMU_ALARM] = "PMU-alarm", [SEQ_AIC_MASK] = "AIC-mask",
-	[SEQ_MARK] = "mark", [SEQ_UNTIL] = "until", [SEQ_GATE] = "gate", [SEQ_WD2] = "WD2",
+	[SEQ_MARK] = "mark", [SEQ_UNTIL] = "until", [SEQ_GATE] = "gate", [SEQ_ENTRY2] = "entry2", [SEQ_CRUMB] = "crumb", [SEQ_WD2] = "WD2",
 	[SEQ_ASC_STOP] = "ASC-stop", [SEQ_COPROC_STOP] = "coproc-stop",
 	[SEQ_COPROC_IDLE] = "coproc-idle", [SEQ_SEP_SLEEP] = "SEP-sleep",
 };
@@ -2361,6 +2588,10 @@ static int aseq_begin(suspend_state_t state)
 		aseq_pmu_begin(s);
 	if (state == PM_SUSPEND_MEM && s->soc == &t6020_sleep_seq)
 		aseq_wake_pmu_map();
+	if (state == PM_SUSPEND_MEM)
+		aseq_entry2_map();
+	if (state == PM_SUSPEND_MEM)
+		aseq_dump_map(s);
 	/*
 	 * On the boot CPU, as macOS does all of its entry: the writer of /sys/power/state may be
 	 * anywhere (pd335: cpu5, whose read of a cluster word the bench's HV couldn't take).
@@ -4025,18 +4256,23 @@ static const struct apple_sleep_op t6020_entry[] = {
 	OP(EDGE_W32, NUB_SPMI, 0x40, SEQ_PS_EDGE_VAL(17, 0x2000001, 0), ALL, "EDGEON nub-spmi0 +0x40 NOTIFY_ENABLE <- 0x2000001 (macOS)"),
 	OP(EDGE_W32, NUB_SPMI, 0x20, SEQ_PS_EDGE_VAL(16, 0x4, 0), ALL, "EDGEON nub-spmi0 enable +0x20 <- 0x4 (macOS)"),
 	OP(EDGE_W32, NUB_SPMI, 0x24, SEQ_PS_EDGE_VAL(16, 0x40000000, 0), ALL, "EDGEON nub-spmi0 enable +0x24 <- 0x40000000 (macOS)"),
+	OP(ENTRY2, PMGR, 0, 0, COMMIT, "Linux: hybrid bit 28, the second entry of a boot (note 86 cycle 2): unlatch BUSY words, ANS bridge, crumbs"),
 	OP(GATE, PMGR, 0, SEQ_GATE_PMU | SEQ_GATE_RTC, COMMIT, "Linux: no commit 1 on a PMU failure or a bad RTC"),
 	W32(COMMIT, 0x4000, 1, COMMIT, "n24 #30 C15 commit 1"),
 	OP(MARK, PMGR, 0, 0, COMMIT, "commit 1's time"),
 	OP(AIC_MASK, PMGR, 0, 0, AIC, "n24 #31 C16 AIC mask-all"),
+	OP(CRUMB, PMGR, 0, 0x60, COMMIT, "Linux: crumb 0x60, commit 1 taken (hybrid bit 28)"),
 	/* pd145/pd158: read the event, the alarm, the irq mask, then arm (no 0x1406 read) */
 	PMU(PMU_R, PMU_RTC_EVENT, 1, PMU, "n24 #32 C17 PMU rtc_alarm_event read"),
 	PMU(PMU_ALARM, PMU_RTC_ALARM, 0, PMU, "n24 #32 C17 PMU rtc_alarm ← now + alarm_s"),
 	PMU(PMU_W8, PMU_RTC_IRQ_MASK, 0, PMU, "n24 #32 C17 PMU rtc_irq_mask ← 0"),
 	PMU(PMU_W8, PMU_RTC_ALARM_CTRL, PMU_RTC_ALARM_ARM, PMU, "n24 #32 C17 PMU rtc_alarm_ctrl ← 0x41"),
+	OP(CRUMB, PMGR, 0, 0x61, COMMIT, "Linux: crumb 0x61, the alarm written (hybrid bit 28)"),
 	OP(GATE, PMGR, 0, SEQ_GATE_PMU | SEQ_GATE_ALARM, COMMIT, "Linux: no commit 2 unless the alarm reads back armed"),
+	OP(CRUMB, PMGR, 0, 0x62, COMMIT, "Linux: crumb 0x62, before commit 2's wait (hybrid bit 28)"),
 	OP(UNTIL, PMGR, 0, SEQ_COMMIT_GAP_US, COMMIT, "commit 2 no sooner than macOS's 0.52 ms"),
 	W32(COMMIT, 0x4000, 1, COMMIT, "n24 #33 C18 commit 2"),
+	OP(CRUMB, PMGR, 29, 0x63, COMMIT, "Linux: crumb 0x63, commit 2 taken (hybrid bits 28 and 29)"),
 	OP(BOOT_DEEP, PMGR, 0, 0, ALL, "n24 #34 cpu0: ACC_OVRD deep, CYC_OVRD | 0x3000001, WFI"),
 };
 

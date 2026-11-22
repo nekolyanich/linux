@@ -648,6 +648,9 @@ static int apple_spmi_pmu_stage_set(const char *val, const struct kernel_param *
 		return ret;
 	if (stage < 0x31 || stage > 0x3f)
 		return -EINVAL;
+	/* The bench's witness only: native EL2 with boot_crumb, never a daily boot (rv-usb4, batch 3) */
+	if (!boot_crumb || !is_kernel_in_hyp_mode())
+		return -EPERM;
 	if (!crumb_ctrl)
 		return -ENODEV;
 	ret = crumb_ctrl->write_cmd(crumb_ctrl, SPMI_CMD_EXT_WRITEL, crumb_sid,
@@ -661,7 +664,7 @@ static const struct kernel_param_ops apple_spmi_pmu_stage_ops = {
 	.set = apple_spmi_pmu_stage_set,
 };
 module_param_cb(pmu_stage, &apple_spmi_pmu_stage_ops, NULL, 0200);
-MODULE_PARM_DESC(pmu_stage, "bench: write 0x31..0x3f to the PMU boot_stage (native T2/T4 witness)");
+MODULE_PARM_DESC(pmu_stage, "bench: write 0x31..0x3f to the PMU boot_stage (native T2/T4 witness; EL2 with boot_crumb=1 only)");
 
 /* The PMU's slave id: the child that is the boot_stage's nvmem */
 static void apple_spmi_crumb_find(struct spmi_controller *ctrl, struct device_node *np)

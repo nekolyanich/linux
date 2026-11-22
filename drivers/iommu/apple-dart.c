@@ -1468,6 +1468,10 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 	irqreturn_t ret;
 	struct apple_dart *dart = dev;
 
+	/* Held across its block's power cycle: its registers aren't there (the line is shared) */
+	if (dart->held)
+		return IRQ_NONE;
+
 	WARN_ON(pm_runtime_get_sync(dart->dev) < 0);
 	ret = dart->hw->irq_handler(irq, dev);
 	pm_runtime_put(dart->dev);
@@ -1948,6 +1952,38 @@ void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
 	pm_runtime_put(dev);
 }
 EXPORT_SYMBOL_GPL(apple_dart_sleep_restore_lost);
+
+/*
+ * Bench, read-only: whether the DART is locked now (iBoot's lock survives a cut or
+ * not), and each stream's TCR and first TTBR that isn't zero, into @buf.
+ */
+void apple_dart_bench_state(struct device *dev, char *buf, size_t len)
+{
+	struct apple_dart *dart;
+	size_t off;
+	int sid;
+
+	buf[0] = 0;
+	if (dev->driver != &apple_dart_driver.driver || !(dart = dev_get_drvdata(dev))) {
+		scnprintf(buf, len, "not bound");
+		return;
+	}
+	if (pm_runtime_resume_and_get(dev)) {
+		scnprintf(buf, len, "not powered");
+		return;
+	}
+	off = scnprintf(buf, len, "locked at probe %d, now %d:", dart->locked,
+			apple_dart_is_locked(dart));
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		u32 tcr = readl(dart->regs + DART_TCR(dart, sid));
+		u32 ttbr = readl(dart->regs + DART_TTBR(dart, sid, 0));
+
+		if (tcr || ttbr)
+			off += scnprintf(buf + off, len - off, " %d:%#x/%#x", sid, tcr, ttbr);
+	}
+	pm_runtime_put(dev);
+}
+EXPORT_SYMBOL_GPL(apple_dart_bench_state);
 
 /*
  * A firmware-driven sleep (aurora 2573357f, by function) takes the DARTs in

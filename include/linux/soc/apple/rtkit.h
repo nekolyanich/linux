@@ -120,6 +120,9 @@ int apple_rtkit_reinit_keep(struct apple_rtkit *rtk);
 /* Stop receiving before an idled co-processor sleeps; its buffers stay put. */
 void apple_rtkit_detach_keep(struct apple_rtkit *rtk);
 
+/* Whether a warm session refused a changed buffer request since its reinit: the caller restarts it cold. */
+bool apple_rtkit_keep_refused(struct apple_rtkit *rtk);
+
 /*
  * Set how long each handshake step (power state and endpoint map replies)
  * waits for the co-processor, for one that is known to answer slowly. Call

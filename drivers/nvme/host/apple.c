@@ -1199,6 +1199,7 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
+	bool kept_boot = false;
 	int ret;
 	u32 boot_status, aqa;
 	struct apple_nvme *anv =
@@ -1232,6 +1233,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
 
+cold:
 	/*
 	 * Only do the soft-reset if the CPU is not running, which means either we
 	 * or the previous stage shut it down cleanly.
@@ -1242,6 +1244,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		bool kept = reinit_keep_on() && ans_idle_kept;
 
 		ans_idle_kept = false;
+		kept_boot = kept;
 		if (kept) {
 			ret = apple_rtkit_reinit_keep(anv->rtk);
 			dev_info(anv->dev, "bench: RTKit buffers kept across the sleep (reinit_keep): %d\n", ret);
@@ -1287,8 +1290,12 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		ret = apple_rtkit_wake(anv->rtk);
 	}
 
+	if (!ret && kept_boot && apple_rtkit_keep_refused(anv->rtk))
+		ret = -EBUSY;
 	if (ret) {
 		dev_err(anv->dev, "ANS did not boot");
+		if (kept_boot)
+			goto cold_again;
 		goto out;
 	}
 
@@ -1296,8 +1303,12 @@ static void apple_nvme_reset_work(struct work_struct *work)
 				 boot_status,
 				 boot_status == APPLE_ANS_BOOT_STATUS_OK,
 				 USEC_PER_MSEC, APPLE_ANS_BOOT_TIMEOUT);
+	if (!ret && kept_boot && apple_rtkit_keep_refused(anv->rtk))
+		ret = -EBUSY;
 	if (ret) {
 		dev_err(anv->dev, "ANS did not initialize");
+		if (kept_boot)
+			goto cold_again;
 		goto out;
 	}
 
@@ -1425,10 +1436,28 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	dev_dbg(anv->dev, "ANS boot and NVMe init completed.");
 	return;
 
+	/*
+	 * Booted with its buffers kept but refused (a changed buffer request, or no boot): once, the
+	 * cold path: RTKit shut down, CPU stopped, the buffers freed by the reinit, reset, boot (review round 5).
+	 */
+cold_again:
+	dev_warn(anv->dev, "ANS not back with its buffers kept (%d): a cold reinit once\n", ret);
+	kept_boot = false;
+	/* As at the top: RTKit shut down cleanly for the reset, if the boot got that far */
+	if (apple_rtkit_is_running(anv->rtk)) {
+		int err = apple_rtkit_shutdown(anv->rtk);
+
+		if (err)
+			dev_warn(anv->dev, "RTKit shutdown before the cold reinit: %d\n", err);
+	}
+	writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+	goto cold;
+
 out_remove_sq:
 	apple_nvme_remove_sq(anv);
 out_remove_cq:
 	apple_nvme_remove_cq(anv);
+
 out:
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);

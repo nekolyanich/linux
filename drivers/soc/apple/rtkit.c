@@ -315,6 +315,7 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 			dev_err(rtk->dev,
 				"RTKit: buffer request for 0x%zx bytes at %pad while 0x%zx bytes at %pad are live\n",
 				size, &iova, buffer->size, &buffer->iova);
+			WRITE_ONCE(rtk->keep_refused, true);
 			return -EBUSY;
 		}
 		if (buffer->is_mapped)
@@ -903,6 +904,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	rtk->crashed = false;
 	rtk->warm_session = false;
+	rtk->keep_refused = false;
 	WRITE_ONCE(rtk->oslog_owed, 0);
 	/* A cold boot after a warm restart or sleep stop: the full EPMAP reply, and a receive callback again */
 	rtk->warm_restart = false;
@@ -1108,6 +1110,7 @@ int apple_rtkit_reinit_keep(struct apple_rtkit *rtk)
 	 * old one with its SART entry (review 9b77f38).
 	 */
 	rtk->warm_session = true;
+	rtk->keep_refused = false;
 	WRITE_ONCE(rtk->oslog_owed, 0);
 	rtk->warm_restart = false;
 	rtk->warm_last_mask = U32_MAX;
@@ -1134,6 +1137,12 @@ void apple_rtkit_detach_keep(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_detach_keep);
 
+bool apple_rtkit_keep_refused(struct apple_rtkit *rtk)
+{
+	return READ_ONCE(rtk->keep_refused);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_keep_refused);
+
 void apple_rtkit_set_warm_epmap_mask(struct apple_rtkit *rtk, u32 last_mask)
 {
 	rtk->warm_last_mask = last_mask;
@@ -1155,6 +1164,7 @@ int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
 	rtk->crashed = false;
 	rtk->warm_restart = true;
 	rtk->warm_session = true;
+	rtk->keep_refused = false;
 	/* A counter owed to the old session isn't the new one's */
 	WRITE_ONCE(rtk->oslog_owed, 0);
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;

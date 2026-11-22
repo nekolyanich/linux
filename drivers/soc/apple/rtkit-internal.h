@@ -42,6 +42,8 @@ struct apple_rtkit {
 	u32 warm_last_mask;
 	/* Restarted warm since the last reinit: the buffers stay live */
 	bool warm_session;
+	/* A changed buffer request was refused in a warm session (apple_rtkit_keep_refused) */
+	bool keep_refused;
 	/* apple_rtkit_set_oslog_echo: OSLOG counters echoed; one the receive work still owes */
 	bool oslog_echo;
 	u64 oslog_owed;

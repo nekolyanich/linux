@@ -19,6 +19,8 @@
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/delay.h>
 #include <linux/unaligned.h>
 
 #define SMC_ENDPOINT			0x20
@@ -67,6 +69,9 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return -EIO;
 	if (smc->atomic_mode)
 		return -EIO;
+	/* Told the AP is idle: it answers nothing until told it's on again */
+	if (smc->ap_notified)
+		return -EIO;
 
 	reinit_completion(&smc->cmd_done);
 
@@ -83,7 +88,21 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return ret;
 	}
 
-	if (wait_for_completion_timeout(&smc->cmd_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) <= 0) {
+	if (smc->polled) {
+		/* The noirq phase: no interrupt completes it, poll the mailbox */
+		unsigned int us;
+
+		for (us = 0; us < SMC_TIMEOUT_MS * USEC_PER_MSEC; us += 10) {
+			if (try_wait_for_completion(&smc->cmd_done))
+				break;
+			apple_rtkit_poll(smc->rtk);
+			udelay(10);
+		}
+		if (us >= SMC_TIMEOUT_MS * USEC_PER_MSEC && !try_wait_for_completion(&smc->cmd_done)) {
+			dev_err(smc->dev, "Command timed out, polled (%llx)", msg);
+			return -ETIMEDOUT;
+		}
+	} else if (wait_for_completion_timeout(&smc->cmd_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) <= 0) {
 		dev_err(smc->dev, "Command timed out (%llx)", msg);
 		return -ETIMEDOUT;
 	}
@@ -492,10 +511,236 @@ static const struct of_device_id apple_smc_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 
+/*
+ * apple-sleep's sequencer (native5; aurora's SMC sleep path by function): the
+ * sleep warning (MBSE = slpw) at its .begin, the commit (MBSE = slpa, then the
+ * AP idle notice) after the devices' noirq suspend, and at the wake the AP on
+ * notice and MBSE = waka.
+ */
+#define SMC_SLEEP_IDLE_MS	1
+
+static void apple_smc_set_polled(struct apple_smc *smc, bool polled)
+{
+	guard(mutex)(&smc->mutex);
+
+	smc->polled = polled;
+}
+
+static void apple_smc_set_ap_notified(struct apple_smc *smc, bool notified)
+{
+	guard(mutex)(&smc->mutex);
+
+	smc->ap_notified = notified;
+}
+
+static int apple_smc_ap_power(struct apple_smc *smc, bool on)
+{
+	return smc->polled ? apple_rtkit_ap_power_noirq(smc->rtk, on) :
+			     apple_rtkit_ap_power(smc->rtk, on);
+}
+
+static int apple_smc_notice_idle(struct apple_smc *smc)
+{
+	int ret;
+
+	/*
+	 * Commands fail from here on. The mutex isn't held across the notice: the
+	 * answer comes through the same path as the notifications, and those can
+	 * be waiting for this mutex.
+	 */
+	apple_smc_set_ap_notified(smc, true);
+	ret = apple_smc_ap_power(smc, false);
+	if (ret) {
+		/* Taken and not answered, perhaps, so undo it. */
+		apple_smc_ap_power(smc, true);
+		apple_smc_set_ap_notified(smc, false);
+		dev_err(smc->dev, "SMC did not take the sleep notice: %d\n", ret);
+	}
+	return ret;
+}
+
+static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
+{
+	int ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), value);
+
+	if (ret)
+		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
+}
+
+int apple_smc_sleep_seq_warn(struct apple_smc *smc)
+{
+	int ret;
+
+	smc->sleep_seq = true;
+	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpw));
+	if (ret)
+		dev_err(smc->dev, "Failed to issue MBSE = slpw: %d\n", ret);
+	else
+		smc->sleep_warned = true;
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_smc_sleep_seq_warn);
+
+/* After the devices' noirq suspend: their interrupts are off, so the replies are polled for. */
+int apple_smc_sleep_seq_commit(struct apple_smc *smc, unsigned int arm_us, unsigned int idle_us,
+			       bool skip_slpa)
+{
+	int ret = 0;
+
+	apple_smc_set_polled(smc, true);
+	if (skip_slpa)
+		dev_info(smc->dev, "bench: MBSE = slpa skipped, the AP idle notice only\n");
+	else
+		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
+	if (ret) {
+		dev_err(smc->dev, "Failed to issue MBSE = slpa: %d\n", ret);
+	} else {
+		apple_sleep_bench_probe(smc, "after slpa", false);
+		udelay(arm_us);
+		ret = apple_smc_notice_idle(smc);
+		if (!ret)
+			udelay(idle_us);
+	}
+	apple_smc_set_polled(smc, false);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_smc_sleep_seq_commit);
+
+static void apple_smc_bench_key_name(char *out, smc_key key)
+{
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		char c = (char)(key >> (24 - 8 * i));
+
+		out[i] = (c >= 0x20 && c < 0x7f && c != ' ' && c != '=') ? c : '?';
+	}
+	out[4] = 0;
+}
+
+/* Bench: read-only; "KEY=hex" for each of @keys appended to @buf (reads in polled mode if @polled) */
+int apple_smc_bench_read_line(struct apple_smc *smc, const smc_key *keys, int n, char *buf, size_t size,
+			      bool polled)
+{
+	int i, len = 0;
+
+	if (polled)
+		apple_smc_set_polled(smc, true);
+	for (i = 0; i < n; i++) {
+		struct apple_smc_key_info info = {};
+		u8 val[32];
+		char nm[5];
+		int ret = apple_smc_get_key_info(smc, keys[i], &info);
+
+		if (!ret && (!info.size || info.size > sizeof(val)))
+			ret = -E2BIG;
+		if (!ret)
+			ret = apple_smc_read(smc, keys[i], val, info.size);
+		apple_smc_bench_key_name(nm, keys[i]);
+		if (ret < 0)
+			len += scnprintf(buf + len, size - len, " %s=err%d", nm, ret);
+		else
+			len += scnprintf(buf + len, size - len, " %s=%*phN", nm, info.size, val);
+	}
+	if (polled)
+		apple_smc_set_polled(smc, false);
+	return len;
+}
+EXPORT_SYMBOL_GPL(apple_smc_bench_read_line);
+
+void apple_smc_bench_edge_keys(struct apple_smc *smc, const char *tag, bool polled)
+{
+	static const smc_key keys[] = { SMC_KEY(WKTP), SMC_KEY(MBSE), SMC_KEY(MBSW), SMC_KEY(MSLD) };
+	char line[160];
+	int len;
+
+	len = scnprintf(line, sizeof(line), "bench: smc edge keys (%s%s):", tag, polled ? ", polled" : "");
+	apple_smc_bench_read_line(smc, keys, ARRAY_SIZE(keys), line + len, sizeof(line) - len, polled);
+	dev_info(smc->dev, "%s\n", line);
+}
+EXPORT_SYMBOL_GPL(apple_smc_bench_edge_keys);
+
+/* apple_sleep.smc_notify's wake bits (native5): 32 IOP_PWR_STATE 0x9 (not carried), 64 WKTP <- 0, 128 gp03 */
+#define SMC_WAKE_WKTP0		BIT(6)
+#define SMC_WAKE_GP03		BIT(7)
+
+static void apple_smc_sleep_wake(struct apple_smc *smc)
+{
+	unsigned int bits = apple_sleep_bench_smc_wake_bits();
+	u32 event = 0, pmvc;
+	u8 record[8] = {};
+	int ret;
+
+	ret = apple_smc_ap_power(smc, true);
+	if (ret)
+		dev_err(smc->dev, "SMC did not take the wake notice: %d\n", ret);
+	apple_smc_set_ap_notified(smc, false);
+	if (!apple_smc_read_u32(smc, SMC_KEY(MBSE), &event) &&
+	    apple_smc_read(smc, SMC_KEY(MBSW), record, sizeof(record)) >= 0)
+		dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph\n", event, record);
+
+	apple_smc_write_mbse(smc, SMC_KEY(waka));
+	smc->sleep_warned = false;
+	if (bits & SMC_WAKE_WKTP0) {
+		u8 zero = 0;
+
+		ret = apple_smc_write(smc, SMC_KEY(WKTP), &zero, sizeof(zero));
+		if (!ret)
+			ret = apple_smc_write(smc, SMC_KEY(WKTP), &zero, sizeof(zero));
+		dev_info(smc->dev, "bench: WKTP <- 0 twice at wake: %d\n", ret);
+	}
+	/* Bench: macOS toggles vdd_cio at the wake too (apple_sleep.smc_notify bit 3) */
+	if (apple_sleep_bench_pmvc_wake(&pmvc)) {
+		ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), pmvc);
+		dev_info(smc->dev, "pmVC <- %#x at wake: %d\n", pmvc, ret);
+	}
+	apple_sleep_bench_probe(smc, "after the SMC wake", false);
+	if (bits & SMC_WAKE_GP03) {
+		int r1, r2;
+
+		r1 = apple_smc_write_u32(smc, SMC_KEY(gp03), 0x00800000);
+		mdelay(10);
+		r2 = apple_smc_write_u32(smc, SMC_KEY(gp03), 0x00800001);
+		dev_info(smc->dev, "bench: gp03 <- 0x00800000, 10 ms, <- 0x00800001 at wake: %d, %d\n", r1, r2);
+	}
+}
+
+static void apple_smc_complete(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	smc->sleep_seq = false;
+	if (smc->sleep_warned) {
+		/* A sleep refused after the warning: tell it the AP stays awake */
+		apple_smc_write_mbse(smc, SMC_KEY(waka));
+		smc->sleep_warned = false;
+	}
+}
+
+static int apple_smc_resume_noirq(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	if (smc->ap_notified) {
+		apple_smc_set_polled(smc, true);
+		apple_smc_sleep_wake(smc);
+		apple_smc_set_polled(smc, false);
+	}
+	return 0;
+}
+
+static const struct dev_pm_ops apple_smc_pm_ops = {
+	.complete = pm_sleep_ptr(apple_smc_complete),
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_smc_resume_noirq)
+};
+
 static struct platform_driver apple_smc_driver = {
 	.driver = {
 		.name = "macsmc",
 		.of_match_table = apple_smc_of_match,
+		.pm = pm_sleep_ptr(&apple_smc_pm_ops),
 	},
 	.probe = apple_smc_probe,
 };

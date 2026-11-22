@@ -25,7 +25,7 @@ apple-tunable-y = tunable.o
 obj-$(CONFIG_APPLE_AOP) += aop.o
 
 obj-$(CONFIG_APPLE_SOC_SLEEP) += apple-sleep.o
-apple-sleep-y = sleep.o sleep-seq.o sleep-smc-stub.o
+apple-sleep-y = sleep.o sleep-seq.o
 
 obj-$(CONFIG_APPLE_SEP) += apple-sep.o
 apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o crypto_shim.o \

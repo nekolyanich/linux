@@ -126,6 +126,16 @@ struct apple_smc {
 	struct completion cmd_done;
 	u64 cmd_ret;
 
+	/*
+	 * apple-sleep's sequencer (native5, by function from aurora): commands poll
+	 * the mailbox (@polled) in the noirq phase, and fail once the SMC was told
+	 * the AP is idle (@ap_notified) until it is told it's on again.
+	 */
+	bool polled;
+	bool ap_notified;
+	bool sleep_seq;
+	bool sleep_warned;
+
 	struct mutex mutex;
 	spinlock_t lock;
 };
@@ -277,11 +287,7 @@ static inline int apple_smc_write_flag_atomic(struct apple_smc *smc, smc_key key
 	return apple_smc_write_u8_atomic(smc, key, state ? 1 : 0);
 }
 
-/*
- * apple-sleep's sequencer (m2pro 7.3.4 sleep backport): the SMC's sleep
- * notices and the bench's read-only key reads. Until the macsmc batch they
- * are refusing stubs in drivers/soc/apple/sleep-smc-stub.c.
- */
+/* apple-sleep's sequencer: the SMC's sleep notices and the bench's read-only key reads */
 void apple_smc_bench_edge_keys(struct apple_smc *smc, const char *tag, bool polled);
 int apple_smc_bench_read_line(struct apple_smc *smc, const smc_key *keys, int n, char *buf, size_t size,
 			      bool polled);

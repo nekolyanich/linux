@@ -40,6 +40,8 @@ config APPLE_SOC_SLEEP
 	default n
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
+	# the sequencer calls the SMC driver's sleep notices directly
+	depends on MFD_MACSMC=y
 	select APPLE_TUNABLE
 	help
 	  Powers the secondary CPUs off and suspends the system to RAM on an

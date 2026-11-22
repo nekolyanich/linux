@@ -1499,3 +1499,38 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 
 	dcp_set_power_state(dcp, false, &req, NULL, NULL);
 }
+
+static void dcp_s2r_link_sleep_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/*
+ * Bench (native5, note 77 §14.52), after Ante042's t600x-s2r-reference 954a5cf8d300:
+ * DCPPowerManager A500 (13.x firmware) drains the AP link and marks it inactive, so an AP
+ * power IDLE can be acked. A true argument is a teardown that also unregisters the AP power
+ * callbacks; the bench sends false.
+ */
+int DCP_FW_NAME(iomfb_s2r_link_sleep)(struct apple_dcp *dcp, bool teardown)
+{
+	struct dcp_wait_cookie *cookie;
+	u32 in = teardown;
+	long t;
+
+	if (!dcp_methods[dcpep_s2r_link_sleep].tag[0])
+		return -EOPNOTSUPP;
+	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+	dcp_push(dcp, false, &dcp_methods[dcpep_s2r_link_sleep], sizeof(in), 0, &in,
+		 dcp_s2r_link_sleep_done, cookie);
+	t = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(2000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+	return t ? 0 : -ETIMEDOUT;
+}

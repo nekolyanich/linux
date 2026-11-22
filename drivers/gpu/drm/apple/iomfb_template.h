@@ -208,5 +208,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp);
+/* Bench: DCPPowerManager A500 (13.x), the AP link drained before an AP idle; -EOPNOTSUPP elsewhere */
+int DCP_FW_NAME(iomfb_s2r_link_sleep)(struct apple_dcp *dcp, bool teardown);
 
 #endif

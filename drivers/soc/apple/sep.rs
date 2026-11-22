@@ -2642,22 +2642,18 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
 struct SepDriver(Arc<SepData>);
 
-kernel::of_device_table!(
-    OF_TABLE,
-    MODULE_OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,sep"), ())]
-);
+kernel::of_device_table!(OF_TABLE, (), [(of::DeviceId::new(c"apple,sep"), ())]);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();
+    type Data<'bound> = SepDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<device::Core>,
-        _info: Option<&()>,
-    ) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<device::Core<'_>>,
+        _info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core> = pdev.as_ref();
         if *module_parameters::provision_keybag.value() != 0
             && *module_parameters::xart_writes.value() == 0

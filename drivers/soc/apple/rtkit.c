@@ -81,6 +81,7 @@ enum {
 
 #define APPLE_RTKIT_OSLOG_TYPE GENMASK_ULL(63, 56)
 #define APPLE_RTKIT_OSLOG_BUFFER_REQUEST 1
+#define APPLE_RTKIT_OSLOG_LOG 2
 #define APPLE_RTKIT_OSLOG_SIZE GENMASK_ULL(55, 36)
 #define APPLE_RTKIT_OSLOG_IOVA GENMASK_ULL(35, 0)
 
@@ -570,6 +571,22 @@ static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
 static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg);
+	int err;
+
+	/*
+	 * Only for a caller that asked (aurora, apple_rtkit_set_oslog_echo): a firmware counts
+	 * its log writes and holds the next counter until the last is echoed, and with one
+	 * outstanding takes no AP power notice: a DCP after a warm restart. macOS echoes every one.
+	 */
+	if (type == APPLE_RTKIT_OSLOG_LOG && rtk->oslog_echo) {
+		/* A polled idle that came first echoed it already. */
+		if (cmpxchg(&rtk->oslog_owed, msg, 0) != msg)
+			return;
+		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG, msg, NULL, false);
+		if (err)
+			dev_err(rtk->dev, "RTKit: oslog echo failed: %d\n", err);
+		return;
+	}
 
 	switch (type) {
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
@@ -623,6 +640,12 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	kfree(rtk_work);
 }
 
+static bool apple_rtkit_oslog_owed_msg(struct apple_rtkit *rtk, u8 ep, u64 msg)
+{
+	return ep == APPLE_RTKIT_EP_OSLOG &&
+	       FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg) == APPLE_RTKIT_OSLOG_LOG && rtk->oslog_echo;
+}
+
 static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 			   void *cookie)
 {
@@ -651,6 +674,8 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	if (!work)
 		return;
 
+	if (apple_rtkit_oslog_owed_msg(rtk, ep, msg.msg0))
+		WRITE_ONCE(rtk->oslog_owed, msg.msg0);
 	work->rtk = rtk;
 	work->ep = ep;
 	work->msg = msg.msg0;
@@ -1173,7 +1198,8 @@ EXPORT_SYMBOL_GPL(apple_rtkit_power_cycled_return);
  * A coprocessor's idle with interrupts off (aurora, by function), for the
  * callers that ask: the receive callback is swapped for one that takes only
  * what an idle needs, the mailbox polled, and the state acks waited on in
- * 10 us steps. Asahi's RTKit echoes no OSLOG counters, so none is owed here.
+ * 10 us steps. With oslog_echo, an OSLOG counter is echoed at once, and one the
+ * receive work still owes is echoed first.
  */
 #define APPLE_RTKIT_POLLED_STEP_US	10
 #define APPLE_RTKIT_POLLED_LOOPS	20000
@@ -1195,6 +1221,11 @@ static void apple_rtkit_polled_rx(struct apple_mbox *mbox, struct apple_mbox_msg
 	struct apple_rtkit *rtk = cookie;
 	u8 ep = msg.msg1;
 
+	if (apple_rtkit_oslog_owed_msg(rtk, ep, msg.msg0)) {
+		if (apple_mbox_send(mbox, msg, true))
+			dev_err(rtk->dev, "RTKit: oslog echo failed while idling\n");
+		return;
+	}
 	if (ep == APPLE_RTKIT_EP_MGMT) {
 		u8 type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg.msg0);
 		unsigned int state = FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg.msg0);
@@ -1241,8 +1272,18 @@ static void apple_rtkit_polled_begin(struct apple_rtkit *rtk)
 	rtk->mbox->rx = apple_rtkit_polled_rx;
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
 
+	u64 owed;
+
 	/* What's already waiting is answered first, or the firmware may not go idle. */
 	apple_mbox_poll(rtk->mbox);
+	/* Then a counter left for the receive work, which can't run now. */
+	owed = xchg(&rtk->oslog_owed, 0);
+	if (owed) {
+		struct apple_mbox_msg echo = { .msg0 = owed, .msg1 = APPLE_RTKIT_EP_OSLOG };
+
+		if (apple_mbox_send(rtk->mbox, echo, true))
+			dev_err(rtk->dev, "RTKit: oslog echo failed before the idle\n");
+	}
 }
 
 static void apple_rtkit_polled_end(struct apple_rtkit *rtk)
@@ -1293,6 +1334,59 @@ int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_ap_idle_polled);
+
+void apple_rtkit_set_oslog_echo(struct apple_rtkit *rtk, bool echo)
+{
+	rtk->oslog_echo = echo;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_oslog_echo);
+
+/*
+ * Bench (aurora, note 77 §14.46): apple_rtkit_idle() with each ack waited for up to
+ * timeout_ms (0: the handshake timeout), and a hook between the AP request and its
+ * wait: macOS stops the DCP's AFK queues there (note 77 §14.48).
+ */
+int apple_rtkit_bench_idle(struct apple_rtkit *rtk, unsigned int timeout_ms,
+			   void (*after_ap_send)(void *data), void *data)
+{
+	unsigned int saved = rtk->handshake_timeout_ms;
+	int ret;
+
+	rtk->handshake_timeout_ms = timeout_ms ?: saved;
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+					  FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE,
+						     APPLE_RTKIT_PWR_STATE_IDLE));
+	if (ret)
+		goto out;
+	if (after_ap_send)
+		after_ap_send(data);
+	ret = apple_rtkit_wait_for_completion(rtk, &rtk->ap_pwr_ack_completion);
+	if (!ret && rtk->ap_power_state != APPLE_RTKIT_PWR_STATE_IDLE)
+		ret = -EINVAL;
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: AP idle not acknowledged: %d\n", ret);
+		goto out;
+	}
+	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: IOP idle not acknowledged: %d\n", ret);
+		goto out;
+	}
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
+out:
+	rtk->handshake_timeout_ms = saved;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_bench_idle);
+
+void apple_rtkit_bench_states(struct apple_rtkit *rtk, unsigned int *ap, unsigned int *iop)
+{
+	*ap = READ_ONCE(rtk->ap_power_state);
+	*iop = READ_ONCE(rtk->iop_power_state);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_bench_states);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {

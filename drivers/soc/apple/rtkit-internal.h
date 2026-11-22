@@ -42,6 +42,9 @@ struct apple_rtkit {
 	u32 warm_last_mask;
 	/* Restarted warm since the last reinit: the buffers stay live */
 	bool warm_session;
+	/* apple_rtkit_set_oslog_echo: OSLOG counters echoed; one the receive work still owes */
+	bool oslog_echo;
+	u64 oslog_owed;
 
 	struct completion epmap_completion;
 	struct completion iop_pwr_ack_completion;

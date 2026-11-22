@@ -225,6 +225,13 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
 				  unsigned int *us);
 int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us);
 
+/* Echo the firmware's OSLOG counters (off by default), as macOS does: a DCP after a warm restart */
+void apple_rtkit_set_oslog_echo(struct apple_rtkit *rtk, bool echo);
+/* Bench: apple_rtkit_idle() with a timeout per ack and a hook after the AP request */
+int apple_rtkit_bench_idle(struct apple_rtkit *rtk, unsigned int timeout_ms,
+			   void (*after_ap_send)(void *data), void *data);
+void apple_rtkit_bench_states(struct apple_rtkit *rtk, unsigned int *ap, unsigned int *iop);
+
 /*
  * Checks if an endpoint with a given index exists
  *

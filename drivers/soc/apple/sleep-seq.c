@@ -411,6 +411,8 @@ struct apple_sleep_seq {
 };
 
 static struct apple_sleep_seq *apple_sleep_seq;
+/* External DCPs their driver stopped for this sleep (apple_sleep_dispext_down) */
+static u8 aseq_dispext_down;
 
 static bool dry_run;
 module_param(dry_run, bool, 0644);
@@ -2114,8 +2116,6 @@ static void aseq_dispext_owned(struct apple_sleep_seq *s)
  * so its request leaves the PMP report as an unbound one's does. Set at the device's suspend,
  * cleared at its resume; read at the entry's report write.
  */
-static u8 aseq_dispext_down;
-
 void apple_sleep_dispext_down(struct device *dev, bool down)
 {
 	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);

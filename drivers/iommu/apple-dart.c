@@ -20,6 +20,8 @@
 #include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/minmax.h>
@@ -1792,26 +1794,120 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 }
 
 /*
- * Its consumer's own power cycle, outside a system sleep: the registers saved and put back.
- * Only for a device apple-dart is bound to.
+ * Its consumer's own power cycle, outside a system sleep: the registers saved
+ * and put back. Only for a device apple-dart is bound to. One save or restore
+ * at a time, each under a runtime-PM reference held for its length, so
+ * runtime suspend cannot run between its register reads and writes and the
+ * DART is powered for them. A locked DART's translation registers belong to
+ * its firmware and are not put back here (rv-usb4, batch 1 item 4).
  */
+static DEFINE_MUTEX(apple_dart_state_lock);
+
+static int apple_dart_state_call(struct device *dev, int (*fn)(struct device *dev))
+{
+	struct apple_dart *dart;
+	int ret;
+
+	if (dev->driver != &apple_dart_driver.driver)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (!dart)
+		return -ENODEV;
+	if (dart->locked)
+		return -EOPNOTSUPP;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
+		return ret;
+	mutex_lock(&apple_dart_state_lock);
+	ret = fn(dev);
+	mutex_unlock(&apple_dart_state_lock);
+	pm_runtime_put(dev);
+
+	return ret;
+}
+
 int apple_dart_state_save(struct device *dev)
 {
-	if (dev->driver != &apple_dart_driver.driver || !dev_get_drvdata(dev))
-		return -ENODEV;
-	return apple_dart_suspend(dev);
+	return apple_dart_state_call(dev, apple_dart_suspend);
 }
 EXPORT_SYMBOL_GPL(apple_dart_state_save);
 
 int apple_dart_state_restore(struct device *dev)
 {
-	if (dev->driver != &apple_dart_driver.driver || !dev_get_drvdata(dev))
-		return -ENODEV;
-	return apple_dart_resume(dev);
+	return apple_dart_state_call(dev, apple_dart_resume);
 }
 EXPORT_SYMBOL_GPL(apple_dart_state_restore);
 
-static DEFINE_RUNTIME_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume, NULL);
+/*
+ * A firmware-driven sleep (aurora 2573357f, by function) takes the DARTs in
+ * the noirq phase, which every device finishes before any early resume:
+ * coprocessors such as the PMP and SIO restart their firmware in their early
+ * resume, and its first DMA has to find the DART already restored. Any other
+ * sleep keeps the normal phase, which the PCIe tunnel DARTs need.
+ *
+ * Bench (native5, note 77 §14.20): the bench's suspend isn't via firmware, its
+ * resume is (the hybrid). Only SIO's and PMP's DARTs (t6020): the PCIe DARTs'
+ * noirq save lands after pcie-apple took the root complex down.
+ */
+static bool bench_hybrid;
+module_param(bench_hybrid, bool, 0444);
+
+static bool apple_dart_bench_hybrid(struct device *dev)
+{
+	return (bench_hybrid || (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_DART)) &&
+	       (!strcmp(dev_name(dev), "39b008000.iommu") || !strcmp(dev_name(dev), "3860e8000.iommu"));
+}
+
+static bool apple_dart_fw_sleep(struct device *dev)
+{
+	return pm_suspend_via_firmware() || apple_dart_bench_hybrid(dev);
+}
+
+static __maybe_unused int apple_dart_sys_suspend(struct device *dev)
+{
+	return apple_dart_fw_sleep(dev) ? 0 : pm_runtime_force_suspend(dev);
+}
+
+static __maybe_unused int apple_dart_sys_resume(struct device *dev)
+{
+	return apple_dart_fw_sleep(dev) ? 0 : pm_runtime_force_resume(dev);
+}
+
+static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
+{
+	return apple_dart_fw_sleep(dev) ? pm_runtime_force_suspend(dev) : 0;
+}
+
+static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
+{
+	int ret;
+
+	if (!apple_dart_fw_sleep(dev))
+		return 0;
+	ret = pm_runtime_force_resume(dev);
+	/*
+	 * A real sleep took the registers even of a DART runtime PM had
+	 * suspended, which force_resume leaves alone. Its consumer's firmware may
+	 * DMA through it before anything resumes it at runtime, so write the
+	 * saved state back now.
+	 */
+	if (!ret && pm_resume_via_firmware() && pm_runtime_status_suspended(dev)) {
+		ret = apple_dart_resume(dev);
+		if (ret)
+			dev_err(dev, "restore after sleep failed: %d\n", ret);
+	}
+	if (apple_dart_bench_hybrid(dev) && !pm_suspend_via_firmware())
+		dev_info(dev, "bench: hybrid, resumed in noirq: %d (runtime %s)\n", ret,
+			 pm_runtime_status_suspended(dev) ? "suspended" : "active");
+	return ret;
+}
+
+static const struct dev_pm_ops apple_dart_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend, apple_dart_sys_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend_noirq, apple_dart_sys_resume_noirq)
+	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
+};
 
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },

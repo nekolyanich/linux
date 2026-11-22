@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/soc/apple/t8132.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
 #define APPLE_PMGR_AUTO_ENABLE  BIT(28)
@@ -821,8 +822,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 * status and ownership before population; fail closed if it was not
 	 * enabled. Other firmware keeps the tree's own domain descriptions.
 	 */
-	/* aurora's T8132 qualified-firmware path (t8132.h): not carried on asahi, never taken */
-	if (t8132 && false && !of_property_present(node, "status"))
+	if (t8132 && apple_t8132_firmware_path() && !of_property_present(node, "status"))
 		return dev_err_probe(dev, -ENODEV, "missing M4 power-domain policy\n");
 
 	tvm = of_parse_phandle(node, "power-domains", 0);

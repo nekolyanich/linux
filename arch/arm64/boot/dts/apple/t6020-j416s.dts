@@ -9,6 +9,12 @@
 
 /dts-v1/;
 
+/*
+ * Let m1n1 start the PMP, as macOS does at boot: it manages the fabric and
+ * DCS power states and takes the AP sleep notice before the commit.
+ */
+#define APPLE_USE_PMP
+
 #include "t6020.dtsi"
 #include "t602x-j414-j416.dtsi"
 
@@ -44,4 +50,21 @@
 
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j416s.bin";
+};
+
+/* Research: the system sleep's dry run (apple_sleep.dry_run, the m1n1 bench). */
+&sleep {
+	status = "okay";
+	/* The co-processors the bench's sleep idles and stops through their drivers (not on every t602x) */
+	apple,coprocs = <&dcp>, <&dcpext0>, <&dcpext1>, <&sio>, <&mtp>;
+};
+
+/*
+ * After a sleep that cuts the AP GPIO block's power, macOS puts back every pin but the ADT's
+ * no-restore-gpio-pins (j416s: 130, 131, 135), the global word first. The display firmware drives
+ * pins the boot loader set up here (note 77 §14.123-14.126).
+ */
+&pinctrl_ap {
+	apple,resume-restore-all;
+	gpio-reserved-ranges = <130 2>, <135 1>;
 };

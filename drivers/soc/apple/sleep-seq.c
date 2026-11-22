@@ -1765,11 +1765,15 @@ static void aseq_op_run(struct apple_sleep_seq *s, const struct apple_sleep_op *
 		break;
 	case SEQ_W64:
 		/* dispext_off: macOS's report words carry the external DCPs' requests until n24 #4 */
-		if (s->dispext_done && op->blk == s->soc->report_blk && op->off == s->soc->report_write)
-			writeq(op->val & ~((s->dispext_bound & BIT(0) ? 0 :
+		if (s->dispext_done && op->blk == s->soc->report_blk && op->off == s->soc->report_write) {
+			/* Unbound, or stopped by its driver for this sleep: its request goes */
+			u8 keep = s->dispext_bound & ~READ_ONCE(aseq_dispext_down);
+
+			writeq(op->val & ~((keep & BIT(0) ? 0 :
 					    BIT_ULL(s->soc->dispext_report_bit[0])) |
-					   (s->dispext_bound & BIT(1) ? 0 :
+					   (keep & BIT(1) ? 0 :
 					    BIT_ULL(s->soc->dispext_report_bit[1]))), reg);
+		}
 		else
 			writeq(op->val, reg);
 		break;
@@ -2104,6 +2108,37 @@ static void aseq_dispext_owned(struct apple_sleep_seq *s)
 			 owned, bound);
 	s->dispext_bound = owned;
 }
+
+/*
+ * An external DCP its driver stopped for this sleep (apple_sleep_dispext_down): owned and down,
+ * so its request leaves the PMP report as an unbound one's does. Set at the device's suspend,
+ * cleared at its resume; read at the entry's report write.
+ */
+static u8 aseq_dispext_down;
+
+void apple_sleep_dispext_down(struct device *dev, bool down)
+{
+	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);
+	struct resource r;
+
+	if (!s || of_address_to_resource(dev->of_node, 0, &r))
+		return;
+	for (unsigned int d = 0; d < s->soc->ndispext && d < 2; d++) {
+		int index = of_property_match_string(s->dev->of_node, "reg-names",
+						     s->soc->blocks[s->soc->dispext_asc[d]]);
+		struct resource asc;
+
+		if (index < 0 || of_address_to_resource(s->dev->of_node, index, &asc) ||
+		    !resource_overlaps(&r, &asc))
+			continue;
+		if (down)
+			WRITE_ONCE(aseq_dispext_down, READ_ONCE(aseq_dispext_down) | BIT(d));
+		else
+			WRITE_ONCE(aseq_dispext_down, READ_ONCE(aseq_dispext_down) & ~BIT(d));
+		dev_info(s->dev, "dispext%u: %s by its driver\n", d, down ? "stopped" : "back");
+	}
+}
+EXPORT_SYMBOL_GPL(apple_sleep_dispext_down);
 
 /* Each external DCP's CPU control and status (only with its cpu0 word not off) and its PS words */
 static void aseq_dispext_print(struct apple_sleep_seq *s, const char *when)

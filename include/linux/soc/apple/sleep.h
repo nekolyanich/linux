@@ -176,6 +176,8 @@ bool apple_sleep_bench_sep_sleep(void);
 bool apple_sleep_bench_sep_sleep_early(void);
 /* The SEP driver that sends the early SLEEP says so; sleep-seq's via_firmware guard asks */
 void apple_sleep_sep_early_set(struct device *dev, bool wired);
+/* An external DCP's driver stopped it for this sleep, or brought it back */
+void apple_sleep_dispext_down(struct device *dev, bool down);
 bool apple_sleep_sep_early_wired(void);
 
 
@@ -357,6 +359,10 @@ static inline bool apple_sleep_bench_sep_sleep_early(void)
 }
 
 static inline void apple_sleep_sep_early_set(struct device *dev, bool wired)
+{
+}
+
+static inline void apple_sleep_dispext_down(struct device *dev, bool down)
 {
 }
 

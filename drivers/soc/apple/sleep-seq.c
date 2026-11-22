@@ -546,6 +546,18 @@ bool apple_sleep_seq_bench(void)
 }
 
 /*
+ * Whether this system sleep is sleep-seq's S2R entry, as .enter will take it (the same gate):
+ * its drivers that stop for it at suspend_late (the PMP) ask, not each their own bench switch.
+ */
+bool apple_sleep_seq_s2r(void)
+{
+	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);
+
+	return s && s->mbox && bench && !dry_run && pm_suspend_target_state == PM_SUSPEND_MEM;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_seq_s2r);
+
+/*
  * pd335: the "now" read of E ACC (cluster + 0x20660) trapped and the bench's HV couldn't
  * take it. macOS writes the cluster's ACC, CPM and DVFS words without reading them first, so
  * by default neither the plan nor the run reads them; their saved[] stays invalid.

@@ -186,6 +186,7 @@ void apple_sleep_sep_gate_set(u8 gate);
  * not asked to stop (no firmware sleep, no bench_sleep), 2 stopped at suspend_late, 3 its
  * stop failed, 4 left for the commit, 5 idled at the commit, 6 its commit idle failed
  */
+bool apple_sleep_seq_s2r(void);
 void apple_sleep_pmp_state_set(u8 state);
 
 
@@ -381,6 +382,11 @@ static inline bool apple_sleep_sep_early_wired(void)
 
 static inline void apple_sleep_sep_gate_set(u8 gate)
 {
+}
+
+static inline bool apple_sleep_seq_s2r(void)
+{
+	return false;
 }
 
 static inline void apple_sleep_pmp_state_set(u8 state)

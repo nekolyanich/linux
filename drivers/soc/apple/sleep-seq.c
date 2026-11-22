@@ -386,6 +386,8 @@ struct apple_sleep_seq {
 	/* bit d: dcpext<d> is in the DT, so its driver owns it: its rows never run (rv-dpswitch Q4 #1) */
 	u8 dispext_bound;
 	bool dispext_done;
+	/* a wake brought dispext back: the next .begin runs its rows again */
+	bool dispext_again;
 	bool dispext_settled;
 	struct delayed_work dispext_work;
 	unsigned int dispext_tries;
@@ -2087,6 +2089,10 @@ static uint dispext_off = 1;
 module_param(dispext_off, uint, 0444);
 MODULE_PARM_DESC(dispext_off, "bench: dispext0/1's entry rows at boot (1) or .begin (2), 0 at the entry");
 
+static bool dispext_rerun = true;
+module_param(dispext_rerun, bool, 0644);
+MODULE_PARM_DESC(dispext_rerun, "bench: run dispext's entry rows again at the first .begin after a wake (0 = once per boot)");
+
 #define DISPEXT_TRIES	40	/* x 250 ms for the PMP report's driver */
 
 /* The rows from each external DCP's coproc stop through its last PS word */
@@ -2267,7 +2273,7 @@ static void aseq_dispext_report(struct apple_sleep_seq *s, unsigned int d)
 			 soc->dispext_report_bit[d], v);
 }
 
-/* The rows as the entry runs them, each with interrupts off; once per boot */
+/* The rows as the entry runs them, each with interrupts off; once per boot and again after each wake */
 static void aseq_dispext_run(struct apple_sleep_seq *s, const char *when)
 {
 	unsigned int i, n = 0;
@@ -2650,9 +2656,11 @@ static int aseq_begin(suspend_state_t state)
 	/* Nor the SEP's refusal of one: its gate is set again by its .suspend */
 	if (READ_ONCE(aseq_sep_gate) == 4)
 		WRITE_ONCE(aseq_sep_gate, 0);
-	if (state == PM_SUSPEND_MEM && bench && dispext_off == 2 && s->dispext_rows) {
+	if (state == PM_SUSPEND_MEM && bench && s->dispext_rows) {
 		aseq_dispext_print(s, "begin");
-		aseq_dispext_run(s, "begin");
+		if (dispext_off == 2 || s->dispext_again)
+			aseq_dispext_run(s, s->dispext_again ? "begin after a wake" : "begin");
+		s->dispext_again = false;
 	}
 	if (state == PM_SUSPEND_MEM && (smc_notify & SEQ_SMC_SLEEP)) {
 		ret = aseq_smc_warn(s);
@@ -2908,6 +2916,11 @@ static void aseq_resumed(struct apple_sleep_seq *s)
 			    (u64)((resumes - s->resumes_before) & 0xff) << 16 |
 			    (u64)(-s->resume_pmu_ret & 0xff) << 24);
 	s->resumed = true;
+	/* the wake reset the PMGR: dispext's rows ran for the last entry only (aurora d59a4511) */
+	if (s->dispext_done && READ_ONCE(dispext_rerun)) {
+		s->dispext_done = false;
+		s->dispext_again = true;
+	}
 	pr_emerg("apple-sleep: back from S2R: resumes %llu -> %llu, PMU boot_stage <- %#x: %d\n",
 		 s->resumes_before, resumes, stage, s->resume_pmu_ret);
 	if (READ_ONCE(hybrid) & ASEQ_HYBRID_NATIVE_EDGE_CNTPCT)

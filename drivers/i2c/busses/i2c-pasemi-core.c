@@ -450,6 +450,17 @@ int pasemi_i2c_common_probe(struct pasemi_smbus *smbus)
 }
 EXPORT_SYMBOL_GPL(pasemi_i2c_common_probe);
 
+/*
+ * After a sleep that cut the controller's power its divider, enable bit and
+ * FIFOs are back at their reset values: set them again (as aurora's runtime
+ * resume does after a domain power loss).
+ */
+void pasemi_i2c_reinit(struct pasemi_smbus *smbus)
+{
+	pasemi_reset(smbus);
+}
+EXPORT_SYMBOL_GPL(pasemi_i2c_reinit);
+
 irqreturn_t pasemi_irq_handler(int irq, void *dev_id)
 {
 	struct pasemi_smbus *smbus = dev_id;

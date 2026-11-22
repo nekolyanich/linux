@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 
 #include "i2c-pasemi-core.h"
@@ -91,6 +92,20 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
 
 static void pasemi_platform_i2c_remove(struct platform_device *pdev) { }
 
+/* Only a sleep with a power cut (a firmware resume) lost the registers */
+static int pasemi_platform_i2c_resume_noirq(struct device *dev)
+{
+	struct pasemi_platform_i2c_data *data = dev_get_drvdata(dev);
+
+	if (data && pm_resume_via_firmware())
+		pasemi_i2c_reinit(&data->smbus);
+	return 0;
+}
+
+static const struct dev_pm_ops pasemi_platform_i2c_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, pasemi_platform_i2c_resume_noirq)
+};
+
 static const struct of_device_id pasemi_platform_i2c_of_match[] = {
 	{ .compatible = "apple,t8103-i2c" },
 	{ .compatible = "apple,i2c" },
@@ -102,6 +117,7 @@ static struct platform_driver pasemi_platform_i2c_driver = {
 	.driver	= {
 		.name			= "i2c-apple",
 		.of_match_table		= pasemi_platform_i2c_of_match,
+		.pm			= pm_sleep_ptr(&pasemi_platform_i2c_pm_ops),
 	},
 	.probe	= pasemi_platform_i2c_probe,
 	.remove = pasemi_platform_i2c_remove,

@@ -3222,7 +3222,7 @@ impl SepData {
             return;
         };
         this.capture_epoch.store(epoch, Relaxed);
-        if workqueue::system()
+        if workqueue::system_dfl()
             .enqueue::<Arc<SepData>, ENROL_WORK_ID>(this.clone())
             .is_err()
         {
@@ -3236,7 +3236,7 @@ impl SepData {
             return;
         };
         this.capture_epoch.store(epoch, Relaxed);
-        if workqueue::system()
+        if workqueue::system_dfl()
             .enqueue::<Arc<SepData>, VERIFY_WORK_ID>(this.clone())
             .is_err()
         {

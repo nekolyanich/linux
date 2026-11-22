@@ -9,6 +9,7 @@ extern "C" {
     fn sep_store_open_host(path: *const c_char, created: *mut bool) -> *mut c_void;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
     fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
+    fn sep_store_open_partlabel(label: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_close(handle: *mut c_void);
     fn sep_store_size(handle: *mut c_void) -> i64;
     fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize) -> c_long;
@@ -112,6 +113,17 @@ impl StoreFile {
         // returns a live file or an error pointer.
         let handle = kernel::error::from_err_ptr(unsafe {
             sep_store_open_block(path.as_char_ptr(), c_int::from(writable))
+        })?;
+        Ok(StoreFile { handle })
+    }
+
+    /// The internal NVMe's partition named `label` in its GPT, opened as
+    /// [`Self::open_block`] opens its by-partlabel link, for when the link is
+    /// missing (no udev). `EPROBE_DEFER` while the disk may still be scanned.
+    pub(crate) fn open_partlabel(label: &CStr, writable: bool) -> Result<StoreFile> {
+        // SAFETY: as in `open_block`; `label` is NUL-terminated.
+        let handle = kernel::error::from_err_ptr(unsafe {
+            sep_store_open_partlabel(label.as_char_ptr(), c_int::from(writable))
         })?;
         Ok(StoreFile { handle })
     }

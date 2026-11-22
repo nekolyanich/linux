@@ -13,6 +13,11 @@
 
 #include <linux/cred.h>
 #include <linux/blkdev.h>
+#include <linux/device.h>
+#include <linux/file.h>
+#include <linux/kdev_t.h>
+#include <linux/ktime.h>
+#include <linux/timekeeping.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
@@ -100,6 +105,74 @@ void *sep_store_open_block(const char *path, int writable)
 		filp_close(f, NULL);
 		return ERR_PTR(-ENODEV);
 	}
+	return f;
+}
+
+/*
+ * The partition whose GPT name is @label on the internal NVMe, for when its
+ * by-partlabel link is missing: udev makes the link, and an initrd without
+ * udev (the bench's test-initrd) or a probe before udev has run has none.
+ * The block layer itself keeps each partition's GPT name (bd_meta_info, from
+ * the GPT parser) from the moment the disk is scanned. The device found is the
+ * one the link would point at; it is opened through its devtmpfs node as
+ * sep_store_open_block() opens the link, or, without devtmpfs, by its number.
+ * Not found while the disk may still be on its way: -EPROBE_DEFER.
+ */
+#define SEP_PARTLABEL_DEFER_MS	(60 * MSEC_PER_SEC)
+
+struct sep_partlabel_match {
+	const char *label;
+};
+
+static int sep_partlabel_match(struct device *dev, const void *data)
+{
+	const struct sep_partlabel_match *m = data;
+	struct block_device *bdev = dev_to_bdev(dev);
+
+	if (!bdev_is_partition(bdev) || !bdev->bd_meta_info)
+		return 0;
+	if (strcmp(bdev->bd_disk->disk_name, "nvme0n1"))
+		return 0;
+	return !strncmp((const char *)bdev->bd_meta_info->volname, m->label,
+			PARTITION_META_INFO_VOLNAMELTH);
+}
+
+void *sep_store_open_partlabel(const char *label, int writable)
+{
+	struct sep_partlabel_match m = { .label = label };
+	struct device *dev;
+	struct file *f;
+	char path[64];
+	dev_t devt;
+
+	dev = class_find_device(&block_class, NULL, &m, sep_partlabel_match);
+	if (!dev) {
+		if (ktime_to_ms(ktime_get_boottime()) < SEP_PARTLABEL_DEFER_MS)
+			return ERR_PTR(-EPROBE_DEFER);
+		return ERR_PTR(-ENOENT);
+	}
+	devt = dev->devt;
+	snprintf(path, sizeof(path), "/dev/%s", dev_name(dev));
+	put_device(dev);
+
+	f = sep_store_open_block(path, writable);
+	if (!IS_ERR(f) || PTR_ERR(f) != -ENOENT) {
+		if (!IS_ERR(f))
+			pr_info("apple_sep: %s is %s (by its GPT name, no by-partlabel link)\n",
+				label, path);
+		return f;
+	}
+	/* No devtmpfs node: the same device by its number, non-exclusive as the path open */
+	f = bdev_file_open_by_dev(devt, BLK_OPEN_READ | (writable ? BLK_OPEN_WRITE : 0),
+				  NULL, NULL);
+	if (IS_ERR(f))
+		return f;
+	if (writable && bdev_read_only(file_bdev(f))) {
+		fput(f);
+		return ERR_PTR(-ENODEV);
+	}
+	pr_info("apple_sep: %s is %u:%u (by its GPT name, no device node)\n", label,
+		MAJOR(devt), MINOR(devt));
 	return f;
 }
 

@@ -14,6 +14,8 @@ use kernel::prelude::*;
 /// The raw-extent owner opens this whole partition (the iBoot system container,
 /// where the gigalocker lives) and serves the gigalocker window directly.
 pub(crate) const OWNER_PATH: &CStr = c"/dev/disk/by-partlabel/iBootSystemContainer";
+/// Its GPT name, for when the link is missing.
+pub(crate) const OWNER_LABEL: &CStr = c"iBootSystemContainer";
 
 const BLOCK_SIZE: usize = 0x1000;
 const SLOT_SIZE: usize = 0x9000;
@@ -142,7 +144,11 @@ impl Store {
     /// an override of it. Writes additionally require a single-owner extent
     /// with no snapshots or pending revert, checked on the same block handle.
     pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
-        let file = shim::StoreFile::open_block(OWNER_PATH, writes_enabled)?;
+        // No link without udev (the bench's initrd): the same partition by its GPT name
+        let file = match shim::StoreFile::open_block(OWNER_PATH, writes_enabled) {
+            Err(e) if e == ENOENT => shim::StoreFile::open_partlabel(OWNER_LABEL, writes_enabled)?,
+            r => r?,
+        };
         let base = crate::xart_apfs::locate(&file, writes_enabled)?;
         if start_sector != 0 {
             if start_sector.checked_mul(512).ok_or(EINVAL)? != base {

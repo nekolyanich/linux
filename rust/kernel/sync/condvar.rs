@@ -198,6 +198,31 @@ impl CondVar {
         }
     }
 
+    /// Releases the lock and waits for a notification in uninterruptible, freezable mode.
+    ///
+    /// As [`CondVar::wait_timeout`]: signals do not wake it up, so the result is never
+    /// [`CondVarTimeoutResult::Signal`]. But the freezer can freeze the thread where it sleeps,
+    /// so a system suspend doesn't wait for the timeout (an uninterruptible sleep holds the
+    /// freezer up to its end, and the freezer gives up after 20 s). The timeout keeps running
+    /// while frozen; on the thaw the thread goes on with what is left of it, or none.
+    ///
+    /// The thread is frozen with whatever other locks it holds: only for a caller whose held
+    /// locks nothing on the suspend and resume path takes.
+    #[must_use = "wait_freezable_timeout may wake up spuriously, so the caller must check the return value"]
+    pub fn wait_freezable_timeout<T: ?Sized, B: Backend>(
+        &self,
+        guard: &mut Guard<'_, T, B>,
+        jiffies: Jiffies,
+    ) -> CondVarTimeoutResult {
+        let jiffies = jiffies.try_into().unwrap_or(MAX_SCHEDULE_TIMEOUT);
+        let res = self.wait_internal(TASK_UNINTERRUPTIBLE | TASK_FREEZABLE, guard, jiffies);
+
+        match res as Jiffies {
+            0 => CondVarTimeoutResult::Timeout,
+            jiffies => CondVarTimeoutResult::Woken { jiffies },
+        }
+    }
+
     /// Releases the lock and waits for a notification in interruptible mode.
     ///
     /// Atomically releases the given lock (whose ownership is proven by the guard) and puts the

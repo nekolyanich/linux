@@ -1279,7 +1279,7 @@ impl SepData {
         // SAFETY: a shim callback for this file.
         let auth = unsafe { file.auth() };
         auth.uses = auth.uses.saturating_add(1);
-        let max = *crate::module_parameters::credit_max_uses.value();
+        let max = crate::module_parameters::credit_max_uses.value();
         if !auth.window || status != 0 || (max != 0 && auth.uses >= max) {
             self.key_auth_forget(auth);
             auth.last = AUTH_IDLE;
@@ -1930,7 +1930,7 @@ impl SepData {
             // provision_keybag=0 (the bench's copies of m2pro's state) makes
             // none, as at the Touch ID bring-up.
             None if how == Home::Create
-                && *crate::module_parameters::provision_keybag.value() != 0
+                && crate::module_parameters::provision_keybag.value() != 0
                 && !crate::userbag::stored_checked(file.uid)? =>
             {
                 if !self.sks_provision_identity_keybag() {
@@ -2139,7 +2139,7 @@ impl SepData {
         let Some(mut s) = self.soft_get(uid) else {
             return Ok(());
         };
-        let hours = *crate::module_parameters::password_every_h.value();
+        let hours = crate::module_parameters::password_every_h.value();
         if hours != 0 && s.last_password_ns != 0 && self.bag_secret(uid).is_some() {
             let age = crate::shim::boottime_ns().saturating_sub(s.last_password_ns);
             if age > u64::from(hours) * 3_600_000_000_000 {
@@ -2170,7 +2170,7 @@ impl SepData {
             s.failed = 0;
         } else {
             s.failed = s.failed.saturating_add(1);
-            let max = *crate::module_parameters::failed_matches_lock.value();
+            let max = crate::module_parameters::failed_matches_lock.value();
             if max != 0 && s.failed >= max && self.bag_secret(uid).is_some() {
                 dev_info!(self.dev, "sep-key: uid {}'s bag: {} failed matches, locked\n", uid, s.failed);
                 s.lock_pending = true;

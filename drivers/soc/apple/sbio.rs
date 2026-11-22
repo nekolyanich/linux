@@ -424,7 +424,7 @@ impl SepData {
         // save-pending bit. J313, J414s and J314s each restored a fresh
         // enrollment after this export and user-before-master completion.
         // Every profile now does this.
-        if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
+        if self.profile.persistent_enrol || module_parameters::j414s_persistent_enrol.value() != 0 {
             if owner_initial_state == Some(0x3)
                 && !self.save_catacomb(
                     crate::sbio::CatacombUser::OWNER,
@@ -517,7 +517,7 @@ impl SepData {
     }
 
     fn probe_owner_export(&self) {
-        if *module_parameters::probe_owner_export.value() == 0 {
+        if module_parameters::probe_owner_export.value() == 0 {
             return;
         }
         if self.templates_restored.load(Relaxed)
@@ -822,7 +822,7 @@ impl SepData {
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
-        if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
+        if self.profile.persistent_enrol || module_parameters::j414s_persistent_enrol.value() != 0 {
             return self.save_all_components_user_first(user);
         }
         // On m2fix11, a completed enrollment marked both master and user 0x7,
@@ -1230,7 +1230,7 @@ impl SepData {
             return;
         }
         diag::keystore_open();
-        if *module_parameters::provision_keybag.value() != 0 {
+        if module_parameters::provision_keybag.value() != 0 {
             if !self.xart_writable() {
                 dev_err!(
                     self.dev,
@@ -1882,7 +1882,7 @@ impl SepData {
     }
 
     fn sensor_trace(&self, step: &CStr) {
-        if *module_parameters::sensor_trace.value() != 0 {
+        if module_parameters::sensor_trace.value() != 0 {
             dev_info!(self.dev, "sensor: {} done at {} ms\n", step, self.sensor_ms());
         }
     }
@@ -2161,7 +2161,7 @@ impl SepData {
                 answered_without_identifier = true;
                 continue;
             };
-            if *module_parameters::sensor_trace.value() != 0 {
+            if module_parameters::sensor_trace.value() != 0 {
                 dev_info!(
                     self.dev,
                     "sensor: identifier present {} ms after power-on\n",

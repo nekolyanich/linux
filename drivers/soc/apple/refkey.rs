@@ -167,7 +167,7 @@ impl SepData {
     fn machine_refkey_path() -> &'static CStr {
         const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/aurora-sep-refkey.bin";
         const MACHINE_REFKEY_V2_PATH: &CStr = c"/var/lib/aurora-sep-refkey-v2.bin";
-        if *crate::module_parameters::refkey_v2.value() != 0 {
+        if crate::module_parameters::refkey_v2.value() != 0 {
             MACHINE_REFKEY_V2_PATH
         } else {
             MACHINE_REFKEY_PATH

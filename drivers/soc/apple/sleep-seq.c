@@ -2116,7 +2116,7 @@ module_param(dispext_off, uint, 0444);
 MODULE_PARM_DESC(dispext_off, "bench: dispext0/1's entry rows at boot (1) or .begin (2), 0 at the entry");
 
 static bool dispext_rerun = true;
-module_param(dispext_rerun, bool, 0644);
+module_param(dispext_rerun, bool, 0444);
 MODULE_PARM_DESC(dispext_rerun, "bench: run dispext's entry rows again at the first .begin after a wake (0 = once per boot)");
 
 #define DISPEXT_TRIES	40	/* x 250 ms for the PMP report's driver */
@@ -2943,7 +2943,7 @@ static void aseq_resumed(struct apple_sleep_seq *s)
 			    (u64)(-s->resume_pmu_ret & 0xff) << 24);
 	s->resumed = true;
 	/* the wake reset the PMGR: dispext's rows ran for the last entry only (aurora d59a4511) */
-	if (s->dispext_done && READ_ONCE(dispext_rerun)) {
+	if (s->dispext_done && dispext_rerun) {
 		s->dispext_done = false;
 		s->dispext_again = true;
 	}

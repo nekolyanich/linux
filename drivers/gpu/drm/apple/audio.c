@@ -79,10 +79,11 @@ struct dcp_audio {
 #define DCPAUD_MAX_PERIODS	16
 
 /*
- * System sleep with a stream open (aurora 327c774e's legacy part, by function): suspend the
- * stream the ALSA way, so its SIO channel is idle when SIO's firmware stops for the sleep.
- * Off by default: a daily sleep keeps today's behaviour (the stream runs on into the sleep, and
- * the display's sink drop stops it DISCONNECTED).
+ * System sleep with a stream open (aurora 327c774e's legacy part, by function). The ALSA core
+ * suspends an open stream at every system sleep anyway, from the PCM device's own suspend
+ * (sound/core/pcm.c, do_pcm_suspend); its order against this device and the display's sink drop
+ * is not checked on m2pro (rv-dpaudio, batch 14). This switch only moves that suspend earlier,
+ * to this device's .prepare (before any device suspends) and its .suspend. Off by default.
  */
 static bool sleep_suspend_stream;
 module_param(sleep_suspend_stream, bool, 0444);
@@ -353,12 +354,17 @@ static int dcpaud_connection_up(struct dcp_audio *dcpaud)
 }
 
 /*
- * A stream suspended for a system sleep (sleep_suspend_stream) is kept when the display drops
- * its sink for the sleep (dcpaud_report_hotplug()), and goes on with the sink connected after the
- * wake (aurora 327c774e, by function on our cookies): its next hw_params or prepare reads that
- * sink's elements and takes its connection. A prepare (userspace recovering the suspended stream)
- * selects the stream's element anew from its parameters. Without a sink, or with one that does
- * not take the stream's format, the stream fails and userspace opens a new one.
+ * A stream suspended for a system sleep is kept when the display drops its sink for the sleep
+ * (dcpaud_report_hotplug()), and goes on with the sink connected after the wake (aurora 327c774e,
+ * by function on our cookies). Live on every sleep, with or without sleep_suspend_stream: the
+ * ALSA core suspends open streams itself (rv-dpaudio, batch 14: accepted as the fix for the
+ * DISCONNECTED stream after a wake). Its next hw_params or prepare reads that sink's elements and
+ * takes its connection; a prepare (userspace recovering the suspended stream) selects the
+ * stream's element anew from its parameters. Without a sink, or with one that does not take the
+ * stream's format, the stream fails and userspace opens a new one: a prepare before the sink is
+ * back gets -ENXIO, and PipeWire reopens. The connection cookie is read here and stored after
+ * the elements are read, outside the lock: a sink drop in between leaves the stream on the old
+ * cookie, which the next START refuses (-ENXIO).
  */
 static int dcpaud_take_kept(struct dcp_audio *dcpaud, struct snd_pcm_runtime *runtime)
 {
@@ -496,8 +502,9 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	/*
 	 * A suspended stream's DMA ends, as on STOP: a paused SIO channel stays busy, and the SIO
-	 * firmware stops in the sleep. Only snd_pcm_suspend_all() sends SUSPEND here, and only
-	 * with sleep_suspend_stream.
+	 * firmware stops in the sleep. SUSPEND comes from snd_pcm_suspend_all() at every system
+	 * sleep (the ALSA core's, or sleep_suspend_stream's earlier one). With no PAUSE in the
+	 * PCM's info, dmaengine terminated the DMA on SUSPEND before this too.
 	 */
 	ret = snd_dmaengine_pcm_trigger(substream, cmd == SNDRV_PCM_TRIGGER_SUSPEND ?
 					SNDRV_PCM_TRIGGER_STOP : cmd);
@@ -727,7 +734,8 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 		/*
 		 * One suspended for a system sleep is kept: the display drops its sink for the
 		 * sleep, and the stream goes on with the sink connected after the wake, see
-		 * dcpaud_take_kept(). Only sleep_suspend_stream suspends a stream.
+		 * dcpaud_take_kept(). The ALSA core suspends open streams at every sleep, so this
+		 * is live by default, provided its suspend runs before the sink drop.
 		 */
 		if (substream->runtime && substream->runtime->state == SNDRV_PCM_STATE_SUSPENDED)
 			WRITE_ONCE(dcpaud->kept, true);

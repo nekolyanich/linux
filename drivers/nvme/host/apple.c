@@ -243,20 +243,20 @@ MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
  * off in the noirq phase once the controller has suspended.
  */
 static bool sleep_keep_ps;
-module_param(sleep_keep_ps, bool, 0644);
+module_param(sleep_keep_ps, bool, 0444);
 MODULE_PARM_DESC(sleep_keep_ps,
 		 "Bench: leave the controller's power domains on across system sleep, as macOS");
 
 /* Bench: macOS gives ANS AP/IOP 0x201 for sleep (Tanabota census), not the RTKit shutdown. */
 static bool sleep_idle;
-module_param(sleep_idle, bool, 0644);
+module_param(sleep_idle, bool, 0444);
 
 /*
  * Bench (note 77 §14.18): the reset work frees RTKit's buffers (apple_rtkit_reinit -> the SART's remove) while
  * ANS2's reset is asserted; after an S3 wake that SART access raises an SError. 1: reinit first, then the reset.
  */
 static bool bench_reinit_first;
-module_param(bench_reinit_first, bool, 0644);
+module_param(bench_reinit_first, bool, 0444);
 
 /*
  * Bench (note 77 §14.20): the ADT's /arm-io/ans tunables. iBoot applies them at boot and an S3 power loss
@@ -265,14 +265,14 @@ module_param(bench_reinit_first, bool, 0644);
  * reg 4 and 5. Bits: 1 reads and prints them, 2 applies the AIU ones, 4 the lane one (where a word differs).
  */
 static int bench_ans_tunables;
-module_param(bench_ans_tunables, int, 0644);
+module_param(bench_ans_tunables, int, 0444);
 
 /*
  * Bench (review 8 §3): ANS's -62 after the wake is the AP_PWR_STATE ON wait (1 s), and macOS sends AP ON 97 s
  * after its HELLO. t6020: the RTKit handshake timeout of the reset work's boot, in ms (0: RTKit's 1 s).
  */
 static unsigned int bench_ans_handshake_ms;
-module_param(bench_ans_handshake_ms, uint, 0644);
+module_param(bench_ans_handshake_ms, uint, 0444);
 
 struct apple_ans_tunable {
 	u32 off, mask, val;

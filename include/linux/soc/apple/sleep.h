@@ -181,6 +181,12 @@ void apple_sleep_dispext_down(struct device *dev, bool down);
 bool apple_sleep_sep_early_wired(void);
 /* The SEP driver's sleep gate for the entry crumb: 0 open, 1 draining, 2 told, 3 lost, 4 refused */
 void apple_sleep_sep_gate_set(u8 gate);
+/*
+ * The PMP driver's sleep state for the bench's crumbs: 0 not registered, 1 registered but
+ * not asked to stop (no firmware sleep, no bench_sleep), 2 stopped at suspend_late, 3 its
+ * stop failed, 4 left for the commit, 5 idled at the commit, 6 its commit idle failed
+ */
+void apple_sleep_pmp_state_set(u8 state);
 
 
 /*
@@ -374,6 +380,10 @@ static inline bool apple_sleep_sep_early_wired(void)
 }
 
 static inline void apple_sleep_sep_gate_set(u8 gate)
+{
+}
+
+static inline void apple_sleep_pmp_state_set(u8 state)
 {
 }
 

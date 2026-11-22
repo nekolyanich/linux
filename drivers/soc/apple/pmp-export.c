@@ -16,6 +16,7 @@
 #include <linux/of_address.h>
 #include <linux/pm.h>
 #include <linux/soc/apple/pmp.h>
+#include <linux/soc/apple/boot-crumb.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
@@ -27,6 +28,17 @@ static struct device *pmp_device;
 static struct apple_rtkit *pmp_rtk;
 static void __iomem *pmp_asc;
 static bool pmp_asleep, pmp_commit_registered, pmp_commit_used;
+
+/*
+ * Bench crumbs (boot_stage, EL2 with spmi_apple_controller.boot_crumb=1): 0x40 + the state at
+ * suspend_late and at the commit (see apple_sleep_pmp_state_set), overwritten by the entry's
+ * later crumbs; apple_sleep.pmp_crumb carries the last one to the crumb before commit 2.
+ */
+static void apple_pmp_state(u8 state)
+{
+	apple_sleep_pmp_state_set(state);
+	apple_spmi_boot_crumb(0x40 + state);
+}
 
 static bool bench_sleep;
 module_param(bench_sleep, bool, 0444);
@@ -45,6 +57,7 @@ int apple_pmp_register(struct device *dev, struct apple_rtkit *rtk)
 		return -ENOMEM;
 	pmp_device = dev;
 	pmp_rtk = rtk;
+	apple_sleep_pmp_state_set(1);
 	return 0;
 }
 
@@ -53,6 +66,7 @@ void apple_pmp_unregister(struct device *dev)
 	guard(mutex)(&pmp_lock);
 	if (pmp_device != dev)
 		return;
+	apple_sleep_pmp_state_set(0);
 	if (pmp_commit_registered)
 		apple_sleep_coproc_unregister(dev);
 	pmp_commit_registered = false;
@@ -66,8 +80,11 @@ void apple_pmp_unregister(struct device *dev)
 static int apple_pmp_commit_stop_fn(void *unused)
 {
 	unsigned int us;
+	int ret = apple_rtkit_sleep_idle_polled(pmp_rtk, pmp_asc + APPLE_PMP_ASC_CPU_CONTROL, &us);
 
-	return apple_rtkit_sleep_idle_polled(pmp_rtk, pmp_asc + APPLE_PMP_ASC_CPU_CONTROL, &us);
+	/* No crumb write here: the SPMI path takes a lock the commit can't */
+	apple_sleep_pmp_state_set(ret ? 6 : 5);
+	return ret;
 }
 
 static bool apple_pmp_commit_available(struct device *dev)
@@ -85,8 +102,10 @@ static int apple_pmp_suspend_late(struct device *dev)
 	bool at_commit;
 	int ret;
 
-	if (!pm_suspend_via_firmware() && !bench_sleep)
+	if (!pm_suspend_via_firmware() && !bench_sleep) {
+		apple_sleep_pmp_state_set(pmp_device == dev ? 1 : 0);
 		return 0;
+	}
 
 	guard(mutex)(&pmp_lock);
 	if (pmp_device != dev || pmp_asleep || !pmp_rtk)
@@ -101,14 +120,17 @@ static int apple_pmp_suspend_late(struct device *dev)
 	if (at_commit) {
 		apple_sleep_coproc_set_ready(dev, true);
 		pmp_commit_used = true;
+		apple_pmp_state(4);
 		dev_info(dev, "idle and stop left for the sleep's commit\n");
 	} else {
 		ret = apple_rtkit_sleep_stop(pmp_rtk, pmp_asc + APPLE_PMP_ASC_CPU_CONTROL);
 		if (ret) {
+			apple_pmp_state(3);
 			if (apple_rtkit_sleep_return(pmp_rtk, pmp_asc + APPLE_PMP_ASC_CPU_CONTROL))
 				dev_err(dev, "firmware did not come back\n");
 			return dev_err_probe(dev, ret, "firmware did not go idle for sleep\n");
 		}
+		apple_pmp_state(2);
 		dev_info(dev, "firmware idle and stopped for sleep\n");
 	}
 	pmp_asleep = true;

@@ -521,6 +521,22 @@ void apple_sleep_sep_gate_set(u8 gate)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_sep_gate_set);
 
+/*
+ * Bench (apple_sleep.pmp_crumb, with hybrid bit 28): crumb 0x62's spot, the last write before
+ * commit 2 without bits 29/30, becomes 0xc0 | the PMP's sleep state (apple_sleep_pmp_state_set;
+ * 0xc0 means no PMP driver registered). Takes the spot ahead of smc_crumb.
+ */
+static bool pmp_crumb;
+module_param(pmp_crumb, bool, 0444);
+MODULE_PARM_DESC(pmp_crumb, "bench: crumb 0x62's spot carries the PMP's sleep state (0xc0 | state)");
+static u8 aseq_pmp_state;
+
+void apple_sleep_pmp_state_set(u8 state)
+{
+	WRITE_ONCE(aseq_pmp_state, state);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_pmp_state_set);
+
 /* For sleep.c's co-processor registry, which refuses below EL2 off the bench */
 bool apple_sleep_seq_bench(void)
 {
@@ -1670,7 +1686,9 @@ static void aseq_crumb(struct apple_sleep_seq *s, u64 val, u32 extra_bit)
 
 	if (val == 0x63 && (READ_ONCE(hybrid) & ASEQ_HYBRID_STATE_DUMP))
 		c = aseq_ps_crumb;
-	if (val == 0x62 && smc_crumb)
+	if (val == 0x62 && pmp_crumb)
+		c = 0xc0 | (READ_ONCE(aseq_pmp_state) & 0x0f);
+	else if (val == 0x62 && smc_crumb)
 		c = 0xa0 | (READ_ONCE(aseq_smc_bits) & 0x1f);
 	aseq_crumb_raw(s, c, extra_bit);
 }

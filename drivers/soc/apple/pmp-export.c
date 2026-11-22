@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * The PMP across a system sleep (aurora's pmp-export.c, by function, for t6020's
- * t6000-pmp-v2, which keeps no SRAM): idled and its CPU stopped with its RTKit
- * session kept, and restarted warm after a real wake. With apple_pmp.bench_sleep
+ * t6000-pmp-v2): idled and its CPU stopped with its RTKit session kept, and restarted
+ * warm after a real wake. Its 1 MB SRAM doesn't survive the cut (note 84 §27): on the
+ * bench, apple_pmp.bench_sram=2 keeps it (native5's 86bcd0ab, by function). With apple_pmp.bench_sleep
  * (the m1n1 bench, as native5's t4-a ran) at suspend_late; otherwise, for a
  * suspend via firmware, at the sleep's commit through apple-sleep's coprocessor
  * registry. Any other sleep leaves it running, as before.
@@ -19,7 +20,9 @@
 #include <linux/soc/apple/boot-crumb.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/sizes.h>
 #include <linux/suspend.h>
+#include <linux/vmalloc.h>
 
 #define APPLE_PMP_ASC_CPU_CONTROL	0x44
 
@@ -30,6 +33,75 @@ static void __iomem *pmp_asc;
 static bool pmp_asleep, pmp_commit_registered, pmp_commit_used;
 /* The last real wake didn't bring it back: left stopped, not idled again (state 7) */
 static bool pmp_wake_failed;
+
+/*
+ * Bench (note 82 §4.1, from Ante042's t6000 S2R: his pmp_pc_stop/start keep the PMP's whole SRAM;
+ * native5 86bcd0ab, 9 of 9 wakes back against -62 8 of 8): 1 prints an SRAM checksum at the sleep
+ * and before the wake's restart (changed = lost); 2 also keeps all of it and writes it back before
+ * the restart. Read at register; hybrid bit 6 means 2, bit 5 means 1. Only the bench_sleep stop at
+ * suspend_late keeps it: the commit-time stop (a firmware sleep) doesn't yet.
+ */
+static uint bench_sram;
+module_param(bench_sram, uint, 0444);
+MODULE_PARM_DESC(bench_sram, "bench: 1 checksums the PMP's SRAM over a sleep, 2 also keeps and writes it back");
+
+static unsigned int pmp_sram_mode;
+static void __iomem *pmp_sram;
+static size_t pmp_sram_size;
+static u32 *pmp_sram_copy, pmp_sram_sum;
+static bool pmp_sram_kept;
+
+static u32 apple_pmp_bench_sram(void)
+{
+	u32 m = apple_sleep_bench_hybrid();
+
+	return max(bench_sram, (m & APPLE_SLEEP_HYBRID_PMP_SRAM) ? 2U :
+			       (m & APPLE_SLEEP_HYBRID_READS) ? 1U : 0U);
+}
+
+static u32 apple_pmp_sram_sum(void)
+{
+	u32 sum = 0;
+
+	for (size_t off = 0; off < pmp_sram_size; off += 4)
+		sum = rol32(sum, 1) ^ readl_relaxed(pmp_sram + off);
+	return sum;
+}
+
+/* At register: the mapping, and with 2 the copy's room, so a sleep never allocates it */
+static void apple_pmp_sram_setup(struct device *dev)
+{
+	struct resource res;
+	int idx;
+
+	pmp_sram_mode = apple_pmp_bench_sram();
+	if (!pmp_sram_mode)
+		return;
+	idx = of_property_match_string(dev->of_node, "reg-names", "pmp");
+	if (idx < 0 || of_address_to_resource(dev->of_node, idx, &res)) {
+		dev_warn(dev, "bench: no \"pmp\" SRAM range\n");
+		return;
+	}
+	pmp_sram_size = min_t(size_t, resource_size(&res), SZ_1M) & ~(size_t)3;
+	/* As the driver's own mapping of it: non-posted where the bus is */
+	pmp_sram = (res.flags & IORESOURCE_MEM_NONPOSTED) ? ioremap_np(res.start, pmp_sram_size) :
+							       ioremap(res.start, pmp_sram_size);
+	if (pmp_sram && pmp_sram_mode >= 2)
+		pmp_sram_copy = vmalloc(pmp_sram_size);
+	dev_info(dev, "bench: SRAM %s: %zu bytes at %pa, %s\n", pmp_sram_mode >= 2 ? "keep" : "checksum",
+		 pmp_sram_size, &res.start,
+		 !pmp_sram ? "not mapped" : pmp_sram_mode < 2 || pmp_sram_copy ? "ready" : "no room");
+}
+
+static void apple_pmp_sram_teardown(void)
+{
+	vfree(pmp_sram_copy);
+	pmp_sram_copy = NULL;
+	if (pmp_sram)
+		iounmap(pmp_sram);
+	pmp_sram = NULL;
+	pmp_sram_kept = false;
+}
 
 /*
  * Bench crumbs (boot_stage, EL2 with spmi_apple_controller.boot_crumb=1): 0x40 + the state at
@@ -81,6 +153,7 @@ int apple_pmp_register(struct device *dev, struct apple_rtkit *rtk)
 		return -ENOMEM;
 	pmp_device = dev;
 	pmp_rtk = rtk;
+	apple_pmp_sram_setup(dev);
 	apple_sleep_pmp_state_set(1);
 	/* Never put: no rmmod once the PMP can be stopped for a sleep */
 	if (apple_pmp_keep_bound())
@@ -99,6 +172,7 @@ void apple_pmp_unregister(struct device *dev)
 	pmp_commit_registered = false;
 	iounmap(pmp_asc);
 	pmp_asc = NULL;
+	apple_pmp_sram_teardown();
 	pmp_rtk = NULL;
 	pmp_device = NULL;
 }
@@ -149,6 +223,11 @@ static int apple_pmp_suspend_late(struct device *dev)
 		dev_err(dev, "no stop at the sleep's commit: refusing the sleep\n");
 		return -EBUSY;
 	}
+	/* The keep's room was taken at register: without it this stop would lose the SRAM */
+	if (!at_commit && pmp_sram_mode >= 2 && (!pmp_sram || !pmp_sram_copy)) {
+		dev_err(dev, "bench: no room to keep the SRAM: refusing the sleep\n");
+		return -ENOMEM;
+	}
 	if (at_commit) {
 		apple_sleep_coproc_set_ready(dev, true);
 		pmp_commit_used = true;
@@ -163,6 +242,16 @@ static int apple_pmp_suspend_late(struct device *dev)
 			return dev_err_probe(dev, ret, "firmware did not go idle for sleep\n");
 		}
 		apple_pmp_state(2);
+		if (pmp_sram) {
+			pmp_sram_sum = apple_pmp_sram_sum();
+			if (pmp_sram_copy) {
+				for (size_t i = 0; i < pmp_sram_size / 4; i++)
+					pmp_sram_copy[i] = readl_relaxed(pmp_sram + 4 * i);
+				pmp_sram_kept = true;
+			}
+			dev_info(dev, "bench: SRAM at the sleep: sum %#010x, %zu bytes kept\n",
+				 pmp_sram_sum, pmp_sram_kept ? pmp_sram_size : 0);
+		}
 		dev_info(dev, "firmware idle and stopped for sleep\n");
 	}
 	pmp_asleep = true;
@@ -184,7 +273,7 @@ static int apple_pmp_resume_early(struct device *dev)
 		apple_sleep_coproc_set_ready(dev, false);
 		if (!pm_resume_via_firmware() && !stopped) {
 			pmp_asleep = false;
-		pmp_wake_failed = false;
+			pmp_wake_failed = false;
 			dev_info(dev, "sleep refused before the commit: firmware never stopped\n");
 			return 0;
 		}
@@ -199,9 +288,12 @@ static int apple_pmp_resume_early(struct device *dev)
 	if (!pm_resume_via_firmware()) {
 		void __iomem *control = pmp_asc + APPLE_PMP_ASC_CPU_CONTROL;
 
+		/* Refused: its power was kept, so its SRAM too; the copy is stale from here */
+		pmp_sram_kept = false;
+
 		if (!apple_rtkit_sleep_return(pmp_rtk, control)) {
 			pmp_asleep = false;
-		pmp_wake_failed = false;
+			pmp_wake_failed = false;
 			dev_info(dev, "sleep refused: firmware still ran\n");
 			return 0;
 		}
@@ -217,6 +309,20 @@ static int apple_pmp_resume_early(struct device *dev)
 		pmp_wake_failed = false;
 		dev_info(dev, "sleep refused: firmware back after a reset\n");
 		return 0;
+	}
+	if (pmp_sram) {
+		u32 sum = apple_pmp_sram_sum();
+
+		dev_info(dev, "bench: SRAM before the restart: sum %#010x, at the sleep %#010x: %s\n",
+			 sum, pmp_sram_sum, sum == pmp_sram_sum ? "kept" : "changed");
+	}
+	/* The firmware is stopped: its SRAM back, and read back so RUN can't overtake the writes */
+	if (pmp_sram_kept) {
+		for (size_t i = 0; i < pmp_sram_size / 4; i++)
+			writel_relaxed(pmp_sram_copy[i], pmp_sram + 4 * i);
+		(void)readl(pmp_sram);
+		pmp_sram_kept = false;
+		dev_info(dev, "bench: SRAM restored: %zu bytes\n", pmp_sram_size);
 	}
 	ret = apple_rtkit_sleep_return(pmp_rtk, pmp_asc + APPLE_PMP_ASC_CPU_CONTROL);
 	if (ret) {

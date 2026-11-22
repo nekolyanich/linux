@@ -203,6 +203,20 @@ int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on);
 int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on);
 
 /*
+ * A coprocessor's sleep with its session kept (aurora): idle it and stop its
+ * CPU (@cpu_control is its ASC CPU_CONTROL word); after the wake restart the
+ * session warm, keeping its endpoints and buffers, and run the CPU again.
+ * power_cycled_return() is the same after its power was cycled without a
+ * system sleep. warm_restart() alone restarts the session.
+ */
+int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control);
+int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control);
+int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_control);
+int apple_rtkit_warm_restart(struct apple_rtkit *rtk);
+void apple_rtkit_mailbox_off(struct apple_rtkit *rtk);
+void apple_rtkit_set_warm_epmap_mask(struct apple_rtkit *rtk, u32 last_mask);
+
+/*
  * Checks if an endpoint with a given index exists
  *
  * @rtk:            RTKit reference

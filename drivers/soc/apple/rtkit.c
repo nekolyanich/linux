@@ -5,10 +5,19 @@
  */
 
 #include <linux/delay.h>
+#include <linux/suspend.h>
+#include <linux/iopoll.h>
 #include "rtkit-internal.h"
 
 /* Default wait for each handshake reply, see apple_rtkit_set_handshake_timeout() (aurora) */
 #define APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS 1000
+
+/* The ASC CPU's registers, as the callers pass them (aurora) */
+#define APPLE_ASC_CPU_CONTROL_RUN	BIT(4)
+#define APPLE_ASC_CPU_STATUS		4
+#define APPLE_ASC_CPU_STATUS_STOPPED	BIT(1)
+#define APPLE_ASC_CPU_STATUS_IDLE	BIT(5)
+#define APPLE_ASC_CPU_STATUS_DOWN	(APPLE_ASC_CPU_STATUS_STOPPED | APPLE_ASC_CPU_STATUS_IDLE)
 
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
@@ -178,10 +187,29 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	else
 		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 
+	/*
+	 * macOS's reply to a restarted coprocessor echoes the map, and adds bit 1
+	 * to the first part: 0x51d becomes 0x51f. It starts no endpoints.
+	 * Measured under aura on a DCP, 3 of 3 (aurora).
+	 */
+	if (rtk->warm_restart) {
+		if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
+			reply |= bitmap & rtk->warm_last_mask;
+		else
+			reply |= bitmap | BIT_ULL(1);
+	}
+
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
 
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
+
+	if (rtk->warm_restart) {
+		rtk->warm_restart = false;
+		rtk->boot_result = 0;
+		complete_all(&rtk->epmap_completion);
+		return;
+	}
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		switch (ep) {
@@ -267,6 +295,32 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	u64 reply;
 	int err;
 
+	/*
+	 * After a warm restart the session's buffers are live (aurora): an
+	 * identical request gets the same reply again, a changed one is refused.
+	 */
+	if (rtk->warm_session && buffer->size) {
+		size_t size;
+		dma_addr_t iova;
+
+		if (ep == APPLE_RTKIT_EP_OSLOG) {
+			size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg);
+			iova = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg) << 12;
+		} else {
+			size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
+			iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
+		}
+		if (size != buffer->size || (iova != buffer->iova && (iova || buffer->is_mapped))) {
+			dev_err(rtk->dev,
+				"RTKit: buffer request for 0x%zx bytes at %pad while 0x%zx bytes at %pad are live\n",
+				size, &iova, buffer->size, &buffer->iova);
+			return -EBUSY;
+		}
+		if (buffer->is_mapped)
+			return 0;
+		goto reply;
+	}
+
 	/* The different size vs. IOVA shifts look odd but are indeed correct this way */
 	if (ep == APPLE_RTKIT_EP_OSLOG) {
 		buffer->size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg);
@@ -301,6 +355,7 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		}
 	}
 
+reply:
 	if (!buffer->is_mapped) {
 		/* oslog uses different fields and needs a shifted IOVA instead of size */
 		if (ep == APPLE_RTKIT_EP_OSLOG) {
@@ -710,6 +765,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->cookie = cookie;
 	rtk->ops = ops;
 	rtk->handshake_timeout_ms = APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
+	rtk->warm_last_mask = U32_MAX;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
@@ -819,6 +875,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
 	rtk->crashed = false;
+	rtk->warm_session = false;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
@@ -962,6 +1019,147 @@ int apple_rtkit_idle(struct apple_rtkit *rtk)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_idle);
+
+/*
+ * A coprocessor's sleep with its session kept (aurora, by function), for the
+ * drivers that ask for it; nothing else changes. The firmware is idled (AP
+ * and IOP 0x201), its CPU waited for down, the mailbox stopped and the CPU
+ * stopped; after the wake the session is restarted warm, keeping its
+ * endpoints and buffers, and the CPU run again.
+ */
+static void apple_rtkit_detach_rx(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+
+	apple_mbox_stop(rtk->mbox);
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	if (rtk->mbox->cookie == rtk)
+		rtk->mbox->rx = NULL;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
+
+void apple_rtkit_mailbox_off(struct apple_rtkit *rtk)
+{
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_mailbox_off);
+
+void apple_rtkit_set_warm_epmap_mask(struct apple_rtkit *rtk, u32 last_mask)
+{
+	rtk->warm_last_mask = last_mask;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_warm_epmap_mask);
+
+int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+	int ret;
+
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+
+	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+
+	rtk->crashed = false;
+	rtk->warm_restart = true;
+	rtk->warm_session = true;
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		rtk->warm_restart = false;
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_warm_restart);
+
+static int apple_rtkit_sleep_idle(struct apple_rtkit *rtk, void __iomem *cpu_control)
+{
+	u32 status;
+	int ret;
+
+	ret = apple_rtkit_idle(rtk);
+	if (ret)
+		return ret;
+
+	ret = readl_poll_timeout(cpu_control + APPLE_ASC_CPU_STATUS, status,
+				 (status & APPLE_ASC_CPU_STATUS_DOWN) == APPLE_ASC_CPU_STATUS_DOWN,
+				 100, 5000);
+	/* Both idles took, so it doesn't run on: stop it as if the status had shown it. */
+	if (ret)
+		dev_warn(rtk->dev, "RTKit: idle, but not stopped: status %#x\n", status);
+
+	return 0;
+}
+
+int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control)
+{
+	int ret;
+
+	ret = apple_rtkit_sleep_idle(rtk, cpu_control);
+	if (ret)
+		return ret;
+
+	apple_rtkit_mailbox_off(rtk);
+
+	/* Twice, each time from what it reads back. */
+	writel(readl(cpu_control) & ~APPLE_ASC_CPU_CONTROL_RUN, cpu_control);
+	writel(readl(cpu_control) & ~APPLE_ASC_CPU_CONTROL_RUN, cpu_control);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_sleep_stop);
+
+int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
+{
+	int ret;
+
+	/*
+	 * No real sleep: a firmware that idled doesn't come back from that with
+	 * its power kept, and stays down until the next sleep restarts it. One
+	 * whose idle failed still runs.
+	 */
+	if (!pm_resume_via_firmware()) {
+		if (!(readl(cpu_control) & APPLE_ASC_CPU_CONTROL_RUN) ||
+		    (rtk->iop_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON)
+			return -EAGAIN;
+		/* Its AP idle took and its IOP idle didn't: endpoints stay shut until AP on. */
+		if ((rtk->ap_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON)
+			return apple_rtkit_ap_power(rtk, true);
+		return 0;
+	}
+
+	ret = apple_rtkit_warm_restart(rtk);
+	if (ret)
+		return ret;
+
+	writel(readl(cpu_control) | APPLE_ASC_CPU_CONTROL_RUN, cpu_control);
+
+	return apple_rtkit_boot(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_sleep_return);
+
+int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
+{
+	int ret = apple_rtkit_warm_restart(rtk);
+
+	if (ret)
+		return ret;
+	writel(readl(cpu_control) | APPLE_ASC_CPU_CONTROL_RUN, cpu_control);
+
+	return apple_rtkit_boot(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_power_cycled_return);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {

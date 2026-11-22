@@ -33,6 +33,15 @@ struct apple_rtkit {
 	unsigned int handshake_timeout_ms;
 	/* apple_rtkit_ap_power_noirq: the handshake waits poll the mailbox in 10 ms slices (aurora) */
 	bool poll_waits;
+	/*
+	 * apple_rtkit_warm_restart (aurora, retained session): the next endpoint
+	 * map is answered as macOS answers a restarted coprocessor, echoing the
+	 * map, and starts no endpoint; warm_last_mask limits the last part's echo.
+	 */
+	bool warm_restart;
+	u32 warm_last_mask;
+	/* Restarted warm since the last reinit: the buffers stay live */
+	bool warm_session;
 
 	struct completion epmap_completion;
 	struct completion iop_pwr_ack_completion;

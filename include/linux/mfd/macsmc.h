@@ -277,4 +277,16 @@ static inline int apple_smc_write_flag_atomic(struct apple_smc *smc, smc_key key
 	return apple_smc_write_u8_atomic(smc, key, state ? 1 : 0);
 }
 
+/*
+ * apple-sleep's sequencer (m2pro 7.3.4 sleep backport): the SMC's sleep
+ * notices and the bench's read-only key reads. Until the macsmc batch they
+ * are refusing stubs in drivers/soc/apple/sleep-smc-stub.c.
+ */
+void apple_smc_bench_edge_keys(struct apple_smc *smc, const char *tag, bool polled);
+int apple_smc_bench_read_line(struct apple_smc *smc, const smc_key *keys, int n, char *buf, size_t size,
+			      bool polled);
+int apple_smc_sleep_seq_warn(struct apple_smc *smc);
+int apple_smc_sleep_seq_commit(struct apple_smc *smc, unsigned int arm_us, unsigned int idle_us,
+			       bool skip_slpa);
+
 #endif

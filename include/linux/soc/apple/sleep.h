@@ -11,6 +11,8 @@
 #include <linux/kconfig.h>
 #include <linux/types.h>
 
+struct apple_smc;
+
 struct device;
 struct device_node;
 

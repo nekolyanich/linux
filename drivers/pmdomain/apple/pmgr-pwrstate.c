@@ -965,7 +965,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 						   !ps->no_auto_enable && !ps->no_auto_pm) == 0;
 		}
 	} else if (active && !ps->firmware_owned && !ps->inherited_on) {
-		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
+		/* asahi 7.3.4 has no GENPD_FLAG_DEFER_OFF in the genpd core: wakeup only, as its own driver */
+		ps->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 	}
 
 	/* Turn on auto-PM if the domain is already on, unless it must stay off */

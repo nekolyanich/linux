@@ -138,6 +138,8 @@ struct apple_dcp {
 	/* Bench (native5): the RTKit idle at the end of the suspend ran, and its result */
 	bool bench_idle_ran;
 	int bench_idle_ret;
+	/* An IOMFB call at the suspend timed out (A500): channel depths reset before RUN */
+	bool bench_call_lost;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

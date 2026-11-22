@@ -1736,10 +1736,15 @@ static void dcp_bench_afk_queue_op(struct apple_dcp *dcp, u16 op, const char *wh
 {
 	struct apple_dcp_afkep *eps[8];
 	unsigned int n = dcp_bench_afk_eps(dcp, eps, ARRAY_SIZE(eps)), i;
+	char list[64];
+	size_t off = 0;
 
-	for (i = 0; i < n; i++)
+	list[0] = 0;
+	for (i = 0; i < n; i++) {
 		afk_bench_queue_op(eps[i], op);
-	dev_info(dcp->dev, "bench: afk queue %#x %s: %u endpoints\n", op, when, n);
+		off += scnprintf(list + off, sizeof(list) - off, " %#x", eps[i]->endpoint);
+	}
+	dev_info(dcp->dev, "bench: afk queue %#x %s: %u endpoints:%s\n", op, when, n, list);
 }
 
 static void dcp_bench_afk_stop(void *data)
@@ -1762,6 +1767,8 @@ static void dcp_bench_idle_at_suspend(struct apple_dcp *dcp)
 		return;
 	t0 = ktime_get();
 	ret = iomfb_s2r_link_sleep(dcp);
+	/* Its call never returned: the channel it took must not outlive the warm restart */
+	dcp->bench_call_lost = ret == -ETIMEDOUT;
 	dev_info(dcp->dev, "bench: dcp link sleep A500: %d after %lld ms\n", ret,
 		 ktime_ms_delta(ktime_get(), t0));
 	t0 = ktime_get();
@@ -1909,6 +1916,17 @@ static void dcp_bench_boot(struct apple_dcp *dcp)
 	if (ret) {
 		dev_err(dcp->dev, "bench: dcp-boot: RTKit warm restart failed: %d\n", ret);
 		return;
+	}
+	/* A call the old session never answered: its depth would wedge the new one's calls */
+	if (dcp->bench_call_lost) {
+		dcp->ch_cmd.depth = 0;
+		dcp->ch_oobcmd.depth = 0;
+		dcp->ch_cb.depth = 0;
+		dcp->ch_oobcb.depth = 0;
+		dcp->ch_async.depth = 0;
+		dcp->ch_oobasync.depth = 0;
+		dcp->bench_call_lost = false;
+		dev_info(dcp->dev, "bench: dcp-boot: IOMFB channels reset after a lost call\n");
 	}
 	writel(APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
 	ret = apple_rtkit_boot(dcp->rtk);

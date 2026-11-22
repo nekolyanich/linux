@@ -135,6 +135,8 @@ struct apple_smc {
 	bool ap_notified;
 	bool sleep_seq;
 	bool sleep_warned;
+	/* WKTP exists and is writable: a full wake writes it 0 (aurora ae550867) */
+	bool has_wktp;
 
 	struct mutex mutex;
 	spinlock_t lock;

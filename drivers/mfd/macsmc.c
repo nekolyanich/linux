@@ -8,6 +8,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/suspend.h>
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
@@ -56,6 +57,36 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
+
+/*
+ * WKTP, the wake type (aurora ae550867, Diljit Singh): a wake from firmware deep
+ * sleep on a non-HID source leaves the SMC in Silent Running (Power Nap) until
+ * the OS writes WKTP = 0 for a full wake: fan at 0 RPM, budgets clamped. Probed
+ * from the key's info (j416s has it: macOS writes it in its sleep round), written
+ * once at probe and after every resume that isn't a dark wake.
+ */
+#define SMC_WAKE_TYPE_FULL	0U
+
+static void apple_smc_write_full_wake(struct apple_smc *smc)
+{
+	int ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WAKE_TYPE_FULL);
+
+	if (ret < 0)
+		dev_warn(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WAKE_TYPE_FULL, ret);
+}
+
+static void apple_smc_probe_wktp(struct apple_smc *smc)
+{
+	struct apple_smc_key_info info;
+	int ret;
+
+	ret = apple_smc_get_key_info(smc, SMC_KEY(WKTP), &info);
+	if (ret < 0 || info.size != sizeof(u8) || !(info.flags & APPLE_SMC_WRITABLE))
+		return;
+
+	smc->has_wktp = true;
+	apple_smc_write_full_wake(smc);
+}
 
 static bool apple_smc_reply_arrived(struct apple_smc *smc)
 {
@@ -493,6 +524,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
+	apple_smc_probe_wktp(smc);
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -722,6 +755,8 @@ static void apple_smc_complete(struct device *dev)
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
 		smc->sleep_warned = false;
 	}
+	if (smc->has_wktp && !pm_dark_wake())
+		apple_smc_write_full_wake(smc);
 }
 
 static int apple_smc_resume_noirq(struct device *dev)

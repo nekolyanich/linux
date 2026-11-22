@@ -53,6 +53,16 @@ static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 	dcp_send_message(ep->dcp, ep->endpoint, message);
 }
 
+/*
+ * Bench (native5, note 77 §14.48): a bare ring-endpoint queue op. 0xa4 stops a started queue
+ * and 0xa3 starts it again (aurora's aop_queue_stop); macOS sends 0xa4 to the DCP's queues
+ * between its AP and IOP idle requests.
+ */
+void afk_bench_queue_op(struct apple_dcp_afkep *ep, u16 op)
+{
+	afk_send(ep, FIELD_PREP(RBEP_TYPE, op));
+}
+
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops)
 {

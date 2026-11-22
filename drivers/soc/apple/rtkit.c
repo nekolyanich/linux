@@ -591,6 +591,12 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	    rtk->ops->recv_message_early(rtk->cookie, ep, msg.msg0))
 		return;
 
+	/* A noirq wait polls: no workqueue runs, so its reply is taken here (aurora). */
+	if (READ_ONCE(rtk->poll_waits) && ep == APPLE_RTKIT_EP_MGMT) {
+		apple_rtkit_management_rx(rtk, msg.msg0);
+		return;
+	}
+
 	work = kzalloc_obj(*work, GFP_ATOMIC);
 	if (!work)
 		return;
@@ -633,6 +639,33 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 	return apple_mbox_send(rtk->mbox, msg, atomic);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_send_message);
+
+static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
+					  unsigned int state);
+
+/*
+ * The AP's power state as a coprocessor that keeps running through a system
+ * sleep hears it (aurora): idle before the sleep, on after the wake. The noirq
+ * variant polls its wait, for the device suspend's noirq phase.
+ */
+int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on)
+{
+	return apple_rtkit_set_ap_power_state(rtk, on ? APPLE_RTKIT_PWR_STATE_ON :
+						    APPLE_RTKIT_PWR_STATE_IDLE);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_power);
+
+int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on)
+{
+	int ret;
+
+	WRITE_ONCE(rtk->poll_waits, true);
+	ret = apple_rtkit_ap_power(rtk, on);
+	WRITE_ONCE(rtk->poll_waits, false);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_power_noirq);
 
 int apple_rtkit_poll(struct apple_rtkit *rtk)
 {
@@ -734,6 +767,18 @@ EXPORT_SYMBOL_GPL(apple_rtkit_set_handshake_timeout);
 static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk, struct completion *c)
 {
 	long t;
+
+	if (READ_ONCE(rtk->poll_waits)) {
+		unsigned int us;
+
+		for (us = 0; us < rtk->handshake_timeout_ms * USEC_PER_MSEC; us += 10) {
+			if (try_wait_for_completion(c))
+				return 0;
+			apple_rtkit_poll(rtk);
+			udelay(10);
+		}
+		return try_wait_for_completion(c) ? 0 : -ETIME;
+	}
 
 	t = wait_for_completion_interruptible_timeout(c,
 						      msecs_to_jiffies(rtk->handshake_timeout_ms));

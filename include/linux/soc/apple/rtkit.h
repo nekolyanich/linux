@@ -195,6 +195,14 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 int apple_rtkit_poll(struct apple_rtkit *rtk);
 
 /*
+ * Tell a coprocessor that keeps running through a system sleep the AP's power
+ * state: idle (@on false) before the sleep, on after the wake. The _noirq
+ * variant polls for the reply, for the noirq phase.
+ */
+int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on);
+int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on);
+
+/*
  * Checks if an endpoint with a given index exists
  *
  * @rtk:            RTKit reference

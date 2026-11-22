@@ -79,6 +79,7 @@ unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
             (*pdrv.get()).remove = Some(Self::remove_callback);
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
+            (*pdrv.get()).driver.pm = T::pm_ops().map_or(core::ptr::null(), core::ptr::from_ref);
         }
 
         // SAFETY: `pdrv` is guaranteed to be a valid `DriverType`.
@@ -222,6 +223,11 @@ pub trait Driver {
 
     /// The table of ACPI device ids supported by the driver.
     const ACPI_ID_TABLE: Option<acpi::IdTable<Self::IdInfo>> = None;
+
+    /// The driver's power management callbacks, if it has any.
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        None
+    }
 
     /// Platform driver probe.
     ///

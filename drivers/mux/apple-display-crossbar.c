@@ -603,11 +603,11 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
  *
  * A routed output lost its state if its 0x030 fields don't hold its dispext or its 0x034 enable
  * is clear (dispext0's fields are 0 at reset, so 0x030 alone can't tell for it). A lost or
- * pending output is selected again; a lost dpphy output is routed again; a dpin output gets its
- * glue back (CFG 3, MODE 1, CTRL 5, then EN 0 and its status wait, as at select:
+ * pending output is selected again; a lost dpphy output is routed again; a dpin output whose
+ * glue was lost gets it back (CFG 3, MODE 1, CTRL 5, then EN 0 and its status wait, as at select:
  * dcp_dptx_xbar_select() skips a reselect while it holds the output) and stays pending for its
- * link's next apple_dpxbar_finish(). A sleep that kept the registers (s2idle) reads two words and
- * writes nothing but the glue of an output that was pending anyway.
+ * link's next apple_dpxbar_finish(). A sleep that kept the registers (s2idle) reads two words
+ * (and a pending dpin's CFG) and writes nothing but a pending output's select, unchanged.
  */
 static __maybe_unused int apple_dpxbar_resume_early(struct device *dev)
 {
@@ -644,9 +644,16 @@ static __maybe_unused int apple_dpxbar_resume_early(struct device *dev)
 			if (!pending)
 				apple_dpxbar_t602x_route(dpxbar, index);
 		} else {
+			void __iomem *dpin = dpxbar->dpin[index - MUX_DPIN0];
+
 			dpxbar_clear32(dpxbar, T602X_REG_034, atc_bit);
 			dpxbar->route_pending[index] = true;
-			if (dpxbar->dpin[index - MUX_DPIN0])
+			/*
+			 * The glue only if it was lost (CFG reads back other than macOS's 3):
+			 * MODE and CTRL are event registers a blind write acks (an HPD not
+			 * handled yet), so a kept glue is left alone (rv-crossbar).
+			 */
+			if (dpin && readl(dpin + DPIN_CFG) != 3)
 				glue |= BIT(index);
 		}
 		dev_info(dpxbar->dev, "%s: dispext%u,%u selected again after sleep%s\n",

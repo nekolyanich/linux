@@ -141,6 +141,9 @@ const AOP_WAKEHINT_CHANNEL_T6020: u32 = 0x1000_0001;
 const AOP_SLEEP_NOTICE_LEN: usize = 12;
 /// Bound on the answer to each stop or start around a system sleep.
 const AFK_SLEEP_TIMEOUT_MS: u32 = 1000;
+/// Bound on an EPIC call's reply (aurora's): a lost reply fails the call instead of wedging
+/// its task, which would then refuse every later system sleep's freeze.
+const EPIC_CALL_TIMEOUT_MS: u32 = 5000;
 
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one of this driver's.
 fn afk_endpoint_index(ep: u8) -> Option<usize> {
@@ -264,6 +267,9 @@ struct AFKEndpoint {
     seq: u16,
     calls: [Option<Arc<FutureValue<CallResult>>>; AOP_MAX_CALLS],
     call_returns: [Option<KVec<u8>>; AOP_MAX_CALLS],
+    /// A call whose caller gave up waiting (aurora's abandon_call): its tag stays reserved, so
+    /// a later call doesn't get it and its late reply, until that reply arrives.
+    abandoned: [bool; AOP_MAX_CALLS],
     /// The next send uses the ring magic "AOP " (macOS's sleep notices) instead of "IOP ".
     tx_magic_aop: bool,
 }
@@ -280,6 +286,7 @@ impl AFKEndpoint {
             seq: 0,
             calls: [const { None }; AOP_MAX_CALLS],
             call_returns: [const { None }; AOP_MAX_CALLS],
+            abandoned: [false; AOP_MAX_CALLS],
             tx_magic_aop: false,
         }
     }
@@ -535,7 +542,14 @@ impl AFKEndpoint {
                 }
                 let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
                 let tag = ehdr.tag as usize;
-                if tag == 0 || tag - 1 > self.calls.len() || self.calls[tag - 1].is_none() {
+                if tag != 0 && tag <= self.calls.len() && self.abandoned[tag - 1] {
+                    // The late reply of a call its caller gave up on: the tag is free again.
+                    self.abandoned[tag - 1] = false;
+                    self.call_returns[tag - 1] = None;
+                    dev_dbg!(client.dev, "Late reply to an abandoned call, tag {}", tag);
+                    return Ok(());
+                }
+                if tag == 0 || tag - 1 >= self.calls.len() || self.calls[tag - 1].is_none() {
                     dev_err!(
                         client.dev,
                         "Got a retcode with invalid tag {:?} on endpoint {}",
@@ -642,7 +656,7 @@ impl AFKEndpoint {
     ) -> Result<Arc<FutureValue<CallResult>>> {
         let mut tag = 0;
         for i in 0..self.calls.len() {
-            if self.calls[i].is_none() {
+            if self.calls[i].is_none() && !self.abandoned[i] {
                 tag = i + 1;
                 break;
             }
@@ -683,6 +697,21 @@ impl AFKEndpoint {
         self.seq = self.seq.wrapping_add(1);
         self.calls[tag - 1] = Some(call.clone());
         Ok(call)
+    }
+}
+
+impl AFKEndpoint {
+    /// The caller of `call` stops waiting: its slot is freed, its tag held until the reply.
+    fn abandon_call(&mut self, call: &Arc<FutureValue<CallResult>>) {
+        for i in 0..self.calls.len() {
+            if let Some(pending) = &self.calls[i] {
+                if Arc::ptr_eq(pending, call) {
+                    self.calls[i] = None;
+                    self.abandoned[i] = true;
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -818,6 +847,8 @@ impl AopData {
         )
     }
     fn start(&self) -> Result<()> {
+        // A firmware started (again) hasn't crashed: sleeps include it.
+        self.crashed.store(false, Release);
         {
             let mut guard = self.rtkit.lock();
             let mut rtk = guard.as_mut().as_pin_mut().unwrap();
@@ -942,6 +973,7 @@ impl AopData {
             return;
         }
         let stopped = self.sleep_stopped.xchg(0, Relaxed);
+        let mut still = 0u32;
         if self.ap_idle.xchg(false, Relaxed) {
             if let Err(e) = self.ap_power(true) {
                 dev_err!(self.dev, "Wake notice not answered ({:?})", e);
@@ -953,9 +985,13 @@ impl AopData {
             }
             let endpoint = AFK_ENDPOINT_START + index as u8;
             if let Err(e) = self.sleep_switch(endpoint, AFK_MSG_START) {
+                // Kept as stopped: the next sleep's undo sends its START again, and its calls
+                // meanwhile fail after EPIC_CALL_TIMEOUT_MS instead of hanging.
                 dev_err!(self.dev, "Endpoint {:#04x} did not restart ({:?})", endpoint, e);
+                still |= 1 << index;
             }
         }
+        self.sleep_stopped.store(still, Relaxed);
         self.sleeping.store(false, Release);
         if stopped != 0 {
             dev_dbg!(self.dev, "AP on notice sent and endpoints restarted after a sleep\n");
@@ -1056,14 +1092,20 @@ impl AopData {
             if !self.has_endpoint(endpoint) {
                 continue;
             }
+            // One the last undo couldn't start again is still stopped: the undo retries it.
+            if self.sleep_stopped.load(Relaxed) & (1 << index) != 0 {
+                continue;
+            }
+            // Marked before the wait: a SLEEP that went out but wasn't answered may still have
+            // stopped it, so the undo STARTs every endpoint a SLEEP was sent to (rv-dpaudio).
+            self.sleep_stopped
+                .store(self.sleep_stopped.load(Relaxed) | (1 << index), Relaxed);
             result = self.sleep_switch(endpoint, AFK_MSG_SLEEP).inspect_err(|e| {
                 dev_err!(self.dev, "Endpoint {:#04x} did not stop ({:?})", endpoint, e);
             });
             if result.is_err() {
                 break;
             }
-            self.sleep_stopped
-                .store(self.sleep_stopped.load(Relaxed) | (1 << index), Relaxed);
             if notices && endpoint == 0x26 {
                 self.sleep_notices();
                 notices = false;
@@ -1117,6 +1159,34 @@ impl AopData {
     }
 }
 
+impl AopData {
+    /// Waits a bounded time for the reply to `call` on endpoint `ep_idx` (aurora's wait_call).
+    fn wait_call(
+        &self,
+        ep_idx: usize,
+        svc: &EPICService,
+        subtype: u16,
+        call: Arc<FutureValue<CallResult>>,
+    ) -> Result<CallResult> {
+        if let Some(res) = call.wait_timeout(EPIC_CALL_TIMEOUT_MS) {
+            return Ok(res);
+        }
+        self.endpoints[ep_idx].lock().abandon_call(&call);
+        // The reply may have come in between: then it's ours after all.
+        if let Some(res) = call.wait_timeout(0) {
+            return Ok(res);
+        }
+        dev_err!(
+            self.dev,
+            "EPIC call {:#x} on channel {} timed out after {} ms",
+            subtype,
+            svc.channel,
+            EPIC_CALL_TIMEOUT_MS
+        );
+        Err(ETIMEDOUT)
+    }
+}
+
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
         if self.sleeping.load(Acquire) {
@@ -1129,7 +1199,7 @@ impl AOP for AopData {
             let mut ep_guard = self.endpoints[ep_idx as usize].lock();
             ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
         };
-        Ok(call.wait().retcode)
+        Ok(self.wait_call(ep_idx as usize, svc, subtype, call)?.retcode)
     }
     fn epic_call_ret(
         &self,
@@ -1157,8 +1227,8 @@ impl AOP for AopData {
                 Some(ret_buf),
             )?
         };
-        let res = call.wait();
-        Ok((res.retcode, res.extra_data.unwrap()))
+        let res = self.wait_call(ep_idx as usize, svc, subtype, call)?;
+        Ok((res.retcode, res.extra_data.ok_or(EIO)?))
     }
     fn add_fakehid_listener(
         &self,

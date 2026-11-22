@@ -1161,6 +1161,131 @@ int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_c
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_power_cycled_return);
 
+/*
+ * A coprocessor's idle with interrupts off (aurora, by function), for the
+ * callers that ask: the receive callback is swapped for one that takes only
+ * what an idle needs, the mailbox polled, and the state acks waited on in
+ * 10 us steps. Asahi's RTKit echoes no OSLOG counters, so none is owed here.
+ */
+#define APPLE_RTKIT_POLLED_STEP_US	10
+#define APPLE_RTKIT_POLLED_LOOPS	20000
+
+static bool apple_rtkit_notification_msg(u8 ep, u64 msg)
+{
+	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
+
+	if (ep == APPLE_RTKIT_EP_SYSLOG)
+		return type == APPLE_RTKIT_SYSLOG_LOG;
+	if (ep == APPLE_RTKIT_EP_IOREPORT)
+		return type == 0x8 || type == 0xc;
+	return false;
+}
+
+/* The state acks, and notifications answered as they come (their log unread). */
+static void apple_rtkit_polled_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie)
+{
+	struct apple_rtkit *rtk = cookie;
+	u8 ep = msg.msg1;
+
+	if (ep == APPLE_RTKIT_EP_MGMT) {
+		u8 type = FIELD_GET(APPLE_RTKIT_MGMT_TYPE, msg.msg0);
+		unsigned int state = FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg.msg0);
+
+		if (type == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK)
+			WRITE_ONCE(rtk->iop_power_state, state);
+		else if (type == APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK)
+			WRITE_ONCE(rtk->ap_power_state, state);
+	} else if (apple_rtkit_notification_msg(ep, msg.msg0)) {
+		apple_mbox_send(mbox, msg, true);
+	}
+}
+
+static int apple_rtkit_polled_state(struct apple_rtkit *rtk, u8 type, unsigned int *state,
+				    unsigned int *us)
+{
+	struct apple_mbox_msg msg = {
+		.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, type) |
+			FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_IDLE),
+		.msg1 = APPLE_RTKIT_EP_MGMT,
+	};
+	int i, ret;
+
+	ret = apple_mbox_send(rtk->mbox, msg, true);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < APPLE_RTKIT_POLLED_LOOPS; i++) {
+		apple_mbox_poll(rtk->mbox);
+		if (READ_ONCE(*state) == APPLE_RTKIT_PWR_STATE_IDLE)
+			return 0;
+		udelay(APPLE_RTKIT_POLLED_STEP_US);
+		*us += APPLE_RTKIT_POLLED_STEP_US;
+	}
+
+	return -ETIMEDOUT;
+}
+
+static void apple_rtkit_polled_begin(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	rtk->mbox->rx = apple_rtkit_polled_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	/* What's already waiting is answered first, or the firmware may not go idle. */
+	apple_mbox_poll(rtk->mbox);
+}
+
+static void apple_rtkit_polled_end(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
+
+int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,
+				  unsigned int *us)
+{
+	u32 status;
+	int ret;
+
+	*us = 0;
+	apple_rtkit_polled_begin(rtk);
+
+	ret = apple_rtkit_polled_state(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+				       &rtk->ap_power_state, us);
+	if (!ret)
+		ret = apple_rtkit_polled_state(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
+					       &rtk->iop_power_state, us);
+	if (!ret)
+		ret = readl_poll_timeout_atomic(cpu_control + APPLE_ASC_CPU_STATUS, status,
+						(status & APPLE_ASC_CPU_STATUS_DOWN) ==
+						APPLE_ASC_CPU_STATUS_DOWN,
+						APPLE_RTKIT_POLLED_STEP_US, 5000);
+
+	apple_rtkit_polled_end(rtk);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_sleep_idle_polled);
+
+int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us)
+{
+	int ret;
+
+	*us = 0;
+	apple_rtkit_polled_begin(rtk);
+	ret = apple_rtkit_polled_state(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+				       &rtk->ap_power_state, us);
+	apple_rtkit_polled_end(rtk);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_idle_polled);
+
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {
 	int ret;

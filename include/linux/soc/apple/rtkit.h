@@ -217,6 +217,15 @@ void apple_rtkit_mailbox_off(struct apple_rtkit *rtk);
 void apple_rtkit_set_warm_epmap_mask(struct apple_rtkit *rtk, u32 last_mask);
 
 /*
+ * With interrupts off (aurora): AP and IOP idle with their acks polled, then
+ * the CPU's status waited for down; or only the AP idle notice (0x201), no IOP
+ * state, no CPU stop. @us gets the time spent waiting.
+ */
+int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,
+				  unsigned int *us);
+int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us);
+
+/*
  * Checks if an endpoint with a given index exists
  *
  * @rtk:            RTKit reference

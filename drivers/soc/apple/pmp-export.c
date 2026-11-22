@@ -28,6 +28,8 @@ static struct device *pmp_device;
 static struct apple_rtkit *pmp_rtk;
 static void __iomem *pmp_asc;
 static bool pmp_asleep, pmp_commit_registered, pmp_commit_used;
+/* The last real wake didn't bring it back: left stopped, not idled again (state 7) */
+static bool pmp_wake_failed;
 
 /*
  * Bench crumbs (boot_stage, EL2 with spmi_apple_controller.boot_crumb=1): 0x40 + the state at
@@ -133,6 +135,11 @@ static int apple_pmp_suspend_late(struct device *dev)
 	}
 
 	guard(mutex)(&pmp_lock);
+	if (pmp_device == dev && pmp_wake_failed) {
+		/* Stopped since the last wake: this sleep takes it as it is */
+		apple_pmp_state(7);
+		return 0;
+	}
 	if (pmp_device != dev || pmp_asleep || !pmp_rtk)
 		return 0;
 	/* The bench's sleep-seq stops no registered coprocessor at the commit: stop it here. */
@@ -177,6 +184,7 @@ static int apple_pmp_resume_early(struct device *dev)
 		apple_sleep_coproc_set_ready(dev, false);
 		if (!pm_resume_via_firmware() && !stopped) {
 			pmp_asleep = false;
+		pmp_wake_failed = false;
 			dev_info(dev, "sleep refused before the commit: firmware never stopped\n");
 			return 0;
 		}
@@ -193,6 +201,7 @@ static int apple_pmp_resume_early(struct device *dev)
 
 		if (!apple_rtkit_sleep_return(pmp_rtk, control)) {
 			pmp_asleep = false;
+		pmp_wake_failed = false;
 			dev_info(dev, "sleep refused: firmware still ran\n");
 			return 0;
 		}
@@ -205,15 +214,25 @@ static int apple_pmp_resume_early(struct device *dev)
 			return 0;
 		}
 		pmp_asleep = false;
+		pmp_wake_failed = false;
 		dev_info(dev, "sleep refused: firmware back after a reset\n");
 		return 0;
 	}
-	pmp_asleep = false;
 	ret = apple_rtkit_sleep_return(pmp_rtk, pmp_asc + APPLE_PMP_ASC_CPU_CONTROL);
-	if (ret)
-		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
-	else
-		dev_info(dev, "firmware back from sleep\n");
+	if (ret) {
+		/*
+		 * Not back (x1cyc3-a: cycle 2's stop failed, 0x43): idling a firmware that never
+		 * restarted fails the next sleep. Keep it stopped, as after a cut, and say so in the
+		 * crumbs (0x47 here, and at each later suspend_late; 0xc7 with pmp_crumb).
+		 */
+		pmp_wake_failed = true;
+		apple_pmp_state(7);
+		dev_err(dev, "firmware did not come back from sleep: %d, left stopped\n", ret);
+		return 0;
+	}
+	pmp_asleep = false;
+	pmp_wake_failed = false;
+	dev_info(dev, "firmware back from sleep\n");
 	return 0;
 }
 

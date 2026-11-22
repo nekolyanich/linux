@@ -257,7 +257,7 @@ static const struct drm_connector_funcs apple_connector_funcs = {
  * time; refuse to put its CRTC on the other.
  */
 static int apple_connector_atomic_check(struct drm_connector *connector,
-					struct drm_atomic_state *state)
+					struct drm_atomic_commit *state)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 	struct drm_connector_state *old_state, *new_state;

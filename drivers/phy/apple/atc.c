@@ -679,6 +679,9 @@ struct apple_atcphy {
 	bool pipehandler_up;
 	/* restore_after_pd_off: the block lost its state in a sleep with a power cut */
 	bool pd_was_off;
+	/* s2r_assume_cut: from PM_SUSPEND_PREPARE to PM_POST_SUSPEND, keep the mode (see usb3_power_off) */
+	bool sleep_keep_mode;
+	struct notifier_block pm_nb;
 
 	struct {
 		void __iomem *core;
@@ -2370,6 +2373,15 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	if (atcphy_modes[atcphy->mode].enable_dp_aux)
 		return 0;
 
+	/*
+	 * dwc3-apple's sleep_stop powers USB3 off for a suspend to RAM: the PIPE is
+	 * parked, the mode the Type-C mux selected stays, and resume_early restores it
+	 * after the cut (or it was kept), so dwc3's restart finds USB3 or USB4 again,
+	 * and a USB4 link and its tunnels aren't taken down for the sleep (rv-crossbar).
+	 */
+	if (atcphy->sleep_keep_mode)
+		return 0;
+
 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF)
 		atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
 
@@ -2832,6 +2844,42 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+/*
+ * Paired with dwc3_apple.sleep_stop (rv-crossbar, batch 7): the restore asserts
+ * the dwc3 reset, and dwc3-apple, which stopped the controller before the sleep,
+ * starts it again in its role at PM_POST_SUSPEND, which sets the PIPE up. Set
+ * both, or neither. With it on, a resume restores only after a real cut, told by
+ * the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
+ */
+static bool s2r_assume_cut;
+module_param(s2r_assume_cut, bool, 0444);
+MODULE_PARM_DESC(s2r_assume_cut, "Restore the PHY after a suspend to RAM whose power cut reset it (with dwc3_apple.sleep_stop)");
+
+/*
+ * Ahead of dwc3-apple's sleep notifier (priority): the mode is kept before dwc3 stops,
+ * and released before it starts again. Before the freezer the sleep's real target isn't
+ * known yet (pm_suspend_target_state is set after these notifiers), so this goes by what
+ * "mem" means now, as dwc3-apple's does.
+ */
+static int atcphy_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct apple_atcphy *atcphy = container_of(nb, struct apple_atcphy, pm_nb);
+
+	guard(mutex)(&atcphy->lock);
+	if (action == PM_SUSPEND_PREPARE && !pm_suspend_default_s2idle())
+		atcphy->sleep_keep_mode = true;
+	else if (action == PM_POST_SUSPEND)
+		atcphy->sleep_keep_mode = false;
+	return NOTIFY_DONE;
+}
+
+static void atcphy_pm_notifier_remove(void *data)
+{
+	struct apple_atcphy *atcphy = data;
+
+	unregister_pm_notifier(&atcphy->pm_nb);
+}
+
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -2860,6 +2908,17 @@ static int atcphy_probe(struct platform_device *pdev)
 
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 	atcphy->pipehandler_up = false;
+
+	if (s2r_assume_cut && atcphy->hw->restore_after_pd_off) {
+		atcphy->pm_nb.notifier_call = atcphy_pm_notify;
+		atcphy->pm_nb.priority = INT_MAX;
+		ret = register_pm_notifier(&atcphy->pm_nb);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(dev, atcphy_pm_notifier_remove, atcphy);
+		if (ret)
+			return ret;
+	}
 
 	return atcphy_probe_finalize(atcphy);
 }
@@ -2903,16 +2962,6 @@ MODULE_DEVICE_TABLE(of, atcphy_match);
  * and let that SetLinkRate cycle them. Touching the PLL here instead made DCP
  * skip the link training on resume altogether.
  */
-/*
- * Paired with dwc3_apple.sleep_stop (rv-crossbar, batch 7): the restore asserts
- * the dwc3 reset, and dwc3-apple, which stopped the controller before the sleep,
- * starts it again in its role at PM_POST_SUSPEND, which sets the PIPE up. Set
- * both, or neither. With it on, a resume restores only after a real cut, told by
- * the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
- */
-static bool s2r_assume_cut;
-module_param(s2r_assume_cut, bool, 0444);
-MODULE_PARM_DESC(s2r_assume_cut, "Restore the PHY after a suspend to RAM whose power cut reset it (with dwc3_apple.sleep_stop)");
 
 static int atcphy_suspend_late(struct device *dev)
 {

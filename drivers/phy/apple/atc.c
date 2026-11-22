@@ -37,6 +37,7 @@
 #include <linux/platform_device.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
@@ -605,6 +606,15 @@ struct atcphy_hw {
 	enum atcphy_generation gen;
 	int aciophy_lane_mode;
 	int aciophy_crossbar;
+	/*
+	 * park_dummy_phy: keep the dummy PIPE backend enabled whenever the PIPE
+	 * is parked; the lock handshake that starts the next PIPE change is only
+	 * acknowledged while it runs (aurora 69c8d2d5, T8122; T6020: JJRPF R59T).
+	 * restore_after_pd_off: a sleep with a power cut resets the block; bring
+	 * the tracked state back at resume (aurora 9ebfd5a2, by function).
+	 */
+	bool park_dummy_phy;
+	bool restore_after_pd_off;
 };
 
 /**
@@ -667,6 +677,8 @@ struct apple_atcphy {
 	u8 tunnel_dpin_rate[2];
 	u8 tunnel_slept;
 	bool pipehandler_up;
+	/* restore_after_pd_off: the block lost its state in a sleep with a power cut */
+	bool pd_was_off;
 
 	struct {
 		void __iomem *core;
@@ -1294,6 +1306,14 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_NATIVE_RESET);
+	/*
+	 * iBoot leaves the dummy PHY enabled and it resets with the PHY's power
+	 * domain, after which every USB3 start fails with "Pipehandler lock not
+	 * acked": set it again on every park (T6020, JJRPF R59T/R59U).
+	 */
+	if (atcphy->hw->park_dummy_phy)
+		set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+		      PIPEHANDLER_DUMMY_PHY_EN);
 
 	return 0;
 }
@@ -2851,6 +2871,16 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
 };
 
+/* T6020/T6021: the T8103 layout, with the dummy PHY kept on and a restore after a power cut (native5) */
+static const struct atcphy_hw atcphy_hw_t6020 = {
+	.gen = ATCPHY_GENERATION_T8103,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
+	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
+	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
+};
+
 static const struct atcphy_hw atcphy_hw_t8122 = {
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
@@ -2859,6 +2889,7 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 };
 
 static const struct of_device_id atcphy_match[] = {
+	{ .compatible = "apple,t6020-atcphy", .data = &atcphy_hw_t6020 },
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{},
@@ -2872,17 +2903,70 @@ MODULE_DEVICE_TABLE(of, atcphy_match);
  * and let that SetLinkRate cycle them. Touching the PLL here instead made DCP
  * skip the link training on resume altogether.
  */
+static bool s2r_assume_cut = true;
+module_param(s2r_assume_cut, bool, 0644);
+MODULE_PARM_DESC(s2r_assume_cut, "treat a suspend to RAM as a power cut of the PHY's domain and restore it on resume");
+
 static int atcphy_suspend_late(struct device *dev)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 
 	guard(mutex)(&atcphy->lock);
 	atcphy->tunnel_slept = atcphy->tunnel_users;
+	/*
+	 * A suspend to RAM with a real power cut resets the PHY while genpd still
+	 * has its domain on: assume the cut, and let the resume restore the PHY
+	 * (native5 a409fdb6, found by JJRPF, Aurora-DeepIdle R59Q).
+	 */
+	if (s2r_assume_cut && atcphy->hw->restore_after_pd_off &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM)
+		atcphy->pd_was_off = true;
+	return 0;
+}
+
+/*
+ * The block came back at its reset values while the driver still tracks the
+ * mode the Type-C mux selected: first the baseline probe sets (the USB
+ * controller in reset, USB2 and the PHY off, the PIPE parked on the dummy
+ * backend), then the tracked mode again, which applies the tunables and sets
+ * the lanes up (aurora's atcphy_restore_after_pd_off, by function). A DP main
+ * link or tunnel pixel clock does not survive; their users set them up again.
+ */
+static int atcphy_resume_early(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+	enum atcphy_mode mode;
+	int ret;
+
+	guard(mutex)(&atcphy->lock);
+	if (!atcphy->pd_was_off)
+		return 0;
+	atcphy->pd_was_off = false;
+	mode = atcphy->mode;
+
+	_atcphy_dwc3_reset_assert(atcphy);
+	atcphy_usb2_power_off(atcphy);
+	ret = atcphy_power_off(atcphy);
+	if (ret)
+		dev_warn(dev, "PHY did not power down after the power cut: %d\n", ret);
+	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+	ret = atcphy_configure_pipehandler_dummy(atcphy);
+	if (ret)
+		dev_warn(dev, "Failed to park the PIPE after the power cut: %d\n", ret);
+	atcphy->pipehandler_up = false;
+
+	if (mode == APPLE_ATCPHY_MODE_OFF)
+		return 0;
+	ret = atcphy_configure(atcphy, mode);
+	if (ret)
+		dev_warn(dev, "Failed to restore mode %d after the power cut: %d\n", mode, ret);
+	else
+		dev_dbg(dev, "restored mode %d after the power cut\n", mode);
 	return 0;
 }
 
 static const struct dev_pm_ops atcphy_pm_ops = {
-	LATE_SYSTEM_SLEEP_PM_OPS(atcphy_suspend_late, NULL)
+	LATE_SYSTEM_SLEEP_PM_OPS(atcphy_suspend_late, atcphy_resume_early)
 };
 
 static struct platform_driver atcphy_driver = {

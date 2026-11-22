@@ -592,12 +592,6 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	    rtk->ops->recv_message_early(rtk->cookie, ep, msg.msg0))
 		return;
 
-	/* A noirq wait polls: no workqueue runs, so its reply is taken here (aurora). */
-	if (READ_ONCE(rtk->poll_waits) && ep == APPLE_RTKIT_EP_MGMT) {
-		apple_rtkit_management_rx(rtk, msg.msg0);
-		return;
-	}
-
 	work = kzalloc_obj(*work, GFP_ATOMIC);
 	if (!work)
 		return;
@@ -769,15 +763,24 @@ static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk, struct compl
 {
 	long t;
 
+	/*
+	 * As aurora's apple_rtkit_wait() for poll_waits: poll the mailbox, then
+	 * wait 10 ms for the reply, which the (non-freezable) RTKit workqueue
+	 * handles as usual, until the handshake timeout.
+	 */
 	if (READ_ONCE(rtk->poll_waits)) {
-		unsigned int us;
+		unsigned long timeout = jiffies + msecs_to_jiffies(rtk->handshake_timeout_ms);
+		int ret;
 
-		for (us = 0; us < rtk->handshake_timeout_ms * USEC_PER_MSEC; us += 10) {
-			if (try_wait_for_completion(c))
+		do {
+			ret = apple_rtkit_poll(rtk);
+			if (ret < 0)
+				return ret;
+			if (wait_for_completion_timeout(c, msecs_to_jiffies(10)))
 				return 0;
-			apple_rtkit_poll(rtk);
-			udelay(10);
-		}
+		} while (time_before(jiffies, timeout));
+
+		/* Completed after the last wait, before the deadline check. */
 		return try_wait_for_completion(c) ? 0 : -ETIME;
 	}
 

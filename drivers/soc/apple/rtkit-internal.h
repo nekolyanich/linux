@@ -31,7 +31,7 @@ struct apple_rtkit {
 
 	/* Each handshake step's wait, apple_rtkit_set_handshake_timeout() */
 	unsigned int handshake_timeout_ms;
-	/* apple_rtkit_ap_power_noirq: waits poll the mailbox, management replies handled inline */
+	/* apple_rtkit_ap_power_noirq: the handshake waits poll the mailbox in 10 ms slices (aurora) */
 	bool poll_waits;
 
 	struct completion epmap_completion;

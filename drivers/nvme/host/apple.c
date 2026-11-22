@@ -29,6 +29,7 @@
 #include <linux/pm_domain.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/reset.h>
 #include <linux/time64.h>
 
@@ -257,6 +258,21 @@ module_param(sleep_idle, bool, 0444);
  */
 static bool bench_reinit_first;
 module_param(bench_reinit_first, bool, 0444);
+
+/*
+ * Bench (note 82 §4.2, from Ante042's t6000 S2R): with sleep_idle, keep the RTKit buffers across the sleep
+ * (detach_keep after the idle, reinit_keep at the reset work, before the reset as bench_reinit_first does): a
+ * firmware resuming from its idle context still points at them, and the full reinit frees them (SART remove).
+ */
+static bool bench_reinit_keep;
+module_param(bench_reinit_keep, bool, 0444);
+
+/* Hybrid bit 8 asks for it too (native5) */
+static bool reinit_keep_on(void)
+{
+	return bench_reinit_keep || (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_ANS_KEEP);
+}
+static bool ans_idle_kept;
 
 /*
  * Bench (note 77 §14.20): the ADT's /arm-io/ans tunables. iBoot applies them at boot and an S3 power loss
@@ -1223,7 +1239,15 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
-		if (bench_reinit_first) {
+		bool kept = reinit_keep_on() && ans_idle_kept;
+
+		ans_idle_kept = false;
+		if (kept) {
+			ret = apple_rtkit_reinit_keep(anv->rtk);
+			dev_info(anv->dev, "bench: RTKit buffers kept across the sleep (reinit_keep): %d\n", ret);
+			if (ret)
+				goto out;
+		} else if (bench_reinit_first) {
 			dev_info(anv->dev, "bench: RTKit reinit before the reset\n");
 			ret = apple_rtkit_reinit(anv->rtk);
 			if (ret)
@@ -1234,7 +1258,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		if (ret)
 			goto out;
 
-		if (!bench_reinit_first) {
+		if (!bench_reinit_first && !kept) {
 			ret = apple_rtkit_reinit(anv->rtk);
 			if (ret)
 				goto out;
@@ -1922,7 +1946,12 @@ static int apple_nvme_suspend(struct device *dev)
 	if (apple_rtkit_is_running(anv->rtk)) {
 		if (sleep_idle) {
 			ret = apple_rtkit_idle(anv->rtk);
-			dev_info(dev, "bench: ANS idled (0x201): %d\n", ret);
+			if (!ret && reinit_keep_on()) {
+				apple_rtkit_detach_keep(anv->rtk);
+				ans_idle_kept = true;
+			}
+			dev_info(dev, "bench: ANS idled (0x201): %d%s\n", ret,
+				 ans_idle_kept ? ", buffers kept" : "");
 		} else {
 			ret = apple_rtkit_shutdown(anv->rtk);
 		}

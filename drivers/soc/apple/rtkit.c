@@ -1079,6 +1079,61 @@ void apple_rtkit_mailbox_off(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_mailbox_off);
 
+/*
+ * Like apple_rtkit_reinit(), but for a co-processor that was put to idle and
+ * resumes from its saved context: it keeps the shared buffers it was given,
+ * so they must stay mapped. Only the mailbox and the power handshake restart.
+ * From Ante042's t6000 S2R (954a5cf8d) by way of native5's 8de2188b, on this
+ * tree's reinit: everything it resets but the buffers.
+ */
+int apple_rtkit_reinit_keep(struct apple_rtkit *rtk)
+{
+	unsigned long flags;
+	int ret;
+
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+
+	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+
+	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+
+	rtk->crashed = false;
+	/*
+	 * The buffers are live: an identical request gets the same reply (the warm path of
+	 * apple_rtkit_common_rx_get_buffer). Cold, each wake would map another and leak the
+	 * old one with its SART entry (review 9b77f38).
+	 */
+	rtk->warm_session = true;
+	WRITE_ONCE(rtk->oslog_owed, 0);
+	rtk->warm_restart = false;
+	rtk->warm_last_mask = U32_MAX;
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_reinit_keep);
+
+/* Stop receiving before an idled co-processor sleeps, its buffers stay put */
+void apple_rtkit_detach_keep(struct apple_rtkit *rtk)
+{
+	apple_rtkit_mailbox_off(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_detach_keep);
+
 void apple_rtkit_set_warm_epmap_mask(struct apple_rtkit *rtk, u32 last_mask)
 {
 	rtk->warm_last_mask = last_mask;

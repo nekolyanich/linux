@@ -112,6 +112,15 @@ void apple_rtkit_free(struct apple_rtkit *rtk);
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
 
 /*
+ * Like apple_rtkit_reinit(), for a co-processor put to idle that resumes from its saved context: it keeps the
+ * shared buffers it was given, so they stay mapped; only the mailbox and the power handshake restart.
+ */
+int apple_rtkit_reinit_keep(struct apple_rtkit *rtk);
+
+/* Stop receiving before an idled co-processor sleeps; its buffers stay put. */
+void apple_rtkit_detach_keep(struct apple_rtkit *rtk);
+
+/*
  * Set how long each handshake step (power state and endpoint map replies)
  * waits for the co-processor, for one that is known to answer slowly. Call
  * before apple_rtkit_boot(). Zero restores the default of 1000 ms.

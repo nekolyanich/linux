@@ -65,6 +65,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
+int iomfb_s2r_link_sleep(struct apple_dcp *dcp);
 /* rtkit message handler for IOMFB messages */
 void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 

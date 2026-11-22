@@ -553,6 +553,14 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	return 0;
 }
 
+/* Bench (native5): A500, the AP link drained before the DCP's AP idle; 13.5 firmware only */
+int iomfb_s2r_link_sleep(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_13_5)
+		return -EOPNOTSUPP;
+	return iomfb_s2r_link_sleep_v13_3(dcp, false);
+}
+
 void iomfb_shutdown(struct apple_dcp *dcp)
 {
 	/* We're going down */

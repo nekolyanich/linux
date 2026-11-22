@@ -475,6 +475,23 @@ bool apple_sleep_bench_sep_sleep_early(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_sep_sleep_early);
 
+static struct device *aseq_sep_early_dev;
+
+void apple_sleep_sep_early_set(struct device *dev, bool wired)
+{
+	if (wired)
+		WRITE_ONCE(aseq_sep_early_dev, dev);
+	else if (READ_ONCE(aseq_sep_early_dev) == dev)
+		WRITE_ONCE(aseq_sep_early_dev, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_sep_early_set);
+
+bool apple_sleep_sep_early_wired(void)
+{
+	return READ_ONCE(aseq_sep_early_dev);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_sep_early_wired);
+
 /* For sleep.c's co-processor registry, which refuses below EL2 off the bench */
 bool apple_sleep_seq_bench(void)
 {
@@ -2179,8 +2196,9 @@ static const char *aseq_via_firmware_sep(void)
 	struct platform_device *pdev;
 	bool bound = false;
 
+	/* Asked of the driver, not taken from the param: a driver without it sends nothing */
 	if (apple_sleep_bench_sep_sleep_early())
-		return "early SLEEP";
+		return apple_sleep_sep_early_wired() ? "early SLEEP" : NULL;
 	if (apple_sleep_bench_sep_sleep())
 		return "table SLEEP";
 	if (!IS_ENABLED(CONFIG_APPLE_SEP))

@@ -174,6 +174,9 @@ bool apple_sleep_bench_sep_sleep(void);
  * process context and waits for the answer; suspend_noirq waits for its domain to gate.
  */
 bool apple_sleep_bench_sep_sleep_early(void);
+/* The SEP driver that sends the early SLEEP says so; sleep-seq's via_firmware guard asks */
+void apple_sleep_sep_early_set(struct device *dev, bool wired);
+bool apple_sleep_sep_early_wired(void);
 
 
 /*
@@ -349,6 +352,15 @@ static inline bool apple_sleep_bench_sep_sleep(void)
 }
 
 static inline bool apple_sleep_bench_sep_sleep_early(void)
+{
+	return false;
+}
+
+static inline void apple_sleep_sep_early_set(struct device *dev, bool wired)
+{
+}
+
+static inline bool apple_sleep_sep_early_wired(void)
 {
 	return false;
 }

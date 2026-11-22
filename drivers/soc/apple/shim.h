@@ -35,6 +35,9 @@ void sep_pm_unregister_sleep(void *dev);
 int sep_pm_clear_dev_disable(void *dev);
 void sep_pm_dart_restore(void *dev);
 int sep_pm_dart_hold(void *dev, bool hold);
+void sep_pm_crumb(u8 stage);
+bool sep_pm_gated(void *dev);
+void sep_pm_set_gate(u32 gate);
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 

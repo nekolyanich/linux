@@ -1239,6 +1239,7 @@ impl SepData {
     fn set_sleep_gate(&self, gate: pm::SleepGate) {
         let _mbox = self.mbox.lock();
         self.sleep_gate.store(gate as u32, Relaxed);
+        pm::publish_gate(gate);
     }
 
     /// The bench's early SLEEP (`apple_sleep.sep_sleep_early`; native5, as aurora #1664 on
@@ -1299,19 +1300,33 @@ impl SepData {
             self.set_sleep_gate(pm::SleepGate::Open);
             return Err(e);
         }
+        pm::crumb(0x5b);
         // From here the request may have been taken: a failure is not reversible.
         let reply = self.sleep_wait(&op, idx, tag);
-        let taken = matches!(&reply, Some(r) if r.param == 0);
-        self.sleep_hold_rx();
-        if !taken {
-            dev_err!(
-                self.dev,
-                "early sleep: the enclave did not take the SLEEP ({:?}); it stays unused\n",
-                reply.map(|r| r.param)
-            );
-            self.set_sleep_gate(pm::SleepGate::Lost);
-            return Err(EIO);
+        match reply {
+            Some(r) if r.param == 0 => pm::crumb(0x5c),
+            Some(r) => {
+                // Refused, and still running (rv-sepkey's (c)): its DART back, the sleep refused
+                pm::crumb(0x5d);
+                let _ = pm::dart_hold(&self.dev, false);
+                self.set_sleep_gate(pm::SleepGate::Open);
+                dev_err!(self.dev, "early sleep: the enclave refused the SLEEP ({:#x}); sleep refused\n", r.param);
+                return Err(EBUSY);
+            }
+            None => {
+                pm::crumb(0x5e);
+                // No answer. Not gated: it runs on, so its DART goes back (no TLB is skipped
+                // under a running enclave). Either way nothing is sent to it again.
+                if !pm::gated(&self.dev) {
+                    let _ = pm::dart_hold(&self.dev, false);
+                }
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Lost);
+                dev_crit!(self.dev, "early sleep: no answer to the SLEEP; the enclave stays unused until a reboot\n");
+                return Err(EIO);
+            }
         }
+        self.sleep_hold_rx();
         if let Some(mbox) = self.mbox.lock().as_ref() {
             // OUTBOX_CTRL (I2A_CONTROL, +0x114) bit 0: nothing more is received from it
             mbox.set_recv_enabled(false);
@@ -1372,10 +1387,10 @@ impl SepData {
         if gate != pm::SleepGate::Told {
             return;
         }
+        // A suspend aborted after the SLEEP (rv-sepkey's (b)): it gated itself with its power
+        // kept, and the same kick may start it; Lost only if that fails.
         if !real {
-            dev_err!(self.dev, "the enclave took a SLEEP without a real sleep; it stays unused until a reboot\n");
-            self.set_sleep_gate(pm::SleepGate::Lost);
-            return;
+            dev_warn!(self.dev, "the enclave took a SLEEP without a real sleep: kicking it anyway\n");
         }
         match self.sleep_kick() {
             Ok(()) => {
@@ -1384,7 +1399,7 @@ impl SepData {
                 dev_info!(self.dev, "the enclave is back from its sleep request\n");
             }
             Err(e) => {
-                dev_err!(
+                dev_crit!(
                     self.dev,
                     "the enclave did not come back ({:?}); it stays unused until a reboot\n",
                     e

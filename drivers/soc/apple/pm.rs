@@ -37,6 +37,9 @@ extern "C" {
     fn sep_pm_clear_dev_disable(dev: *mut c_void) -> c_int;
     fn sep_pm_dart_restore(dev: *mut c_void);
     fn sep_pm_dart_hold(dev: *mut c_void, hold: bool) -> c_int;
+    fn sep_pm_crumb(stage: u8);
+    fn sep_pm_gated(dev: *mut c_void) -> bool;
+    fn sep_pm_set_gate(gate: u32);
     pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
 }
 
@@ -79,6 +82,24 @@ pub(crate) fn dart_hold(dev: &kernel::device::Device, hold: bool) -> Result<()> 
         return Err(Error::from_errno(rc));
     }
     Ok(())
+}
+
+/// A bench crumb (PMU boot_stage); a no-op off the native bench.
+pub(crate) fn crumb(stage: u8) {
+    // SAFETY: no preconditions.
+    unsafe { sep_pm_crumb(stage) };
+}
+
+/// Whether the enclave has gated its own power domain, now.
+pub(crate) fn gated(dev: &kernel::device::Device) -> bool {
+    // SAFETY: `dev` is the bound SEP device.
+    unsafe { sep_pm_gated(dev.as_raw().cast()) }
+}
+
+/// The gate as sysfs shows it (`sleep_gate`).
+pub(crate) fn publish_gate(gate: SleepGate) {
+    // SAFETY: no preconditions.
+    unsafe { sep_pm_set_gate(gate as u32) };
 }
 
 /// Lets a gated enclave start again. Writes only if the bit is set.
@@ -242,7 +263,9 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
     }
     // SAFETY: `dev` is the bound SEP device, unregistered in `unregister` before the
     // `Arc` is reclaimed.
-    unsafe { sep_pm_register_sleep(dev, pm_sleep, pm_wake, pm_told) };
+    if unsafe { sep_pm_register_sleep(dev, pm_sleep, pm_wake, pm_told) } != 0 {
+        pr_warn!("sep: the sleep_gate attribute wasn't created\n");
+    }
     Ok(())
 }
 

@@ -16,6 +16,7 @@
 #include <linux/pm.h>
 #include <linux/pm_domain.h>
 #include <linux/regmap.h>
+#include <linux/soc/apple/boot-crumb.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
@@ -190,13 +191,36 @@ int sep_pm_dart_hold(void *ptr, bool hold)
 	return ret;
 }
 
+/*
+ * Bench crumbs (PMU boot_stage, native EL2 with spmi_apple_controller.boot_crumb=1 only):
+ * 0x5a .suspend entered, 0x5b SLEEP sent, 0x5c taken (param 0), 0x5d refused (param != 0),
+ * 0x5e no answer, 0x5f DEV_DISABLE seen in .suspend_noirq, 0x59 its timeout.
+ */
+void sep_pm_crumb(u8 stage)
+{
+	apple_spmi_boot_crumb(stage);
+}
+
+/* Only a suspend to RAM: s2idle doesn't power the enclave down, and its wake isn't real */
+static bool sep_pm_early_sleep(void)
+{
+	return apple_sleep_bench_sep_sleep_early() && pm_suspend_target_state == PM_SUSPEND_MEM;
+}
+
 static int __maybe_unused sep_pm_suspend(struct device *dev)
 {
 	int (*sleep)(void) = READ_ONCE(sep_pm_sleep);
 
-	if (!apple_sleep_bench_sep_sleep_early() || !sleep)
+	if (!sep_pm_early_sleep() || !sleep)
 		return 0;
+	sep_pm_crumb(0x5a);
 	return sleep();
+}
+
+/* Whether the enclave has gated itself, now */
+bool sep_pm_gated(void *ptr)
+{
+	return !sep_pm_wait_gated(ptr, 0);
 }
 
 /* The last step before the platform's own: the domain has to be down by now. */
@@ -205,7 +229,7 @@ static int __maybe_unused sep_pm_suspend_noirq(struct device *dev)
 	bool (*told)(void) = READ_ONCE(sep_pm_told);
 	int ret;
 
-	if (!apple_sleep_bench_sep_sleep_early() || !told || !told())
+	if (!sep_pm_early_sleep() || !told || !told())
 		return 0;
 
 	ret = sep_pm_wait_gated(dev, 5000);
@@ -213,6 +237,7 @@ static int __maybe_unused sep_pm_suspend_noirq(struct device *dev)
 		ret = -ETIMEDOUT;
 	if (ret == -ENOENT)
 		return 0;
+	sep_pm_crumb(ret ? 0x59 : 0x5f);
 	if (ret)
 		dev_err(dev, "the enclave did not gate its power domain: %d\n", ret);
 	else
@@ -235,17 +260,36 @@ const struct dev_pm_ops sep_pm_ops = {
 	.suspend_noirq = pm_sleep_ptr(sep_pm_suspend_noirq),
 };
 
+/* The driver's SleepGate (open, draining, told, lost), for sysfs; rv-sepkey's (d) */
+static u32 sep_pm_gate;
+static const char *const sep_pm_gate_names[] = { "open", "draining", "told", "lost" };
+
+void sep_pm_set_gate(u32 gate)
+{
+	WRITE_ONCE(sep_pm_gate, gate);
+}
+
+static ssize_t sleep_gate_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	u32 gate = READ_ONCE(sep_pm_gate);
+
+	return sysfs_emit(buf, "%s\n", gate < ARRAY_SIZE(sep_pm_gate_names) ?
+			  sep_pm_gate_names[gate] : "?");
+}
+static DEVICE_ATTR_RO(sleep_gate);
+
 int sep_pm_register_sleep(void *ptr, int (*sleep)(void), void (*wake)(bool real), bool (*told)(void))
 {
 	WRITE_ONCE(sep_pm_sleep, sleep);
 	WRITE_ONCE(sep_pm_wake, wake);
 	WRITE_ONCE(sep_pm_told, told);
 	apple_sleep_sep_early_set(ptr, true);
-	return 0;
+	return device_create_file(ptr, &dev_attr_sleep_gate);
 }
 
 void sep_pm_unregister_sleep(void *ptr)
 {
+	device_remove_file(ptr, &dev_attr_sleep_gate);
 	apple_sleep_sep_early_set(ptr, false);
 	WRITE_ONCE(sep_pm_sleep, NULL);
 	WRITE_ONCE(sep_pm_wake, NULL);

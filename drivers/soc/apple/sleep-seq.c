@@ -422,6 +422,20 @@ MODULE_PARM_DESC(dry_run, "run the entry up to the commit, without PMU writes, a
 
 static bool bench;
 module_param(bench, bool, 0444);
+
+/*
+ * The S2R itself, without the bench (m2pro-73-nixos-params.md): the entry, the dispext rows, the
+ * PMP's and the SEP's/AOP's sleep paths read this, not "bench". bench=1 still means all of it,
+ * so the bench's lines don't change; bench alone keeps the marks, prints and bench-only rows.
+ */
+static bool s2r;
+module_param(s2r, bool, 0444);
+MODULE_PARM_DESC(s2r, "the S2R entry and its drivers' sleep paths (bench=1 implies it)");
+
+static bool aseq_s2r(void)
+{
+	return bench || s2r;
+}
 MODULE_PARM_DESC(bench, "probe at EL1, under a hypervisor that owns the reset vectors (the m1n1 bench)");
 
 /*
@@ -450,7 +464,7 @@ EXPORT_SYMBOL_GPL(apple_sleep_bench_hybrid);
 
 bool apple_sleep_bench_aop_sleep(void)
 {
-	return bench && aop_sleep;
+	return aseq_s2r() && aop_sleep;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_aop_sleep);
 
@@ -465,7 +479,7 @@ MODULE_PARM_DESC(sep_sleep, "send the SEP its SLEEP through its driver (bench on
 
 bool apple_sleep_bench_sep_sleep(void)
 {
-	return bench && sep_sleep;
+	return aseq_s2r() && sep_sleep;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_sep_sleep);
 
@@ -481,7 +495,7 @@ MODULE_PARM_DESC(sep_sleep_early, "the SEP's SLEEP at device suspend, through it
 
 bool apple_sleep_bench_sep_sleep_early(void)
 {
-	return bench && sep_sleep_early && !sep_sleep;
+	return aseq_s2r() && sep_sleep_early && !sep_sleep;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_sep_sleep_early);
 
@@ -542,7 +556,7 @@ EXPORT_SYMBOL_GPL(apple_sleep_pmp_state_set);
 /* For sleep.c's co-processor registry, which refuses below EL2 off the bench */
 bool apple_sleep_seq_bench(void)
 {
-	return bench;
+	return aseq_s2r();
 }
 
 /*
@@ -553,7 +567,7 @@ bool apple_sleep_seq_s2r(void)
 {
 	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);
 
-	return s && s->mbox && bench && !dry_run && pm_suspend_target_state == PM_SUSPEND_MEM;
+	return s && s->mbox && aseq_s2r() && !dry_run && pm_suspend_target_state == PM_SUSPEND_MEM;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_seq_s2r);
 
@@ -583,7 +597,7 @@ static int aseq_groups_set(const char *val, const struct kernel_param *kp)
 /* For aop.rs: AOPORDER, read from the groups as given (only a full entry on the bench sets them) */
 bool apple_sleep_bench_aop_macos_order(void)
 {
-	return bench && aop_sleep && seq_groups != SEQ_G_UNSET && (seq_groups & SEQ_G_AOPORDER);
+	return aseq_s2r() && aop_sleep && seq_groups != SEQ_G_UNSET && (seq_groups & SEQ_G_AOPORDER);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_aop_macos_order);
 
@@ -598,14 +612,14 @@ MODULE_PARM_DESC(aop_quiet, "bench AOP sleep switches (bit 0: wakehint notice on
 
 u32 apple_sleep_bench_aop_quiet(void)
 {
-	return bench && aop_sleep ? aop_quiet : 0;
+	return aseq_s2r() && aop_sleep ? aop_quiet : 0;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_aop_quiet);
 
 /* For aop.rs: AOPSEND, the same way */
 bool apple_sleep_bench_aop_notices(void)
 {
-	return bench && aop_sleep && seq_groups != SEQ_G_UNSET && (seq_groups & SEQ_G_AOPSEND);
+	return aseq_s2r() && aop_sleep && seq_groups != SEQ_G_UNSET && (seq_groups & SEQ_G_AOPSEND);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_bench_aop_notices);
 
@@ -2668,7 +2682,7 @@ static int aseq_begin(suspend_state_t state)
 	/* Nor the SEP's refusal of one: its gate is set again by its .suspend */
 	if (READ_ONCE(aseq_sep_gate) == 4)
 		WRITE_ONCE(aseq_sep_gate, 0);
-	if (state == PM_SUSPEND_MEM && bench && s->dispext_rows) {
+	if (state == PM_SUSPEND_MEM && aseq_s2r() && s->dispext_rows) {
 		aseq_dispext_print(s, "begin");
 		if (dispext_off == 2 || s->dispext_again)
 			aseq_dispext_run(s, s->dispext_again ? "begin after a wake" : "begin");
@@ -3053,8 +3067,8 @@ static int aseq_enter(suspend_state_t state)
 		aseq_dispext_print(s, "entry, stopped by their driver");
 
 	/* No resume path yet: the full entry only where the bench's hypervisor catches the wake. */
-	if (!dry_run && (!s->mbox || !bench)) {
-		dev_err(s->dev, "refused: no resume yet, the full entry runs only on the bench\n");
+	if (!dry_run && (!s->mbox || !aseq_s2r())) {
+		dev_err(s->dev, "refused: no resume yet, the full entry needs apple_sleep.s2r (or the bench)\n");
 		return -EOPNOTSUPP;
 	}
 	if (!dry_run && (s->groups & SEQ_G_COMMIT)) {
@@ -3442,7 +3456,7 @@ static int __apple_sleep_seq_probe(struct platform_device *pdev)
 	ret = aseq_dispext_mark(s);
 	if (ret)
 		return ret;
-	if (bench && s->dispext_rows) {
+	if (aseq_s2r() && s->dispext_rows) {
 		INIT_DELAYED_WORK(&s->dispext_work, aseq_dispext_work_fn);
 		schedule_delayed_work(&s->dispext_work, 0);
 	}
@@ -3456,7 +3470,7 @@ static int __apple_sleep_seq_probe(struct platform_device *pdev)
 
 	dev_info(dev, "%s, %s; %u entry steps\n",
 		 s->mbox ? "boot object mailbox" : "no boot object mailbox",
-		 dry_run ? "dry run" : (s->mbox && bench) ? "full entry, the bench catches the wake" :
+		 dry_run ? "dry run" : (s->mbox && aseq_s2r()) ? "full entry, back through the boot object mailbox" :
 		 "full entry refused: no resume yet",
 		 s->soc->nentry);
 
@@ -4541,8 +4555,8 @@ static int apple_sleep_seq_probe(struct platform_device *pdev)
 
 	apple_spmi_boot_crumb(0x33);
 	ret = __apple_sleep_seq_probe(pdev);
-	dev_info(&pdev->dev, "probe: %d (hyp mode %d, bench %d, dry_run %d)\n", ret,
-		 is_kernel_in_hyp_mode(), bench, dry_run);
+	dev_info(&pdev->dev, "probe: %d (hyp mode %d, bench %d, s2r %d, dry_run %d)\n", ret,
+		 is_kernel_in_hyp_mode(), bench, s2r, dry_run);
 
 	return ret;
 }

@@ -2904,14 +2904,15 @@ MODULE_DEVICE_TABLE(of, atcphy_match);
  * skip the link training on resume altogether.
  */
 /*
- * Off until aurora's dwc3 side comes with it (pre_host_resume and the mem
- * notifier): the restore asserts the dwc3 reset and nothing here deasserts it
- * (rv-crossbar, batch 7). With it on, a resume restores only after a real cut,
- * told by the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
+ * Paired with dwc3_apple.sleep_stop (rv-crossbar, batch 7): the restore asserts
+ * the dwc3 reset, and dwc3-apple, which stopped the controller before the sleep,
+ * starts it again in its role at PM_POST_SUSPEND, which sets the PIPE up. Set
+ * both, or neither. With it on, a resume restores only after a real cut, told by
+ * the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
  */
 static bool s2r_assume_cut;
 module_param(s2r_assume_cut, bool, 0444);
-MODULE_PARM_DESC(s2r_assume_cut, "bench: restore the PHY after a suspend to RAM whose power cut reset it (off: needs the dwc3 resume side)");
+MODULE_PARM_DESC(s2r_assume_cut, "Restore the PHY after a suspend to RAM whose power cut reset it (with dwc3_apple.sleep_stop)");
 
 static int atcphy_suspend_late(struct device *dev)
 {
@@ -2954,6 +2955,12 @@ static int atcphy_resume_early(struct device *dev)
 		return 0;
 	mode = atcphy->mode;
 
+	/*
+	 * The tunnel PLL's teardown while the PHY is still powered: configure's own
+	 * runs after the power-off below, and its command 3 and lock poll would time
+	 * out against a powered-off PHY (rv-crossbar B7.2). It is left nothing to do.
+	 */
+	atc_tunnel_restore(atcphy);
 	_atcphy_dwc3_reset_assert(atcphy);
 	atcphy_usb2_power_off(atcphy);
 	ret = atcphy_power_off(atcphy);

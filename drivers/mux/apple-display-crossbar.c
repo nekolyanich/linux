@@ -587,9 +587,60 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	ret = devm_mux_chip_register(dev, mux_chip);
 	if (ret < 0)
 		return ret;
+	platform_set_drvdata(pdev, mux_chip);
 
 	return 0;
 }
+
+/*
+ * t6020 after a sleep (rv-crossbar round 2, the idea of aurora e678cad69ad2 for T6030): the
+ * crossbar's domain is in no edge on-list (notes/sleep/40 §2.3), so a cut loses the selects, and
+ * the mux core skips a repeat select of the same state. The fixed HDMI route (dcpext0 -> atc3
+ * dpphy, selected once at probe) has nobody else to put it back; dp-switch reselects its own
+ * routes at PM_POST_SUSPEND. For each selected output whose 0x030 fields no longer hold its
+ * dispext: write them again, route a dpphy output again, and leave a dpin output pending for
+ * its link's next apple_dpxbar_finish(). A sleep that kept the registers (s2idle) reads 0x030
+ * once and writes nothing.
+ */
+static __maybe_unused int apple_dpxbar_resume_early(struct device *dev)
+{
+	struct mux_chip *mux_chip = dev_get_drvdata(dev);
+	struct apple_dpxbar *dpxbar;
+	unsigned long flags;
+	u32 sel;
+
+	if (!mux_chip || mux_chip->ops != &apple_dpxbar_t602x_ops)
+		return 0;
+	dpxbar = mux_chip_priv(mux_chip);
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	sel = readl(dpxbar->regs + T602X_REG_030);
+	for (unsigned int index = 0; index < MUX_MAX; index++) {
+		int state = dpxbar->selected_dispext[index];
+		const unsigned int *shift = apple_dpxbar_t602x_out[index].sel_shift;
+		u32 mask = 0xf << shift[0] | 0xf << shift[1];
+		u32 want = (u32)state << shift[0] | (u32)state << shift[1];
+
+		if (state < 0 || (sel & mask) == want)
+			continue;
+		dpxbar_mask32(dpxbar, T602X_REG_030, mask, want);
+		udelay(10);
+		if (index == MUX_DPPHY) {
+			apple_dpxbar_t602x_route(dpxbar, index);
+		} else {
+			dpxbar_clear32(dpxbar, T602X_REG_034, apple_dpxbar_t602x_out[index].atc_bit);
+			dpxbar->route_pending[index] = true;
+		}
+		dev_info(dpxbar->dev, "%s: dispext%u,%u selected again after sleep (0x030 %#x)%s\n",
+			 apple_dpxbar_names[index], state >> 1, state & 1, sel,
+			 index == MUX_DPPHY ? ", routed" : ", route pending");
+	}
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_dpxbar_t602x_pm_ops = {
+	.resume_early = pm_sleep_ptr(apple_dpxbar_resume_early),
+};
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
 	.n_ufp = 2,
@@ -639,6 +690,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
+		.pm		= pm_sleep_ptr(&apple_dpxbar_t602x_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };

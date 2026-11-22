@@ -55,12 +55,32 @@ struct apple_gpio_pinctrl {
 	u32 *all_saved;
 	u32 global_saved;
 	bool global_valid;
+	/* Bench (bench_input_enable, native5 2b8c8dcd): the block's input enable at the sleep */
+	u32 ie_saved;
+	bool ie_valid;
 
 	u8 irqgrps[];
 };
 
 #define REG_GPIO(x)          (4 * (x))
 #define REG_INPUT_ENABLE     0xc48
+
+/*
+ * Bench (note 82 §4.6, native5 2b8c8dcd, from Ante042's t6000 S2R): 1 prints each block's +0xc48 at
+ * probe, at the sleep and after it; 2 also writes the sleep's value back after the wake when it changed,
+ * on the AP block (39b028000) only, before the pins. Hybrid bit 5 means 1, bit 7 means 3. Where
+ * apple,resume-restore-all already puts the word back (the AP block on j416s), 2 adds nothing but the print.
+ */
+static uint bench_input_enable;
+module_param(bench_input_enable, uint, 0444);
+
+static uint ie_mode(void)
+{
+	u32 m = apple_sleep_bench_hybrid();
+
+	return bench_input_enable | ((m & APPLE_SLEEP_HYBRID_READS) ? 1 : 0) |
+	       ((m & APPLE_SLEEP_HYBRID_INPUT_EN) ? 3 : 0);
+}
 #define REG_GPIOx_DATA       BIT(0)
 #define REG_GPIOx_MODE       GENMASK(3, 1)
 #define REG_GPIOx_OUT        1
@@ -565,6 +585,10 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 					     "Failed to register function.");
 	}
 
+	if (ie_mode())
+		dev_info(pctl->dev, "bench: input enable +0xc48 = %#x at probe\n",
+			 readl_relaxed(pctl->base + REG_INPUT_ENABLE));
+
 	return apple_gpio_register(pctl);
 }
 
@@ -589,6 +613,12 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 {
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
 	unsigned int i;
+
+	if (ie_mode() && pm_suspend_target_state == PM_SUSPEND_MEM) {
+		pctl->ie_saved = readl_relaxed(pctl->base + REG_INPUT_ENABLE);
+		pctl->ie_valid = true;
+		dev_info(dev, "bench: input enable +0xc48 = %#x at the sleep\n", pctl->ie_saved);
+	}
 
 	pctl->global_valid = false;
 	if (!pctl->restore_all || pm_suspend_target_state != PM_SUSPEND_MEM ||
@@ -639,6 +669,25 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
 	unsigned int i, restored = 0;
 	u32 val;
+
+	if (pctl->ie_valid) {
+		struct resource *res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
+		u32 ie = readl_relaxed(pctl->base + REG_INPUT_ENABLE);
+		bool ap = res && res->start == 0x39b028000;
+		/* The restore-all path below writes the same word back */
+		bool all = pctl->restore_all && pctl->global_valid && pm_resume_via_firmware();
+
+		pctl->ie_valid = false;
+		if ((ie_mode() & 2) && ap && !all && ie != pctl->ie_saved) {
+			writel_relaxed(pctl->ie_saved, pctl->base + REG_INPUT_ENABLE);
+			dev_info(dev, "bench: input enable +0xc48 = %#x after the sleep (%#x at it), written back: %#x\n",
+				 ie, pctl->ie_saved, readl_relaxed(pctl->base + REG_INPUT_ENABLE));
+		} else {
+			dev_info(dev, "bench: input enable +0xc48 = %#x after the sleep (%#x at it)%s\n", ie,
+				 pctl->ie_saved, ie == pctl->ie_saved ? "" : all ? ", changed: restore-all puts it back" :
+				 ", changed");
+		}
+	}
 
 	if (!pctl->restore_all || !pctl->global_valid || !pm_resume_via_firmware())
 		return 0;

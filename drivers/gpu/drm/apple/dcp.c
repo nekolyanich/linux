@@ -1843,9 +1843,16 @@ static void dcp_bench_disp0_cycle(struct apple_dcp *dcp)
 		goto out;
 	}
 
-	for (i = 0; i < 2; i++)
-		if (darts[i])
-			held[i] = apple_dart_sleep_hold(darts[i]);
+	/* rv-sepkey: both are locked on j416s (hold -95); whether the lock and tables survived the cut */
+	for (i = 0; i < 2; i++) {
+		char st[256];
+
+		if (!darts[i])
+			continue;
+		apple_dart_bench_state(darts[i], st, sizeof(st));
+		dev_info(dcp->dev, "bench: disp0 cycle: dart %s after the cut: %s\n", dev_name(darts[i]), st);
+		held[i] = apple_dart_sleep_hold(darts[i]);
+	}
 	dev_info(dcp->dev, "bench: disp0 cycle: before cpu0 %#x fe %#x sys %#x, darts held %d %d\n",
 		 readl(pc), readl(pf), readl(ps), held[0], held[1]);
 

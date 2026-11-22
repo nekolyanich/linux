@@ -76,6 +76,7 @@ int dcp_switch_connect(struct apple_dcp *dcp, u32 die, u32 atc, u32 port);
 void dcp_switch_disconnect(struct apple_dcp *dcp, bool teardown);
 bool dcp_switch_available(struct apple_dcp *dcp);
 void dp_switch_kick(void);
+bool apple_dp_switch_held(void);
 int dp_switch_add_dcp(struct apple_dcp *dcp);
 void dp_switch_remove_dcp(struct apple_dcp *dcp);
 void dp_switch_unbind_dcp(struct apple_dcp *dcp);

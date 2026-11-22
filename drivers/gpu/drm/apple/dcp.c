@@ -53,6 +53,8 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
+#define APPLE_DCP_COPROC_CPU_STATUS	 0x48
+#define APPLE_DCP_COPROC_CPU_STATUS_DOWN (BIT(1) | BIT(5))
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
@@ -521,7 +523,8 @@ static bool dcp_hdmi_connected(struct apple_dcp *dcp)
 bool dcp_switch_available(struct apple_dcp *dcp)
 {
 	return dcp->dptxport[0].enabled && !dcp->switch_active &&
-	       !dcp_hdmi_connected(dcp);
+	       !dcp_hdmi_connected(dcp) && !READ_ONCE(dcp->crashed) &&
+	       !IS_ERR_OR_NULL(dcp->rtk) && apple_rtkit_is_running(dcp->rtk);
 }
 
 /*
@@ -1388,6 +1391,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
+	/* No stale "down" for sleep-seq (rv-usb4) */
+	if (dcp->dcpext_stopped) {
+		dcp->dcpext_stopped = false;
+		apple_sleep_dispext_down(dev, false);
+	}
 
 	/* the DRM device and its connectors go away after this unbind */
 	if (dcp->dp_switch)
@@ -1954,12 +1962,41 @@ static bool dcpext_sleep_stop;
 module_param(dcpext_sleep_stop, bool, 0444);
 MODULE_PARM_DESC(dcpext_sleep_stop, "bench: stop an idle external DCP for S2R without suspend_via_firmware");
 
+/*
+ * Idle: dp-switch holds its passes for the sleep (sleep_hold, so no pass can route it while
+ * this runs, and every route was released at the prepare), no route is set, and its CRTC is
+ * off (apple-drm's suspend ran first). rv-dpswitch a9161b3: dcp->active is "booted", not this.
+ */
 static bool dcp_dcpext_stop_wanted(struct apple_dcp *dcp)
 {
+	struct drm_crtc_state *cs = dcp->crtc ? dcp->crtc->base.state : NULL;
+
 	return of_device_is_compatible(dcp->dev->of_node, "apple,dcpext") &&
 	       (pm_suspend_via_firmware() || dcpext_sleep_stop) && dcp->coproc_reg &&
 	       !IS_ERR_OR_NULL(dcp->rtk) && apple_rtkit_is_running(dcp->rtk) &&
-	       !dcp->switch_active && !dcp->active;
+	       !READ_ONCE(dcp->crashed) && apple_dp_switch_held() && !dcp->switch_active &&
+	       !(cs && cs->active);
+}
+
+/* As batch 11's internal idle: AP idle, AFK queues stopped (0xa4), IOP idle, 5 s per ack */
+static int dcp_dcpext_idle_stop(struct apple_dcp *dcp)
+{
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	u32 status;
+	int ret;
+
+	ret = apple_rtkit_bench_idle(dcp->rtk, DCP_BENCH_EL2_IDLE_MS, dcp_bench_afk_stop, dcp);
+	if (ret)
+		return ret;
+	if (readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+			       (status & APPLE_DCP_COPROC_CPU_STATUS_DOWN) ==
+			       APPLE_DCP_COPROC_CPU_STATUS_DOWN, 100, 5000))
+		dev_warn(dcp->dev, "dcpext sleep: idle, but not stopped: status %#x\n", status);
+	apple_rtkit_mailbox_off(dcp->rtk);
+	/* As macOS stops it: twice */
+	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+	return 0;
 }
 
 /* True if it stopped: then no wakeup path */
@@ -1972,13 +2009,20 @@ static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
 		return false;
 	ret = iomfb_s2r_link_sleep(dcp);
 	dcp->bench_call_lost = ret == -ETIMEDOUT;
-	ret = apple_rtkit_sleep_stop(dcp->rtk, control);
+	ret = dcp_dcpext_idle_stop(dcp);
 	if (ret) {
-		/* Not idle: it keeps running, with its domains, as today */
-		dev_warn(dcp->dev, "dcpext sleep: firmware did not stop (%d), kept running\n", ret);
-		if (apple_rtkit_sleep_return(dcp->rtk, control))
-			dev_err(dcp->dev, "dcpext sleep: firmware did not come back\n");
-		return false;
+		/* Not idle: it keeps running, with its domains, as today, if it still answers */
+		dev_warn(dcp->dev, "dcpext sleep: firmware did not stop (%d)\n", ret);
+		if (!apple_rtkit_sleep_return(dcp->rtk, control))
+			return false;
+		/*
+		 * Half idle (AP took, IOP didn't): it won't run on as it is (rv-dpswitch item 3).
+		 * Stopped like an idled one, so the resume restarts it from the cycle.
+		 */
+		dev_warn(dcp->dev, "dcpext sleep: half idle, stopped as an idled one\n");
+		apple_rtkit_mailbox_off(dcp->rtk);
+		writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+		writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
 	}
 	dcp->dcpext_stopped = true;
 	apple_sleep_dispext_down(dcp->dev, true);
@@ -2031,6 +2075,12 @@ static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	}
 	if (ret)
 		dev_err(dcp->dev, "dcpext sleep: cold start failed: %d\n", ret);
+	/*
+	 * Cold, its endpoints aren't started again (no dcp_start): unusable for the switch,
+	 * which would route a sink to it (rv-dpswitch item 5), until a rebind.
+	 */
+	WRITE_ONCE(dcp->crashed, true);
+	dev_crit(dcp->dev, "dcpext sleep: not usable for displays until it is bound again\n");
 }
 
 static int dcp_platform_suspend(struct device *dev)

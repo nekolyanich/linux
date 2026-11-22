@@ -236,6 +236,17 @@ static int dp_switch_pm_notify(struct notifier_block *nb, unsigned long action,
 	return NOTIFY_DONE;
 }
 
+/* Whether the passes are held for a system sleep (sleep_hold): no route can be set until the resume */
+bool apple_dp_switch_held(void)
+{
+	bool held;
+
+	mutex_lock(&dp_switch.lock);
+	held = dp_switch.held;
+	mutex_unlock(&dp_switch.lock);
+	return held;
+}
+
 static struct notifier_block dp_switch_pm_nb = {
 	.notifier_call = dp_switch_pm_notify,
 };

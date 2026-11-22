@@ -19,6 +19,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
 #include <linux/iopoll.h>
@@ -29,10 +30,13 @@
 #include <linux/module.h>
 #include <linux/msi.h>
 #include <linux/of_irq.h>
+#include <linux/of_platform.h>
 #include <linux/pci-ecam.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_domain.h>
+#include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
 #include "pci-host-common.h"
@@ -49,6 +53,27 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 static bool s2idle_hold_domains;
 module_param(s2idle_hold_domains, bool, 0444);
 MODULE_PARM_DESC(s2idle_hold_domains, "Hold the host's power domains on through suspend-to-idle (aurora's internal-link hold)");
+
+/*
+ * The t6020 bench's sleep (native5, Tanabota notes 68-79): macOS 13's own
+ * teardown of the internal ports and root complex, and its way back.
+ */
+static uint bench_perst;
+module_param(bench_perst, uint, 0444);
+MODULE_PARM_DESC(bench_perst, "bench: at suspend_noirq, 3 (t602x): macOS 13's own, endpoints to D3hot, each port's disableGated/disablePortHardware, then _disableRootComplex (shared PHY, axi2af); 4 (t602x): 3, with the ADT dart-tunables-instance-0 applied to both internal PCIe DARTs first (Tanabota note 69)");
+
+/* Tanabota note 68: macOS writes gP16 (port01's pwren) in its device round; which ports drop it */
+static uint bench_pwren_off;
+module_param(bench_pwren_off, uint, 0444);
+MODULE_PARM_DESC(bench_pwren_off, "bench: with bench_perst=3/4, mask of the internal ports whose pwren goes low after PERST# (bit 1: port01, as macOS's gP16 write)");
+
+static uint bench_gpfix;
+module_param(bench_gpfix, uint, 0444);
+MODULE_PARM_DESC(bench_gpfix, "bench: with bench_perst=3/4 (t602x), what macOS 13 does in the APCIE_GP domain that Linux doesn't (Tanabota note 75): 1 poll each lane refclk ack low after its request is cleared and re-read both lanes before the root complex goes down (diagnostic), 2 port 1 first, as macOS, 4 each port's IRQ mask <- 0x7f5527ff and status <- 0xf0 first and its status acked last, as macOS, 8 port +0x4020 <- 7 (the port's second page) before PME_Turn_Off, as macOS's runtime writes and aurora's M5 sleep data");
+
+static bool bench_resume;
+module_param(bench_resume, bool, 0444);
+MODULE_PARM_DESC(bench_resume, "bench: with bench_perst=3/4 (t602x), at resume_noirq bring back what its entry took down: the root complex in the reverse order of _disableRootComplex, then each port's refclk, PERST#, RID2SID, MSI doorbell (apple_sleep.hybrid bit 13), IRQ mask and link, and the internal DARTs held (host_resumes) until then (Tanabota notes 77 §14.8, 78 §3.1)");
 
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
@@ -76,6 +101,12 @@ MODULE_PARM_DESC(s2idle_hold_domains, "Hold the host's power domains on through 
 
 #define PORT_LTSSMCTL			0x00080
 #define   PORT_LTSSMCTL_START		BIT(0)
+/* T6050: a trace of macOS shows 0x11 written here to send PME_Turn_Off */
+#define PORT_PME_TURN_OFF		0x00088
+/* Reads back 0 within a few reads of the write (the trace reads 0x1, then 0x10) */
+#define   PORT_PME_TURN_OFF_SEND	BIT(0)
+/* Written with bit 0 and still set afterwards; meaning not known */
+#define   PORT_PME_TURN_OFF_BIT4	BIT(4)
 #define PORT_INTSTAT			0x00100
 #define   PORT_INT_TUNNEL_ERR		31
 #define   PORT_INT_CPL_TIMEOUT		23
@@ -104,6 +135,7 @@ MODULE_PARM_DESC(s2idle_hold_domains, "Hold the host's power domains on through 
 #define PORT_LINKSTS			0x00208
 #define   PORT_LINKSTS_UP		BIT(0)
 #define   PORT_LINKSTS_BUSY		BIT(2)
+#define   PORT_LINKSTS_L2		BIT(6)
 #define PORT_LINKCMDSTS			0x00210
 #define PORT_OUTS_NPREQS		0x00284
 #define   PORT_OUTS_NPREQS_REQ		BIT(24)
@@ -211,6 +243,8 @@ struct apple_pcie {
 	struct apple_pcie_pd	*pds;
 	unsigned int		num_pds;
 	unsigned int		pd_held;
+	/* bench_perst=3/4 took the t602x root complex and ports down at the last suspend_noirq. */
+	bool			bench_rc_off;
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
@@ -234,6 +268,9 @@ struct apple_pcie_port {
 	int			sid_map_sz;
 	unsigned int		irq;
 	bool			irq_disabled;
+	/* PERST# and pwren of a port with a single reset line that Linux trained (bench resume). */
+	struct gpio_desc	*perst_gpio;
+	struct gpio_desc	*pwren_gpio;
 	int			idx;
 };
 
@@ -589,6 +626,66 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 	return readl_relaxed(port_rid2sid_addr(port, idx));
 }
 
+static u32 port_rid2sid_offset(struct apple_pcie_port *port, int idx)
+{
+	return port->pcie->hw->port_rid2sid + 4 * idx;
+}
+
+static inline void apple_pcie_port_writel(struct apple_pcie_port *port, u32 value, u32 offset)
+{
+	writel_relaxed(value, port->base + offset);
+}
+
+static inline u32 apple_pcie_port_readl(struct apple_pcie_port *port, u32 offset)
+{
+	return readl_relaxed(port->base + offset);
+}
+
+static void apple_pcie_port_rmw_set(struct apple_pcie_port *port, u32 set, u32 offset)
+{
+	apple_pcie_port_writel(port, apple_pcie_port_readl(port, offset) | set, offset);
+}
+
+static void apple_pcie_port_rmw_clear(struct apple_pcie_port *port, u32 clear, u32 offset)
+{
+	apple_pcie_port_writel(port, apple_pcie_port_readl(port, offset) & ~clear, offset);
+}
+
+/*
+ * The sleep path's gate on the port's chained IRQ (aurora, native5): neither
+ * disable_irq() nor synchronize_irq() waits for a chained handler that is
+ * already running. Closing the gate under irq_lock does, and any later handler
+ * skips the port registers. AIC has no irq_disable callback, so a lazy disable
+ * would only mark the parent disabled: the line is made unlazy first. Only the
+ * sleep paths call these.
+ */
+static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
+{
+	unsigned long flags;
+
+	if (!port->irq || !port->domain || port->irq_disabled)
+		return;
+
+	irq_set_status_flags(port->irq, IRQ_DISABLE_UNLAZY);
+	disable_irq_nosync(port->irq);
+	raw_spin_lock_irqsave(&port->irq_lock, flags);
+	port->irq_disabled = true;
+	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
+}
+
+static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
+{
+	unsigned long flags;
+
+	if (!port->irq_disabled)
+		return;
+
+	raw_spin_lock_irqsave(&port->irq_lock, flags);
+	port->irq_disabled = false;
+	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
+	enable_irq(port->irq);
+}
+
 static int apple_pcie_setup_link(struct apple_pcie *pcie,
 				 struct apple_pcie_port *port,
 				 struct device_node *np)
@@ -634,6 +731,11 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 			pwren = NULL;
 		else
 			return PTR_ERR(pwren);
+	}
+	/* Kept for the bench's resume, which takes them through the same steps. */
+	if (!num_aux_resets) {
+		port->perst_gpio = reset;
+		port->pwren_gpio = pwren;
 	}
 
 	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
@@ -1146,9 +1248,565 @@ err_release:
 	return ret;
 }
 
+/*
+ * bench_perst=3, t602x: macOS 13.7.8's own sequence (Tanabota note 68). AppleT6020PCIe's
+ * quiesce action runs each port's AppleEmbeddedPCIEPort::disableGated, then
+ * AppleT6020PCIe::_disableRootComplex. By then macOS's endpoint drivers have powered their
+ * IOPCIDevices off (D3hot); Linux binds none, so that is done here first. Unbounded polls of
+ * macOS's are bounded, and every step's result is printed.
+ */
+#define T602X_BENCH_PHY_SHARED		0x0d008000	/* from rc: ADT apcie reg[4], 0x59e008000 */
+#define T602X_BENCH_AXI2AF		0x0b000000	/* from rc: ADT apcie reg[6], 0x59c000000 */
+#define   T602X_BENCH_AXI2AF_CTL	0x400
+#define T602X_BENCH_PHY_CTRL_RESET	BIT(7)
+#define RC_T602X_APPCLK_GATE_DIS	0x0003c
+#define PORT_T602X_FIFO_STS		0x00820
+#define PORT_T602X_CTL_13C		0x0013c
+#define DWC_PORT_DEBUG0			0x728
+#define   DWC_LTSSM_L1_IDLE		0x14
+#define PHY_LANE_CFG_B14		BIT(14)
+
+/*
+ * bench_gpfix (Tanabota note 75): macOS 13's writes in the GP domain that bench_perst=3 doesn't
+ * make, from its write log (pd782, pd783):
+ * - bit 2: disableGated starts with port +0x104 <- 0x7f5527ff, +0x100 <- 0xf0 and ends, after
+ *   rc +0x3c is cleared, with +0x100 <- the pending status (0x20006600 port 0, 0x30004200/0x30004300
+ *   port 1). Linux only disables the IRQ line and leaves the status pending.
+ * - bit 3: port 0 +0x4020 <- 7 three times a minute at runtime (last 3.5 s before slpw); aurora's
+ *   M5 sleep data writes it at sleep. Linux's DT maps 0x4000 of the port, so it never does.
+ * - bits 0/1: macOS's lane RMWs read both refclk acks low 4-7 us after REQ0 is cleared; every
+ *   Linux bench_perst=3 run (16 of 16) leaves port 1 at 0xc00400c, acks high. macOS takes port 1
+ *   down first (its SD driver, in the device round), Linux last.
+ */
+#define T602X_BENCH_GPFIX_LANEACK	BIT(0)
+#define T602X_BENCH_GPFIX_ORDER		BIT(1)
+#define T602X_BENCH_GPFIX_INT		BIT(2)
+#define T602X_BENCH_GPFIX_4020		BIT(3)
+#define T602X_BENCH_PORT_PAGE2(idx)	(0x0300c000 + (idx) * 0x01000000)	/* from rc */
+#define T602X_BENCH_INTMSK_MACOS	0x7f5527ff
+#define T602X_BENCH_INTSTAT_FIRST	0xf0
+
+static int apple_pcie_bench_lane_clear(void __iomem *lane, u32 req, u32 ack)
+{
+	u32 v;
+
+	writel(readl(lane) & ~req, lane);
+	if (!(bench_gpfix & T602X_BENCH_GPFIX_LANEACK))
+		return -ENODATA;
+	return readl_poll_timeout_atomic(lane, v, !(v & ack), 1, 1000);
+}
+
+static void apple_pcie_bench_t602x_port_off(struct apple_pcie *pcie, struct apple_pcie_port *port,
+					    struct pci_bus *bus)
+{
+	void __iomem *rp = pcie->cfg->win + (PCI_DEVFN(port->idx, 0) << 12);
+	void __iomem *lane = port->phy + PHY_LANE_CFG;
+	int nfn = 0, nd3 = 0, pme = -ENOLINK, l2 = -ENOLINK, fifo, ltssm, run, ack0, ack1;
+	u32 v, lane0 = readl(lane), linksts, int0 = 0, int1 = 0, p4020 = 0, p4020n = 0;
+	struct pci_dev *root, *fn;
+	bool up, pwren_off;
+
+	apple_pcie_port_disable_irq(port);
+	if (bench_gpfix & T602X_BENCH_GPFIX_INT) {
+		int0 = apple_pcie_port_readl(port, PORT_INTSTAT);
+		apple_pcie_port_writel(port, T602X_BENCH_INTMSK_MACOS, PORT_INTMSK);
+		apple_pcie_port_writel(port, T602X_BENCH_INTSTAT_FIRST, PORT_INTSTAT);
+	}
+	if (bench_gpfix & T602X_BENCH_GPFIX_4020) {
+		struct resource *rc = platform_get_resource(to_platform_device(pcie->dev),
+							    IORESOURCE_MEM, 1);
+		void __iomem *p2 = rc ? ioremap_np(rc->start + T602X_BENCH_PORT_PAGE2(port->idx),
+						   SZ_16K) : NULL;
+
+		if (p2) {
+			p4020 = readl(p2 + 0x20);
+			writel(7, p2 + 0x20);
+			p4020n = readl(p2 + 0x20);
+			iounmap(p2);
+		} else {
+			dev_err(pcie->dev, "bench: port %d +0x4020 not mapped\n", port->idx);
+		}
+	}
+	linksts = apple_pcie_port_readl(port, PORT_LINKSTS);
+	up = linksts & PORT_LINKSTS_UP;
+
+	/* The endpoints in D3hot: only from there do they take PME_Turn_Off into L2/L3 Ready */
+	root = pci_get_slot(bus, PCI_DEVFN(port->idx, 0));
+	if (root && root->subordinate && up) {
+		list_for_each_entry(fn, &root->subordinate->devices, bus_list) {
+			nfn++;
+			if (!pci_set_power_state(fn, PCI_D3hot) && fn->current_state == PCI_D3hot)
+				nd3++;
+		}
+	}
+	/* disableGated: the root port's command off, its bus numbers cleared */
+	if (root) {
+		pci_write_config_word(root, PCI_COMMAND, 0);
+		if (!pci_read_config_dword(root, PCI_PRIMARY_BUS, &v))
+			pci_write_config_dword(root, PCI_PRIMARY_BUS, v & 0xff0000ff);
+	}
+	pci_dev_put(root);
+
+	/* requestPMEToBroadcast (app clock auto-disable off, +0x88 <- 0x11), its ack, L2 */
+	if (up) {
+		apple_pcie_port_rmw_set(port, PORT_APPCLK_CGDIS, PORT_APPCLK);
+		apple_pcie_port_writel(port, PORT_PME_TURN_OFF_SEND | PORT_PME_TURN_OFF_BIT4,
+				       PORT_PME_TURN_OFF);
+		pme = readl_poll_timeout(port->base + PORT_PME_TURN_OFF, v,
+					 !(v & PORT_PME_TURN_OFF_SEND), 100, 10000);
+		l2 = readl_poll_timeout(port->base + PORT_LINKSTS, v, v & PORT_LINKSTS_L2, 100, 50000);
+	}
+	/* setEndpointReset: PERST# through the ADT's function-perst (Linux's reset-gpios) */
+	if (port->perst_gpio)
+		gpiod_set_value_cansleep(port->perst_gpio, 1);
+	/* enablePortRefclkGating(false) */
+	writel(readl(lane) & ~PHY_LANE_CFG_REFCLKCGEN, lane);
+
+	/* disablePortHardware */
+	rmw_set(BIT(0), pcie->base + RC_T602X_APPCLK_GATE_DIS);
+	fifo = readl_poll_timeout(port->base + PORT_T602X_FIFO_STS, v,
+				  !(v & 0xff) || !(v & 0xff0000), 1, 1000);
+	apple_pcie_port_rmw_set(port, BIT(8), PORT_T602X_CTL_13C);
+	ltssm = readl_poll_timeout(rp + DWC_PORT_DEBUG0, v, (v & 0x3f) != DWC_LTSSM_L1_IDLE, 5, 5000);
+	apple_pcie_port_rmw_clear(port, PORT_PERST_OFF, pcie->hw->port_perst);
+	apple_pcie_port_rmw_clear(port, BIT(8), PORT_T602X_CTL_13C);
+	writel(readl(lane) & ~PHY_LANE_CFG_REFCLKCGEN, lane);
+	writel(readl(lane) & ~BIT(10), lane);
+	writel(readl(lane) & ~BIT(9), lane);
+	writel(readl(lane) | PHY_LANE_CFG_B14, lane);
+	ack0 = apple_pcie_bench_lane_clear(lane, PHY_LANE_CFG_REFCLK0REQ, PHY_LANE_CFG_REFCLK0ACK);
+	ack1 = apple_pcie_bench_lane_clear(lane, PHY_LANE_CFG_REFCLK1REQ, PHY_LANE_CFG_REFCLK1ACK);
+	apple_pcie_port_rmw_clear(port, PORT_APPCLK_EN, PORT_APPCLK);
+	run = readl_poll_timeout(port->base + PORT_STATUS, v, !(v & PORT_STATUS_READY), 1, 1000);
+	rmw_clear(BIT(0), pcie->base + RC_T602X_APPCLK_GATE_DIS);
+	if (bench_gpfix & T602X_BENCH_GPFIX_INT) {
+		int1 = apple_pcie_port_readl(port, PORT_INTSTAT);
+		apple_pcie_port_writel(port, int1, PORT_INTSTAT);
+	}
+
+	pwren_off = (bench_pwren_off & BIT(port->idx)) && port->pwren_gpio;
+	if (pwren_off)
+		gpiod_set_value_cansleep(port->pwren_gpio, 0);
+
+	dev_info(pcie->dev,
+		 "bench: port %d (linksts %#x) D3hot %d of %d, PME_Turn_Off %d, L2 %d (linksts %#x), PERST# asserted, fifo %d, ltssm %d (%#x), lane cfg %#x -> %#x, appclk off %d, pwren %s\n",
+		 port->idx, linksts, nd3, nfn, pme, l2, apple_pcie_port_readl(port, PORT_LINKSTS),
+		 fifo, ltssm, readl(rp + DWC_PORT_DEBUG0) & 0x3f, lane0, readl(lane), run,
+		 pwren_off ? "low" : "kept");
+	if (bench_gpfix)
+		dev_info(pcie->dev,
+			 "bench: gpfix %#x port %d: ack0 %d ack1 %d, intstat %#x first, %#x acked last (now %#x), +0x4020 %#x -> %#x\n",
+			 bench_gpfix, port->idx, ack0, ack1, int0, int1,
+			 (bench_gpfix & T602X_BENCH_GPFIX_INT) ?
+			 apple_pcie_port_readl(port, PORT_INTSTAT) : 0, p4020, p4020n);
+}
+
+static void apple_pcie_bench_t602x_rc_off(struct apple_pcie *pcie)
+{
+	struct resource *rc = platform_get_resource(to_platform_device(pcie->dev), IORESOURCE_MEM, 1);
+	void __iomem *phy, *axi;
+	u32 v, phy0, axi0;
+	int ack1, ack0;
+
+	if (!rc)
+		return;
+	phy = ioremap_np(rc->start + T602X_BENCH_PHY_SHARED, SZ_16K);
+	axi = ioremap_np(rc->start + T602X_BENCH_AXI2AF, SZ_16K);
+	if (!phy || !axi) {
+		dev_err(pcie->dev, "bench: shared PHY / axi2af not mapped\n");
+		goto out;
+	}
+	phy0 = readl(phy);
+	axi0 = readl(axi + T602X_BENCH_AXI2AF_CTL);
+
+	/* _disableRootComplex, in order */
+	udelay(10);
+	writel(readl(phy) | T602X_BENCH_PHY_CTRL_RESET, phy);
+	udelay(1);
+	writel(readl(phy) & ~PHY_LANE_CFG_REFCLK1REQ, phy);
+	ack1 = readl_poll_timeout(phy, v, !(v & PHY_LANE_CFG_REFCLK1ACK), 1, 10000);
+	udelay(1);
+	writel(readl(phy) & ~PHY_LANE_CFG_REFCLK0REQ, phy);
+	ack0 = readl_poll_timeout(phy, v, !(v & PHY_LANE_CFG_REFCLK0ACK), 1, 10000);
+	udelay(1);
+	writel(readl(phy) & ~(BIT(9) | BIT(8)), phy);
+	udelay(10);
+	writel(readl(phy + 4) & ~BIT(4), phy + 4);
+	writel(readl(phy + 4) & ~BIT(0), phy + 4);
+	writel(readl(axi + T602X_BENCH_AXI2AF_CTL) & ~BIT(16), axi + T602X_BENCH_AXI2AF_CTL);
+
+	dev_info(pcie->dev,
+		 "bench: root complex off: shared PHY %#x -> %#x (ack1 %d, ack0 %d), +4 %#x, axi2af +0x400 %#x -> %#x\n",
+		 phy0, readl(phy), ack1, ack0, readl(phy + 4), axi0,
+		 readl(axi + T602X_BENCH_AXI2AF_CTL));
+out:
+	if (axi)
+		iounmap(axi);
+	if (phy)
+		iounmap(phy);
+}
+
+/*
+ * bench_perst=4, t602x (Tanabota note 69): the j416s ADT gives dart-apcie0/1 (0x594000000,
+ * 0x595000000, both in APCIE_GP_SYS) a dart-tunables-instance-0 that macOS's AppleT8110DART
+ * applies at setup. Nothing applies it under Linux: m1n1 doesn't, and the DT carries it only for
+ * the apciec DARTs. Applied here before the ports go down, each word's before/after printed.
+ */
+#define T602X_BENCH_DART0		0x03000000	/* from rc: dart-apcie0, 0x594000000 */
+#define T602X_BENCH_DART1		0x04000000	/* from rc: dart-apcie1, 0x595000000 */
+
+static const u32 t602x_bench_dart_tunables[][3] = {
+	{ 0x20c, 0xff0000b7, 0xe40000b7 },
+	{ 0x220, 0x000f0f0f, 0x000f0f0f },
+	{ 0x224, 0x00ffffff, 0x00080808 },
+	{ 0x300, 0x00001f31, 0x00000001 },
+	{ 0x308, 0x3ffffffc, 0x10000000 },
+	{ 0x310, 0x3ffffffc, 0x3ffffffc },
+};
+
+static void apple_pcie_bench_t602x_dart_tunables(struct apple_pcie *pcie)
+{
+	struct resource *rc = platform_get_resource(to_platform_device(pcie->dev), IORESOURCE_MEM, 1);
+	static const u32 offs[] = { T602X_BENCH_DART0, T602X_BENCH_DART1 };
+	unsigned int d, i;
+
+	if (!rc)
+		return;
+	for (d = 0; d < ARRAY_SIZE(offs); d++) {
+		void __iomem *dart = ioremap_np(rc->start + offs[d], SZ_16K);
+		u32 before[ARRAY_SIZE(t602x_bench_dart_tunables)];
+		u32 after[ARRAY_SIZE(t602x_bench_dart_tunables)];
+
+		if (!dart) {
+			dev_err(pcie->dev, "bench: dart-apcie%u not mapped\n", d);
+			continue;
+		}
+		for (i = 0; i < ARRAY_SIZE(t602x_bench_dart_tunables); i++) {
+			const u32 *t = t602x_bench_dart_tunables[i];
+
+			before[i] = readl(dart + t[0]);
+			writel((before[i] & ~t[1]) | t[2], dart + t[0]);
+			after[i] = readl(dart + t[0]);
+		}
+		dev_info(pcie->dev,
+			 "bench: dart-apcie%u tunables: 0x20c %#x -> %#x, 0x220 %#x -> %#x, 0x224 %#x -> %#x, 0x300 %#x -> %#x, 0x308 %#x -> %#x, 0x310 %#x -> %#x\n",
+			 d, before[0], after[0], before[1], after[1], before[2], after[2],
+			 before[3], after[3], before[4], after[4], before[5], after[5]);
+		iounmap(dart);
+	}
+}
+
+static void apple_pcie_bench_t602x_sleep(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+
+	/* What bench_resume puts back: the ports' stream map and IRQ mask, before anything is cleared. */
+	list_for_each_entry(port, &pcie->ports, entry) {
+		int i;
+
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[i] = apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+	}
+
+	if (bench_gpfix & T602X_BENCH_GPFIX_ORDER) {
+		list_for_each_entry_reverse(port, &pcie->ports, entry)
+			apple_pcie_bench_t602x_port_off(pcie, port, bridge->bus);
+	} else {
+		list_for_each_entry(port, &pcie->ports, entry)
+			apple_pcie_bench_t602x_port_off(pcie, port, bridge->bus);
+	}
+	if (bench_gpfix & T602X_BENCH_GPFIX_LANEACK) {
+		list_for_each_entry(port, &pcie->ports, entry)
+			dev_info(pcie->dev, "bench: gpfix port %d lane cfg %#x before the root complex\n",
+				 port->idx, readl(port->phy + PHY_LANE_CFG));
+	}
+	apple_pcie_bench_t602x_rc_off(pcie);
+}
+
+/*
+ * bench_resume (Tanabota note 77 §14.8, note 78 §3.1): after a bench_perst=3/4 entry,
+ * apple_pcie_resume_noirq for a non-tunneled host would return without touching it, and the root
+ * complex stays down: an access to the internal DARTs then raises an SError (S3-10/11 under the HV:
+ * L2C_ERR_ADR in a DART at 0x5_xxxx_xxxx). The DARTs resume BEFORE this host in every phase:
+ * fw_devlink makes them suppliers through iommu-map. So the entry marks them host_resumes
+ * (apple_dart_set_host_resumes()): after a firmware-driven sleep their noirq resume gates them, and
+ * the end of this restores them (apple_dart_host_resume()). Without suspend_via_firmware their
+ * restore is the normal phase's, which comes after this anyway. Here:
+ * - the shared PHY and the axi2af bridge in the reverse order of apple_pcie_bench_t602x_rc_off();
+ * - each port as probe brings a link up, without pwren: the entry kept it high, and it is an SMC
+ *   GPIO, which isn't served before the SMC resumes; PERST# is pinctrl's;
+ * - the RID2SID entries and IRQ mask saved at the entry, the port IRQs enabled, the LTSSM started
+ *   and the link polled (device interrupts are still off).
+ * The root ports' and endpoints' config space comes back in their own noirq resume.
+ */
+/* Bench (note 77 §14.44): the port's MSI doorbell words, as a string for a print. */
+static void apple_pcie_bench_msi_words(struct apple_pcie_port *port, char *buf, size_t len)
+{
+	struct apple_pcie *pcie = port->pcie;
+
+	snprintf(buf, len, "MSIADDR %#x HI %#x MSICFG %#x MSIMAP[0] %#x",
+		 apple_pcie_port_readl(port, pcie->hw->port_msiaddr),
+		 pcie->hw->port_msiaddr_hi ?
+			apple_pcie_port_readl(port, pcie->hw->port_msiaddr_hi) : 0,
+		 apple_pcie_port_readl(port, PORT_MSICFG),
+		 pcie->hw->port_msimap ?
+			apple_pcie_port_readl(port, pcie->hw->port_msimap) : 0);
+}
+
+/*
+ * Bench (note 77 §14.44): after the wake the port's MSI doorbell is gone, and a GL9755 MSI to
+ * 0xfffff000 faults in its DART (b1h2, 6 of 6 SD wakes). Probe's MSI setup again, as the tunnel
+ * path's apple_pcie_tunnel_restore_irq_hw() does it, with apple_sleep.hybrid bit 13. The words
+ * are printed before and after in either case.
+ */
+static void apple_pcie_bench_t602x_msi(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	char before[96], after[96];
+	bool restore = apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_PCIE_MSI;
+	u32 value = 0;
+	int i;
+
+	apple_pcie_bench_msi_words(port, before, sizeof(before));
+	if (restore) {
+		apple_pcie_port_writel(port, lower_32_bits(DOORBELL_ADDR), pcie->hw->port_msiaddr);
+		if (pcie->hw->port_msiaddr_hi)
+			apple_pcie_port_writel(port, 0, pcie->hw->port_msiaddr_hi);
+		if (pcie->hw->port_msimap) {
+			for (i = 0; i < pcie->nvecs; i++)
+				apple_pcie_port_writel(port,
+					FIELD_PREP(PORT_MSIMAP_TARGET, i) | PORT_MSIMAP_ENABLE,
+					pcie->hw->port_msimap + 4 * i);
+		} else {
+			apple_pcie_port_writel(port, 0, PORT_MSIBASE);
+			value = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
+		}
+		apple_pcie_port_writel(port, value | PORT_MSICFG_EN, PORT_MSICFG);
+	}
+	apple_pcie_bench_msi_words(port, after, sizeof(after));
+	dev_info(pcie->dev, "bench: resume port %d MSI %s: %s -> %s\n", port->idx,
+		 restore ? "restored" : "as found", before, after);
+}
+
+#define DWC_PORT_DEBUG0_LTSSM		GENMASK(5, 0)
+
+static u32 apple_pcie_port_ltssm(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	return FIELD_GET(DWC_PORT_DEBUG0_LTSSM,
+			 readl_relaxed(pcie->cfg->win + (PCI_DEVFN(port->idx, 0) << 12) +
+				       DWC_PORT_DEBUG0));
+}
+
+static int apple_pcie_bench_t602x_port_on(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	void __iomem *lane = port->phy + PHY_LANE_CFG;
+	u32 lane0 = readl(lane), stat;
+	int ret, i;
+
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+	if (port->perst_gpio)
+		gpiod_set_value_cansleep(port->perst_gpio, 1);
+	writel(readl(lane) & ~PHY_LANE_CFG_B14, lane);
+	ret = apple_pcie_setup_refclk(pcie, port);
+	if (ret) {
+		dev_err(pcie->dev, "bench: resume port %d refclk %d (lane cfg %#x -> %#x)\n",
+			port->idx, ret, lane0, readl(lane));
+		return ret;
+	}
+	usleep_range(100, 200);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	if (port->perst_gpio)
+		gpiod_set_value_cansleep(port->perst_gpio, 0);
+	msleep(100);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat, stat & PORT_STATUS_READY,
+					 100, 250000);
+	if (ret) {
+		dev_err(pcie->dev, "bench: resume port %d not ready (status %#x)\n", port->idx, stat);
+		return ret;
+	}
+	if (pcie->hw->port_refclk)
+		rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+	else
+		rmw_set(PHY_LANE_CFG_REFCLKCGEN, lane);
+	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+
+	for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+		apple_pcie_rid2sid_write(port, i, port->saved_rid2sid[i]);
+	apple_pcie_bench_t602x_msi(pcie, port);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	apple_pcie_port_enable_irq(port);
+
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat, stat & PORT_LINKSTS_UP,
+					 1000, link_up_timeout * 1000);
+	dev_info(pcie->dev, "bench: resume port %d: lane cfg %#x -> %#x, link %s (linksts %#x, LTSSM %#x)\n",
+		 port->idx, lane0, readl(lane), ret ? "DOWN" : "up", stat,
+		 apple_pcie_port_ltssm(pcie, port));
+	/* A port without an endpoint stays down, as at probe: not an error. */
+	return 0;
+}
+
+/* bench_resume under suspend_via_firmware: a DART's state saved by its consumer, then its commands gated */
+static int apple_pcie_bench_dart_save_gate(struct device *dart)
+{
+	int ret = apple_dart_state_save(dart);
+
+	apple_dart_quiesce_commands(dart);
+	return ret;
+}
+
+/*
+ * bench_resume: each available DART named in the host's iommu-map (t602x: pcie0_dart_0..3), once. A disabled one
+ * (j416s: dart_2 and dart_3, no port) is skipped, not an error. *done of *total returned 0.
+ */
+static int apple_pcie_bench_for_each_dart(struct apple_pcie *pcie, int (*fn)(struct device *),
+					  unsigned int *done, unsigned int *total)
+{
+	struct device_node *np = pcie->dev->of_node, *seen[8] = {};
+	int n = of_property_count_u32_elems(np, "iommu-map"), ns = 0, ret = 0, i, k;
+
+	for (k = 0; n > 0 && k < n / 4; k++) {
+		/* <rid-base iommu iommu-base length>: the phandle is cell 4k + 1 */
+		struct device_node *d = of_parse_phandle(np, "iommu-map", 4 * k + 1);
+		struct platform_device *pdev;
+		bool dup = false;
+		int err;
+
+		if (!d)
+			continue;
+		if (!of_device_is_available(d)) {
+			of_node_put(d);
+			continue;
+		}
+		for (i = 0; i < ns; i++)
+			dup |= seen[i] == d;
+		if (dup || ns == ARRAY_SIZE(seen)) {
+			of_node_put(d);
+			continue;
+		}
+		seen[ns++] = d;
+		(*total)++;
+		pdev = of_find_device_by_node(d);
+		if (!pdev) {
+			ret = ret ?: -ENODEV;
+			continue;
+		}
+		err = fn(&pdev->dev);
+		put_device(&pdev->dev);
+		if (!err)
+			(*done)++;
+		else if (!ret)
+			ret = err;
+	}
+	for (i = 0; i < ns; i++)
+		of_node_put(seen[i]);
+	return ret;
+}
+
+static int apple_pcie_bench_t602x_resume(struct apple_pcie *pcie)
+{
+	struct resource *rc = platform_get_resource(to_platform_device(pcie->dev), IORESOURCE_MEM, 1);
+	struct apple_pcie_port *port;
+	void __iomem *phy, *axi;
+	u32 v, phy0, phy40, axi0;
+	int ack0, ack1, ret = 0;
+
+	if (!rc)
+		return -ENODEV;
+	phy = ioremap_np(rc->start + T602X_BENCH_PHY_SHARED, SZ_16K);
+	axi = ioremap_np(rc->start + T602X_BENCH_AXI2AF, SZ_16K);
+	if (!phy || !axi) {
+		dev_err(pcie->dev, "bench: resume: shared PHY / axi2af not mapped\n");
+		ret = -ENOMEM;
+		goto out;
+	}
+	phy0 = readl(phy);
+	phy40 = readl(phy + 4);
+	axi0 = readl(axi + T602X_BENCH_AXI2AF_CTL);
+
+	/* _disableRootComplex backwards */
+	writel(readl(axi + T602X_BENCH_AXI2AF_CTL) | BIT(16), axi + T602X_BENCH_AXI2AF_CTL);
+	writel(readl(phy + 4) | BIT(0), phy + 4);
+	writel(readl(phy + 4) | BIT(4), phy + 4);
+	udelay(10);
+	writel(readl(phy) | BIT(9) | BIT(8), phy);
+	udelay(1);
+	writel(readl(phy) | PHY_LANE_CFG_REFCLK0REQ, phy);
+	ack0 = readl_poll_timeout(phy, v, v & PHY_LANE_CFG_REFCLK0ACK, 1, 10000);
+	udelay(1);
+	writel(readl(phy) | PHY_LANE_CFG_REFCLK1REQ, phy);
+	ack1 = readl_poll_timeout(phy, v, v & PHY_LANE_CFG_REFCLK1ACK, 1, 10000);
+	udelay(1);
+	writel(readl(phy) & ~T602X_BENCH_PHY_CTRL_RESET, phy);
+	udelay(10);
+	dev_info(pcie->dev,
+		 "bench: resume: root complex on: shared PHY %#x -> %#x (ack0 %d, ack1 %d), +4 %#x -> %#x, axi2af +0x400 %#x -> %#x\n",
+		 phy0, readl(phy), ack0, ack1, phy40, readl(phy + 4), axi0,
+		 readl(axi + T602X_BENCH_AXI2AF_CTL));
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		ret = apple_pcie_bench_t602x_port_on(pcie, port);
+		if (ret)
+			break;
+	}
+	/* The root complex is back: the DARTs their noirq resume gated restore now. */
+	if (!ret) {
+		unsigned int nd = 0, nt = 0;
+		int dret = apple_pcie_bench_for_each_dart(pcie, apple_dart_host_resume, &nd, &nt);
+
+		dev_info(pcie->dev, "bench: resume: DARTs restored after the root complex: %u of %u, %d\n",
+			 nd, nt, dret);
+	}
+out:
+	if (axi)
+		iounmap(axi);
+	if (phy)
+		iounmap(phy);
+	return ret;
+}
+
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (bench_perst == 3 || bench_perst == 4) {
+		if (pcie->hw != &t602x_hw) {
+			dev_err(dev, "bench: bench_perst=%u is t602x's sequence\n", bench_perst);
+			return 0;
+		}
+		if (bench_perst == 4)
+			apple_pcie_bench_t602x_dart_tunables(pcie);
+		/* bench_resume: the DARTs wait for this host's resume (note 78 §3.1) */
+		if (bench_resume) {
+			unsigned int nd = 0, nt = 0;
+			int dret = apple_pcie_bench_for_each_dart(pcie, apple_dart_set_host_resumes,
+								  &nd, &nt);
+
+			dev_info(dev, "bench: DARTs held for the host's resume: %u of %u, %d\n",
+				 nd, nt, dret);
+			/*
+			 * Note 79: under suspend_via_firmware the DARTs' own save is their noirq,
+			 * after this teardown (they are suppliers: suspended after their
+			 * consumer), and their blocks no longer answer then (pd691: 0x594001000).
+			 * Save them now and gate them, so their noirq suspend leaves them alone;
+			 * the resume's host_resume restores them.
+			 */
+			if (pm_suspend_via_firmware()) {
+				nd = 0;
+				nt = 0;
+				dret = apple_pcie_bench_for_each_dart(pcie,
+								      apple_pcie_bench_dart_save_gate,
+								      &nd, &nt);
+				dev_info(dev, "bench: DARTs saved and gated before the root complex: %u of %u, %d\n",
+					 nd, nt, dret);
+			}
+		}
+		apple_pcie_bench_t602x_sleep(pcie);
+		pcie->bench_rc_off = true;
+		return 0;
+	}
 
 	if (s2idle_hold_domains && pm_suspend_no_platform() && pcie->num_pds)
 		return apple_pcie_hold_domains(pcie);
@@ -1161,6 +1819,12 @@ static int apple_pcie_resume_noirq(struct device *dev)
 
 	/* The domain's hold for the sleep ends first, whatever follows. */
 	apple_pcie_release_domains(pcie);
+	if (pcie->bench_rc_off) {
+		pcie->bench_rc_off = false;
+		if (bench_resume)
+			return apple_pcie_bench_t602x_resume(pcie);
+		dev_info(dev, "bench: the root complex stays down (bench_resume=0)\n");
+	}
 	return 0;
 }
 

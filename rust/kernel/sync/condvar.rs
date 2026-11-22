@@ -27,6 +27,11 @@ macro_rules! new_condvar {
 }
 pub use new_condvar;
 
+/// `TASK_FREEZABLE_UNSAFE` (include/linux/sched.h): `TASK_FREEZABLE`, and with lockdep the bit
+/// that tells the freezer the sleeper may hold locks.
+const TASK_FREEZABLE_UNSAFE: c_int =
+    TASK_FREEZABLE | if cfg!(CONFIG_LOCKDEP) { 0x0000_4000 } else { 0 };
+
 /// A conditional variable.
 ///
 /// Exposes the kernel's [`struct wait_queue_head`] as a condition variable. It allows the caller to
@@ -207,7 +212,9 @@ impl CondVar {
     /// while frozen; on the thaw the thread goes on with what is left of it, or none.
     ///
     /// The thread is frozen with whatever other locks it holds: only for a caller whose held
-    /// locks nothing on the suspend and resume path takes.
+    /// locks nothing on the suspend and resume path takes. That is why it sleeps
+    /// `TASK_FREEZABLE_UNSAFE`, as `freezable_schedule_unsafe()` users do: the freezer's lockdep
+    /// check would otherwise warn about those locks.
     #[must_use = "wait_freezable_timeout may wake up spuriously, so the caller must check the return value"]
     pub fn wait_freezable_timeout<T: ?Sized, B: Backend>(
         &self,
@@ -215,7 +222,7 @@ impl CondVar {
         jiffies: Jiffies,
     ) -> CondVarTimeoutResult {
         let jiffies = jiffies.try_into().unwrap_or(MAX_SCHEDULE_TIMEOUT);
-        let res = self.wait_internal(TASK_UNINTERRUPTIBLE | TASK_FREEZABLE, guard, jiffies);
+        let res = self.wait_internal(TASK_UNINTERRUPTIBLE | TASK_FREEZABLE_UNSAFE, guard, jiffies);
 
         match res as Jiffies {
             0 => CondVarTimeoutResult::Timeout,

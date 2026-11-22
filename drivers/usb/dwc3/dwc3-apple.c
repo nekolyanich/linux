@@ -438,9 +438,11 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
  * the PHY up again with the controller in reset (phy-apple-atc s2r_assume_cut). So stop the
  * controller before the sleep, while everything is powered, as an unplug does, and start it in
  * the role it had once the system is back: the role switch skips a set to the current role, so
- * nothing else would deassert its reset. Devices enumerate again after the wake. Runs before
- * the freezer, so it goes by the state "mem" means now; PM_POST_SUSPEND follows an abandoned
- * sleep as well. Off by default: a daily sleep keeps a connected controller out of system
+ * nothing else would deassert its reset. Devices enumerate again after the wake, and a mounted
+ * USB disk loses its block device (the HCD goes before the freezer). Runs before the freezer,
+ * where the sleep's target isn't known yet (pm_suspend_target_state is set after these
+ * notifiers), so it goes by the state "mem" means now: writing "freeze" with deep selected
+ * costs a USB restart, as aurora's. PM_POST_SUSPEND follows an abandoned sleep as well. Off by default: a daily sleep keeps a connected controller out of system
  * sleep (syscore), as before.
  */
 static bool sleep_stop;

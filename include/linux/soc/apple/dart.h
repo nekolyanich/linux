@@ -17,6 +17,7 @@ struct device;
 int apple_dart_state_save(struct device *dev);
 int apple_dart_state_restore(struct device *dev);
 int apple_dart_sleep_hold(struct device *dev);
+int apple_dart_sleep_hold_any(struct device *dev);
 void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
 void apple_dart_bench_state(struct device *dev, char *buf, size_t len);
 #else
@@ -31,6 +32,11 @@ static inline int apple_dart_state_restore(struct device *dev)
 }
 
 static inline int apple_dart_sleep_hold(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline int apple_dart_sleep_hold_any(struct device *dev)
 {
 	return -ENODEV;
 }

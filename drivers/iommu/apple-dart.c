@@ -1868,18 +1868,30 @@ EXPORT_SYMBOL_GPL(apple_dart_state_restore);
  * commands meanwhile are skipped and redone at the restore. @lost: the block's
  * power went off, so the registers are written back; otherwise only the TLBs.
  */
-int apple_dart_sleep_hold(struct device *dev)
+/* Its registers into save_tcr/save_ttbr, locked or not (a locked DART's are iBoot's) */
+static void apple_dart_held_save(struct apple_dart *dart)
+{
+	unsigned int sid, idx;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		dart->save_tcr[sid] = readl(dart->regs + DART_TCR(dart, sid));
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			dart->save_ttbr[sid][idx] = readl(dart->regs + DART_TTBR(dart, sid, idx));
+	}
+}
+
+static int __apple_dart_sleep_hold(struct device *dev, bool any)
 {
 	struct apple_dart *dart;
 	unsigned long flags;
-	int ret;
+	int ret = 0;
 
 	if (dev->driver != &apple_dart_driver.driver)
 		return -ENODEV;
 	dart = dev_get_drvdata(dev);
 	if (!dart)
 		return -ENODEV;
-	if (dart->locked)
+	if (dart->locked && !any)
 		return -EOPNOTSUPP;
 
 	ret = pm_runtime_resume_and_get(dev);
@@ -1891,7 +1903,10 @@ int apple_dart_sleep_hold(struct device *dev)
 		pm_runtime_put(dev);
 		return -EBUSY;
 	}
-	ret = apple_dart_suspend(dev);
+	if (dart->locked)
+		apple_dart_held_save(dart);
+	else
+		ret = apple_dart_suspend(dev);
 	if (!ret) {
 		spin_lock_irqsave(&dart->lock, flags);
 		dart->held = 1;
@@ -1908,7 +1923,23 @@ int apple_dart_sleep_hold(struct device *dev)
 		synchronize_irq(dart->irq);
 	return 0;
 }
+
+int apple_dart_sleep_hold(struct device *dev)
+{
+	return __apple_dart_sleep_hold(dev, false);
+}
 EXPORT_SYMBOL_GPL(apple_dart_sleep_hold);
+
+/*
+ * The same for a DART iBoot may have locked, which goes down with its consumer's
+ * domain (the SEP's on t6020, native5 and aurora): its registers as they were,
+ * written back at a lost restore whatever the lock; a lock that survived ignores them.
+ */
+int apple_dart_sleep_hold_any(struct device *dev)
+{
+	return __apple_dart_sleep_hold(dev, true);
+}
+EXPORT_SYMBOL_GPL(apple_dart_sleep_hold_any);
 
 void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
 {
@@ -1936,7 +1967,22 @@ void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
 	dart->held_skipped = 0;
 	spin_unlock_irqrestore(&dart->lock, flags);
 
-	if (lost) {
+	if (lost && dart->locked) {
+		unsigned int s, idx;
+
+		/* No reset: iBoot's configuration stays, only its tables go back */
+		for (s = 0; s < dart->num_streams; s++) {
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				writel(dart->save_ttbr[s][idx], dart->regs + DART_TTBR(dart, s, idx));
+			writel(dart->save_tcr[s], dart->regs + DART_TCR(dart, s));
+		}
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			bitmap_zero(map.sidmap, DART_MAX_STREAMS);
+			set_bit(sid, map.sidmap);
+			map.dart = dart;
+			dart->hw->invalidate_tlb(&map);
+		}
+	} else if (lost) {
 		/* The reset at its start invalidates every stream's TLB */
 		if (apple_dart_resume(dev))
 			dev_err(dev, "registers not restored after its block's power cycle\n");
@@ -2005,6 +2051,19 @@ static bool apple_dart_bench_hybrid(struct device *dev)
 	       (!strcmp(dev_name(dev), "39b008000.iommu") || !strcmp(dev_name(dev), "3860e8000.iommu"));
 }
 
+/*
+ * Held by its consumer (apple_dart_sleep_hold*), as the SEP's DART is across the
+ * enclave's SLEEP: its registers aren't there, and the consumer restores it before
+ * starting its firmware, so the DART's own sleep callbacks leave it alone (native5's
+ * guard for a DART with its own sleep list).
+ */
+static bool apple_dart_held(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	return dart && dart->held;
+}
+
 static bool apple_dart_fw_sleep(struct device *dev)
 {
 	return pm_suspend_via_firmware() || apple_dart_bench_hybrid(dev);
@@ -2012,16 +2071,22 @@ static bool apple_dart_fw_sleep(struct device *dev)
 
 static __maybe_unused int apple_dart_sys_suspend(struct device *dev)
 {
+	if (apple_dart_held(dev))
+		return 0;
 	return apple_dart_fw_sleep(dev) ? 0 : pm_runtime_force_suspend(dev);
 }
 
 static __maybe_unused int apple_dart_sys_resume(struct device *dev)
 {
+	if (apple_dart_held(dev))
+		return 0;
 	return apple_dart_fw_sleep(dev) ? 0 : pm_runtime_force_resume(dev);
 }
 
 static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
 {
+	if (apple_dart_held(dev))
+		return 0;
 	return apple_dart_fw_sleep(dev) ? pm_runtime_force_suspend(dev) : 0;
 }
 
@@ -2029,7 +2094,7 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 {
 	int ret;
 
-	if (!apple_dart_fw_sleep(dev))
+	if (!apple_dart_fw_sleep(dev) || apple_dart_held(dev))
 		return 0;
 	ret = pm_runtime_force_resume(dev);
 	/*

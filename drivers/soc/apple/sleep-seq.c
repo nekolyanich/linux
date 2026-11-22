@@ -2200,6 +2200,16 @@ static int aseq_begin(suspend_state_t state)
 	struct apple_sleep_seq *s = apple_sleep_seq;
 	int ret;
 
+	/*
+	 * m2pro 7.3.4 sleep backport: until the macsmc batch brings the SMC's
+	 * sleep notices, only a dry run may enter; a full entry is refused
+	 * here, before anything is written (batch 10 removes this).
+	 */
+	if (state == PM_SUSPEND_MEM && !dry_run) {
+		pr_warn("apple-sleep: full entry refused until the SMC sleep notices are backported; dry_run=1 only\n");
+		return -EOPNOTSUPP;
+	}
+
 	s->resumed = false;
 	s->groups = aseq_groups();
 	WRITE_ONCE(aseq_core_groups, s->groups);

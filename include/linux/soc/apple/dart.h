@@ -4,6 +4,7 @@
 
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/types.h>
 
 struct device;
 
@@ -15,6 +16,8 @@ struct device;
 #if IS_ENABLED(CONFIG_APPLE_DART)
 int apple_dart_state_save(struct device *dev);
 int apple_dart_state_restore(struct device *dev);
+int apple_dart_sleep_hold(struct device *dev);
+void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
 #else
 static inline int apple_dart_state_save(struct device *dev)
 {
@@ -24,6 +27,15 @@ static inline int apple_dart_state_save(struct device *dev)
 static inline int apple_dart_state_restore(struct device *dev)
 {
 	return -ENODEV;
+}
+
+static inline int apple_dart_sleep_hold(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
+{
 }
 #endif
 

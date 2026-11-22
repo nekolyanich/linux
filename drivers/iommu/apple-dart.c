@@ -239,6 +239,13 @@ struct apple_dart {
 	u32 supports_bypass : 1;
 	u32 four_level : 1;
 	u32 locked : 1;
+	/*
+	 * apple_dart_sleep_hold(): saved for its consumer's power cycle, a
+	 * runtime-PM reference held until apple_dart_sleep_restore_lost(); TLB
+	 * commands meanwhile are skipped (the block is off) and redone after.
+	 */
+	u32 held : 1;
+	u32 held_skipped : 1;
 
 	dma_addr_t dma_min;
 	dma_addr_t dma_max;
@@ -520,6 +527,11 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 	u32 command_reg;
 
 	spin_lock_irqsave(&stream_map->dart->lock, flags);
+	if (stream_map->dart->held) {
+		stream_map->dart->held_skipped = 1;
+		spin_unlock_irqrestore(&stream_map->dart->lock, flags);
+		return 0;
+	}
 
 	for (i = 0; i < BITS_TO_U32(stream_map->dart->num_streams); i++)
 		writel(stream_map->sidmap[i],
@@ -553,6 +565,11 @@ apple_dart_t8110_hw_tlb_command(struct apple_dart_stream_map *stream_map,
 	int sid;
 
 	spin_lock_irqsave(&dart->lock, flags);
+	if (dart->held) {
+		dart->held_skipped = 1;
+		spin_unlock_irqrestore(&dart->lock, flags);
+		return 0;
+	}
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
@@ -1838,6 +1855,99 @@ int apple_dart_state_restore(struct device *dev)
 	return apple_dart_state_call(dev, apple_dart_resume);
 }
 EXPORT_SYMBOL_GPL(apple_dart_state_restore);
+
+/*
+ * A consumer that powers its DART's block off and on itself (the DCP's restart
+ * after a cut, native5's disp0 cycle; aurora's sleep hold by function): the
+ * registers saved, and the runtime-PM reference held from the save to the
+ * restore (rv-sepkey), so nothing suspends or touches the DART in between; TLB
+ * commands meanwhile are skipped and redone at the restore. @lost: the block's
+ * power went off, so the registers are written back; otherwise only the TLBs.
+ */
+int apple_dart_sleep_hold(struct device *dev)
+{
+	struct apple_dart *dart;
+	unsigned long flags;
+	int ret;
+
+	if (dev->driver != &apple_dart_driver.driver)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (!dart)
+		return -ENODEV;
+	if (dart->locked)
+		return -EOPNOTSUPP;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
+		return ret;
+	mutex_lock(&apple_dart_state_lock);
+	if (dart->held) {
+		mutex_unlock(&apple_dart_state_lock);
+		pm_runtime_put(dev);
+		return -EBUSY;
+	}
+	ret = apple_dart_suspend(dev);
+	if (!ret) {
+		spin_lock_irqsave(&dart->lock, flags);
+		dart->held = 1;
+		dart->held_skipped = 0;
+		spin_unlock_irqrestore(&dart->lock, flags);
+	}
+	mutex_unlock(&apple_dart_state_lock);
+	if (ret) {
+		pm_runtime_put(dev);
+		return ret;
+	}
+	/* A fault handler already running finishes before the block goes off. */
+	if (dart->irq > 0)
+		synchronize_irq(dart->irq);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_sleep_hold);
+
+void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
+{
+	struct apple_dart_stream_map map = {};
+	struct apple_dart *dart;
+	unsigned long flags;
+	bool skipped;
+	int sid;
+
+	if (dev->driver != &apple_dart_driver.driver)
+		return;
+	dart = dev_get_drvdata(dev);
+	if (!dart)
+		return;
+
+	mutex_lock(&apple_dart_state_lock);
+	spin_lock_irqsave(&dart->lock, flags);
+	if (!dart->held) {
+		spin_unlock_irqrestore(&dart->lock, flags);
+		mutex_unlock(&apple_dart_state_lock);
+		return;
+	}
+	skipped = dart->held_skipped;
+	dart->held = 0;
+	dart->held_skipped = 0;
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	if (lost) {
+		/* The reset at its start invalidates every stream's TLB */
+		if (apple_dart_resume(dev))
+			dev_err(dev, "registers not restored after its block's power cycle\n");
+	} else if (skipped) {
+		map.dart = dart;
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			bitmap_zero(map.sidmap, DART_MAX_STREAMS);
+			set_bit(sid, map.sidmap);
+			dart->hw->invalidate_tlb(&map);
+		}
+	}
+	mutex_unlock(&apple_dart_state_lock);
+	pm_runtime_put(dev);
+}
+EXPORT_SYMBOL_GPL(apple_dart_sleep_restore_lost);
 
 /*
  * A firmware-driven sleep (aurora 2573357f, by function) takes the DARTs in

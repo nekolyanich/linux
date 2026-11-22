@@ -7,6 +7,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/soc/apple/dp-switch.h>
 #include <linux/suspend.h>
@@ -33,6 +34,9 @@ static struct {
 	struct dp_switch_dfp dfp[DP_SWITCH_DFPS];
 	struct apple_dcp *ufp[DP_SWITCH_UFPS];
 	bool kicked;
+	/* sleep_hold: every route released for the sleep, no pass until PM_POST_SUSPEND */
+	bool held;
+	bool resume_pass;
 } dp_switch = {
 	.lock = __MUTEX_INITIALIZER(dp_switch.lock),
 };
@@ -43,6 +47,18 @@ static const char *const dp_switch_port_names[DP_SWITCH_PORTS] = {
 
 static void dp_switch_work(struct work_struct *work);
 static DECLARE_WORK(dp_switch_work_item, dp_switch_work);
+
+/*
+ * rv-dpswitch round 2 (Q4 #2, aurora's sleep_held idea, d2ff12e2, our mechanics): release every
+ * route at PM_SUSPEND_PREPARE, while everything is still powered (dcp_switch_disconnect deselects
+ * the crossbar and stops the tunnel clock), then record hotplug events but run no pass until
+ * PM_POST_SUSPEND, which routes again. The pass runs on the non-freezable system_wq: without the
+ * hold, a tunnel torn down at the entry would run a pass against DCPs being stopped. Off by
+ * default: a daily sleep keeps the routes, and the replug at PM_POST_SUSPEND, as now.
+ */
+static bool sleep_hold;
+module_param(sleep_hold, bool, 0444);
+MODULE_PARM_DESC(sleep_hold, "Release the display switch's routes for system sleep, route again after it");
 
 static unsigned int dfp_index(u32 die, u32 atc, u32 port)
 {
@@ -92,6 +108,11 @@ static void dp_switch_work(struct work_struct *work)
 	int i;
 
 	mutex_lock(&dp_switch.lock);
+	/* sleep_hold: the events are recorded; PM_POST_SUSPEND runs the pass */
+	if (dp_switch.held) {
+		mutex_unlock(&dp_switch.lock);
+		return;
+	}
 
 	/* release first, so a DCP freed here can take a waiting sink */
 	for (i = 0; i < DP_SWITCH_DFPS; i++) {
@@ -170,6 +191,8 @@ static void dp_switch_resume_work(struct work_struct *work)
 		dfp->dcp = NULL;
 		released = true;
 	}
+	/* sleep_hold released them at the prepare already: route again */
+	released |= xchg(&dp_switch.resume_pass, false);
 	mutex_unlock(&dp_switch.lock);
 
 	if (released) {
@@ -183,8 +206,34 @@ static DECLARE_WORK(dp_switch_resume_work_item, dp_switch_resume_work);
 static int dp_switch_pm_notify(struct notifier_block *nb, unsigned long action,
 			       void *data)
 {
-	if (action == PM_POST_SUSPEND)
+	u32 die, atc, port;
+
+	if (action == PM_SUSPEND_PREPARE && sleep_hold) {
+		/* a pass in flight finishes first: it holds the lock */
+		mutex_lock(&dp_switch.lock);
+		dp_switch.held = true;
+		for (int i = 0; i < DP_SWITCH_DFPS; i++) {
+			struct dp_switch_dfp *dfp = &dp_switch.dfp[i];
+
+			if (!dfp->dcp)
+				continue;
+			dfp_decode(i, &die, &atc, &port);
+			dev_info(dfp->dcp->dev, "dp-switch: releasing atc%u %s for sleep\n",
+				 atc, dp_switch_port_names[port]);
+			dcp_switch_disconnect(dfp->dcp, false);
+			dfp->dcp = NULL;
+		}
+		mutex_unlock(&dp_switch.lock);
+	}
+	if (action == PM_POST_SUSPEND) {
+		mutex_lock(&dp_switch.lock);
+		if (dp_switch.held) {
+			dp_switch.held = false;
+			dp_switch.resume_pass = true;
+		}
+		mutex_unlock(&dp_switch.lock);
 		schedule_work(&dp_switch_resume_work_item);
+	}
 	return NOTIFY_DONE;
 }
 

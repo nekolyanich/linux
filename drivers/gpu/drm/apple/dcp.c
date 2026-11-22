@@ -1664,6 +1664,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 static void dcp_platform_remove(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
 	component_del(&pdev->dev, &dcp_comp_ops);
 
 	destroy_piodma_device(dcp);

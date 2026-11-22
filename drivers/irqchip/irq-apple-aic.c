@@ -56,6 +56,10 @@
 #include <linux/limits.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/moduleparam.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
+#include <linux/syscore_ops.h>
 #include <linux/irqchip/irq-apple-aic.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/cputype.h>
@@ -1018,6 +1022,127 @@ static void build_fiq_affinity(struct aic_irq_chip *ic, struct device_node *aff)
 	}
 }
 
+/*
+ * Bench (native5, note 77 §14.19; aurora's firmware-suspend save by function):
+ * the bench's suspend isn't via firmware, its resume is (the hybrid). Only
+ * with apple_sleep.hybrid bit 3 or irq_apple_aic.bench_hybrid at boot: every
+ * IRQ's config and the global words are saved at syscore suspend, every line
+ * masked, and all put back at resume. t6020's own sleep keeps the controller
+ * powered, so a daily boot registers none of this.
+ */
+static struct {
+	u32 config;
+	u32 timeout;
+	u32 cluster_prio;
+	u32 *irq_cfg;
+	bool saved;
+} aic_sleep;
+
+static bool bench_hybrid;
+module_param(bench_hybrid, bool, 0444);
+
+static bool aic_bench_hybrid_on(void)
+{
+	return bench_hybrid || (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_AIC);
+}
+
+static int aic_syscore_suspend(void *data)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 die, i, off = 0;
+
+	if (!pm_suspend_via_firmware() && !aic_bench_hybrid_on())
+		return 0;
+
+	aic_sleep.config = aic_ic_read(ic, AIC2_CONFIG);
+	aic_sleep.timeout = aic_ic_read(ic, AIC2_TIMEOUT);
+	aic_sleep.cluster_prio = aic_ic_read(ic, AIC2_CLUSTER_PRIO);
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++)
+			aic_sleep.irq_cfg[die * ic->nr_irq + i] =
+				aic_ic_read(ic, ic->info.irq_cfg + off + i * 4);
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++)
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+		off += ic->info.die_stride;
+	}
+	aic_sleep.saved = true;
+	pr_info("AIC: bench: hybrid, %u IRQ configs saved\n", ic->nr_die * ic->nr_irq);
+	return 0;
+}
+
+static void aic_syscore_resume(void *data)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 die, i, off = 0, rewritten = 0;
+
+	if (!aic_sleep.saved)
+		return;
+	aic_sleep.saved = false;
+
+	/* Otherwise the suspend was refused, and the controller stayed powered. */
+	if (pm_resume_via_firmware()) {
+		u32 fiq = __this_cpu_read(aic_fiq_unmasked);
+
+		aic_ic_write(ic, AIC2_TIMEOUT, aic_sleep.timeout);
+		aic_ic_write(ic, AIC2_CLUSTER_PRIO, aic_sleep.cluster_prio);
+		aic_ic_write(ic, AIC2_CONFIG, aic_sleep.config);
+		/* The boot CPU doesn't pass through hotplug: set it up again, keeping its FIQ users. */
+		aic_init_cpu(smp_processor_id());
+		__this_cpu_write(aic_fiq_unmasked, fiq);
+		if (is_kernel_in_hyp_mode()) {
+			if (fiq & BIT(AIC_TMR_EL02_PHYS))
+				sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_P);
+			if (fiq & BIT(AIC_TMR_EL02_VIRT))
+				sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_V);
+			isb();
+		}
+	}
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++) {
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+			aic_ic_write(ic, ic->info.sw_clr + off + i * 4, U32_MAX);
+		}
+		for (i = 0; i < ic->nr_irq; i++) {
+			u32 saved = aic_sleep.irq_cfg[die * ic->nr_irq + i];
+			u32 reg = ic->info.irq_cfg + off + i * 4;
+			unsigned int virq;
+
+			if (aic_ic_read(ic, reg) != saved) {
+				aic_ic_write(ic, reg, saved);
+				rewritten++;
+			}
+			/* Unmasked from the IRQ core's books, not from the hardware's. */
+			virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
+			if (virq && !irqd_irq_masked(irq_get_irq_data(virq)))
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i), MASK_BIT(i));
+		}
+		off += ic->info.die_stride;
+	}
+	pr_info("AIC: bench: hybrid, %u IRQ configs rewritten after the sleep%s\n", rewritten,
+		pm_resume_via_firmware() ? ", globals too" : "");
+}
+
+static const struct syscore_ops aic_syscore_ops = {
+	.suspend = aic_syscore_suspend,
+	.resume = aic_syscore_resume,
+};
+
+static struct syscore aic_syscore = {
+	.ops = &aic_syscore_ops,
+};
+
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
+{
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) || !aic_bench_hybrid_on() || irqc->info.version != 2)
+		return;
+	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
+	if (WARN_ON(!aic_sleep.irq_cfg))
+		return;
+	register_syscore(&aic_syscore);
+}
+
 static int __init aic_of_ic_init(struct device_node *node, struct device_node *parent)
 {
 	int i, die;
@@ -1178,6 +1303,8 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	}
 
 	vgic_set_kvm_info(&vgic_info);
+
+	aic_sleep_init(irqc);
 
 	pr_info("Initialized with %d/%d IRQs * %d/%d die(s), %d FIQs, %d vIPIs",
 		irqc->nr_irq, irqc->max_irq, irqc->nr_die, irqc->max_die, AIC_NR_FIQ, AIC_NR_SWIPI);

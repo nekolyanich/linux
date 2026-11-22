@@ -140,6 +140,8 @@ struct apple_dcp {
 	int bench_idle_ret;
 	/* An IOMFB call at the suspend timed out (A500): channel depths reset before RUN */
 	bool bench_call_lost;
+	/* An idle external DCP stopped by its suspend, its domains released */
+	bool dcpext_stopped;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

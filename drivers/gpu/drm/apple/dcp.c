@@ -26,6 +26,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -1938,6 +1939,100 @@ static void dcp_bench_boot(struct apple_dcp *dcp)
 		dcp_bench_afk_queue_op(dcp, 0xa3, "after the boot");
 }
 
+/*
+ * An idle external DCP across S2R (rv-dpswitch fa6f9d6 item 3): with no route (dp-switch's
+ * sleep_hold released it, or none was set up) and no CRTC on, there is no display state to
+ * keep. Only for a real sleep (suspend via firmware) or with appledrm.dcpext_sleep_stop: its
+ * link drained (A500 on 13.5), its firmware idled and its CPU stopped with the session kept,
+ * and no wakeup path, so genpd takes ps_dispextN_cpu0 -> fe -> sys down and sleep-seq leaves
+ * its request out of the PMP report. At the resume the display block is cycled as for the
+ * internal DCP (batch 11) and the session restarted warm; after a refused sleep the cycle is
+ * the reset native5 gives SIO, and the same restart follows. A failed restart falls back to
+ * RTKit's cold start. Anything else keeps today's path: wakeup path, nothing stopped.
+ */
+static bool dcpext_sleep_stop;
+module_param(dcpext_sleep_stop, bool, 0444);
+MODULE_PARM_DESC(dcpext_sleep_stop, "bench: stop an idle external DCP for S2R without suspend_via_firmware");
+
+static bool dcp_dcpext_stop_wanted(struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,dcpext") &&
+	       (pm_suspend_via_firmware() || dcpext_sleep_stop) && dcp->coproc_reg &&
+	       !IS_ERR_OR_NULL(dcp->rtk) && apple_rtkit_is_running(dcp->rtk) &&
+	       !dcp->switch_active && !dcp->active;
+}
+
+/* True if it stopped: then no wakeup path */
+static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
+{
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	int ret;
+
+	if (!dcp_dcpext_stop_wanted(dcp))
+		return false;
+	ret = iomfb_s2r_link_sleep(dcp);
+	dcp->bench_call_lost = ret == -ETIMEDOUT;
+	ret = apple_rtkit_sleep_stop(dcp->rtk, control);
+	if (ret) {
+		/* Not idle: it keeps running, with its domains, as today */
+		dev_warn(dcp->dev, "dcpext sleep: firmware did not stop (%d), kept running\n", ret);
+		if (apple_rtkit_sleep_return(dcp->rtk, control))
+			dev_err(dcp->dev, "dcpext sleep: firmware did not come back\n");
+		return false;
+	}
+	dcp->dcpext_stopped = true;
+	apple_sleep_dispext_down(dcp->dev, true);
+	dev_info(dcp->dev, "dcpext sleep: idle, firmware stopped, domains released\n");
+	return true;
+}
+
+static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
+{
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	bool real = pm_resume_via_firmware();
+	int ret;
+
+	if (!dcp->dcpext_stopped)
+		return;
+	dcp->dcpext_stopped = false;
+	apple_sleep_dispext_down(dcp->dev, false);
+
+	/* The power cycle macOS gives the block between its boots, and the reset of a refused sleep */
+	dcp_bench_disp0_cycle(dcp);
+	if (dcp->bench_call_lost) {
+		dcp->ch_cmd.depth = 0;
+		dcp->ch_oobcmd.depth = 0;
+		dcp->ch_cb.depth = 0;
+		dcp->ch_oobcb.depth = 0;
+		dcp->ch_async.depth = 0;
+		dcp->ch_oobasync.depth = 0;
+		dcp->bench_call_lost = false;
+	}
+	WRITE_ONCE(dcp->crashed, false);
+	apple_rtkit_set_oslog_echo(dcp->rtk, true);
+	ret = real ? apple_rtkit_sleep_return(dcp->rtk, control) :
+		     apple_rtkit_power_cycled_return(dcp->rtk, control);
+	if (!ret) {
+		struct apple_dcp_afkep *eps[8];
+		unsigned int n = dcp_bench_afk_eps(dcp, eps, ARRAY_SIZE(eps)), i;
+
+		for (i = 0; i < n; i++)
+			afk_bench_queue_op(eps[i], 0xa3);
+		dev_info(dcp->dev, "dcpext sleep: back after %s, %u AFK queues started\n",
+			 real ? "the sleep" : "a refused sleep", n);
+		return;
+	}
+	/* RTKit's own cold start, as at the bind: the firmware comes up, even if not all of it */
+	dev_err(dcp->dev, "dcpext sleep: warm restart failed (%d), starting it cold\n", ret);
+	ret = apple_rtkit_reinit(dcp->rtk);
+	if (!ret) {
+		writel_relaxed(readl_relaxed(control) | APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+		ret = apple_rtkit_wake(dcp->rtk);
+	}
+	if (ret)
+		dev_err(dcp->dev, "dcpext sleep: cold start failed: %d\n", ret);
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -1950,6 +2045,9 @@ static int dcp_platform_suspend(struct device *dev)
 		disconnected_hpd_event(dcp->connector);
 		dcp_dptx_disconnect(dcp, 0);
 	}
+	/* An idle external DCP stopped for a real sleep: its domains may go */
+	if (dcp_dcpext_sleep_stop(dcp))
+		return 0;
 	/*
 	 * Set the device as a wakeup device, which forces its power
 	 * domains to stay on. We need this as we do not support full
@@ -1968,6 +2066,8 @@ static int dcp_platform_resume(struct device *dev)
 
 	/* First: nothing below may talk to a firmware the sleep's table stopped (bench only) */
 	dcp_bench_boot(dcp);
+	/* Or that its own suspend stopped (an idle external DCP) */
+	dcp_dcpext_sleep_return(dcp);
 
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);

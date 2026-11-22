@@ -852,6 +852,8 @@ static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk, struct compl
 
 int apple_rtkit_reinit(struct apple_rtkit *rtk)
 {
+	unsigned long flags;
+
 	/* make sure we don't handle any messages while reinitializing */
 	apple_mbox_stop(rtk->mbox);
 	flush_workqueue(rtk->wq);
@@ -876,6 +878,12 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	rtk->crashed = false;
 	rtk->warm_session = false;
+	/* A cold boot after a warm restart or sleep stop: the full EPMAP reply, and a receive callback again */
+	rtk->warm_restart = false;
+	rtk->warm_last_mask = U32_MAX;
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 

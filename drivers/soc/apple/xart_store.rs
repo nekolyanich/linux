@@ -144,9 +144,12 @@ impl Store {
     /// an override of it. Writes additionally require a single-owner extent
     /// with no snapshots or pending revert, checked on the same block handle.
     pub(crate) fn open_owner(writes_enabled: bool, start_sector: u64) -> Result<Store> {
-        // No link without udev (the bench's initrd): the same partition by its GPT name
+        // No link without udev (the bench's initrd, apple_sep.partname_fallback=1 only): the
+        // same partition by its GPT name. A daily boot keeps udev's link alone.
         let file = match shim::StoreFile::open_block(OWNER_PATH, writes_enabled) {
-            Err(e) if e == ENOENT => shim::StoreFile::open_partlabel(OWNER_LABEL, writes_enabled)?,
+            Err(e) if e == ENOENT && crate::module_parameters::partname_fallback.value() != 0 => {
+                shim::StoreFile::open_partlabel(OWNER_LABEL, writes_enabled)?
+            }
             r => r?,
         };
         let base = crate::xart_apfs::locate(&file, writes_enabled)?;

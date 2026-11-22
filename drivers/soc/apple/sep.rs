@@ -3053,6 +3053,10 @@ module! {
             default: 1,
             description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",
         },
+        partname_fallback: u8 {
+            default: 0,
+            description: "Bench: find the iBoot container by its GPT name when /dev/disk/by-partlabel has no link (an initrd without udev), deferring the probe for up to 60 s after boot; 0 (default): the udev link only",
+        },
         xart_start_sector: u64 {
             default: 0,
             description: "Expected 512-byte start sector of the APFS .gl extent in the iBoot container. Zero accepts the APFS result; nonzero must match it and cannot override it",

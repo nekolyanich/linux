@@ -903,6 +903,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	rtk->crashed = false;
 	rtk->warm_session = false;
+	WRITE_ONCE(rtk->oslog_owed, 0);
 	/* A cold boot after a warm restart or sleep stop: the full EPMAP reply, and a receive callback again */
 	rtk->warm_restart = false;
 	rtk->warm_last_mask = U32_MAX;
@@ -1099,6 +1100,8 @@ int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
 	rtk->crashed = false;
 	rtk->warm_restart = true;
 	rtk->warm_session = true;
+	/* A counter owed to the old session isn't the new one's */
+	WRITE_ONCE(rtk->oslog_owed, 0);
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
@@ -1267,12 +1270,11 @@ static int apple_rtkit_polled_state(struct apple_rtkit *rtk, u8 type, unsigned i
 static void apple_rtkit_polled_begin(struct apple_rtkit *rtk)
 {
 	unsigned long flags;
+	u64 owed;
 
 	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
 	rtk->mbox->rx = apple_rtkit_polled_rx;
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
-
-	u64 owed;
 
 	/* What's already waiting is answered first, or the firmware may not go idle. */
 	apple_mbox_poll(rtk->mbox);

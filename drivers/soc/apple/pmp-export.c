@@ -44,6 +44,28 @@ static bool bench_sleep;
 module_param(bench_sleep, bool, 0444);
 MODULE_PARM_DESC(bench_sleep, "bench: idle and stop the PMP at suspend_late without suspend_via_firmware");
 
+/*
+ * Whether the PMP's stop can go to the sleep (aurora 2b629a0c, by function): the sleep driver is
+ * built and the DT has an available sleep controller. Then an unbind would leave the firmware
+ * running, and a commit with it running resets the SoC (seen on T8140); a rebind can't register
+ * again, so every later sleep is refused until reboot. The PMP stays bound (pmp.rs) and its
+ * module stays loaded (apple_pmp_register) there.
+ */
+bool apple_pmp_keep_bound(void)
+{
+	struct device_node *np;
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		return false;
+	for_each_node_by_name(np, "sleep-controller") {
+		if (of_device_is_available(np)) {
+			of_node_put(np);
+			return true;
+		}
+	}
+	return false;
+}
+
 int apple_pmp_register(struct device *dev, struct apple_rtkit *rtk)
 {
 	int idx;
@@ -58,6 +80,9 @@ int apple_pmp_register(struct device *dev, struct apple_rtkit *rtk)
 	pmp_device = dev;
 	pmp_rtk = rtk;
 	apple_sleep_pmp_state_set(1);
+	/* Never put: no rmmod once the PMP can be stopped for a sleep */
+	if (apple_pmp_keep_bound())
+		__module_get(THIS_MODULE);
 	return 0;
 }
 
@@ -156,9 +181,31 @@ static int apple_pmp_resume_early(struct device *dev)
 			return 0;
 		}
 	}
-	/* A stopped firmware doesn't restart with its power kept: the next real sleep does. */
+	/*
+	 * Refused after the stop: an idled firmware doesn't wake with its power kept, and the
+	 * fabric and the report acks stop with it. SIO's order (2e15ba51): sleep_return, which
+	 * takes a firmware whose idle didn't finish; else the sleep engine's PMGR reset of it and
+	 * a restart as after a power cycle. If neither works it stays stopped until a real sleep,
+	 * pmp_asleep kept, so no later sleep tries to idle it.
+	 */
 	if (!pm_resume_via_firmware()) {
-		dev_warn(dev, "sleep refused: firmware stays stopped until a real sleep\n");
+		void __iomem *control = pmp_asc + APPLE_PMP_ASC_CPU_CONTROL;
+
+		if (!apple_rtkit_sleep_return(pmp_rtk, control)) {
+			pmp_asleep = false;
+			dev_info(dev, "sleep refused: firmware still ran\n");
+			return 0;
+		}
+		ret = apple_sleep_engine_reset(dev);
+		if (!ret)
+			ret = apple_rtkit_power_cycled_return(pmp_rtk, control);
+		if (ret) {
+			dev_warn(dev, "sleep refused: firmware not back after a reset (%d), stopped until a real sleep\n",
+				 ret);
+			return 0;
+		}
+		pmp_asleep = false;
+		dev_info(dev, "sleep refused: firmware back after a reset\n");
 		return 0;
 	}
 	pmp_asleep = false;

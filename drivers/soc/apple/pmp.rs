@@ -400,6 +400,7 @@ extern "C" {
     fn apple_pmp_register(dev: *mut bindings::device, rtk: *mut bindings::apple_rtkit) -> kernel::ffi::c_int;
     fn apple_pmp_unregister(dev: *mut bindings::device);
     static apple_pmp_pm_ops: bindings::dev_pm_ops;
+    fn apple_pmp_keep_bound() -> bool;
 }
 
 impl Drop for PmpDriver {
@@ -424,6 +425,11 @@ impl platform::Driver for PmpDriver {
     fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
         // SAFETY: a static the shim defines and never changes.
         Some(unsafe { &*core::ptr::addr_of!(apple_pmp_pm_ops) })
+    }
+
+    fn suppress_bind_attrs() -> bool {
+        // SAFETY: reads the device tree only.
+        unsafe { apple_pmp_keep_bound() }
     }
 
     fn probe<'bound>(

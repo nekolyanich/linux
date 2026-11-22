@@ -48,6 +48,8 @@ struct dcp_audio {
 	struct snd_jack *jack;
 	struct snd_pcm_substream *substream;
 	unsigned int open_cookie;
+	/* Suspended for a system sleep and kept when its sink went, see dcpaud_take_kept() */
+	bool kept;
 
 	struct mutex data_lock;
 	bool dcp_connected; /// dcp status keep for delayed initialization
@@ -335,6 +337,7 @@ static int dcp_pcm_close(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	dcpaud->selected_chmap.channels = 0;
+	WRITE_ONCE(dcpaud->kept, false);
 
 	return snd_dmaengine_pcm_close(substream);
 }
@@ -349,6 +352,49 @@ static int dcpaud_connection_up(struct dcp_audio *dcpaud)
 	return ret;
 }
 
+/*
+ * A stream suspended for a system sleep (sleep_suspend_stream) is kept when the display drops
+ * its sink for the sleep (dcpaud_report_hotplug()), and goes on with the sink connected after the
+ * wake (aurora 327c774e, by function on our cookies): its next hw_params or prepare reads that
+ * sink's elements and takes its connection. A prepare (userspace recovering the suspended stream)
+ * selects the stream's element anew from its parameters. Without a sink, or with one that does
+ * not take the stream's format, the stream fails and userspace opens a new one.
+ */
+static int dcpaud_take_kept(struct dcp_audio *dcpaud, struct snd_pcm_runtime *runtime)
+{
+	struct snd_pcm_hw_params params = { };
+	struct snd_interval *i;
+	unsigned int cookie;
+	int ret;
+
+	if (!READ_ONCE(dcpaud->kept))
+		return 0;
+	scoped_guard(mutex, &dcpaud->data_lock) {
+		if (!dcpaud->connected)
+			return -ENXIO;
+		cookie = dcpaud->connection_cookie;
+	}
+	ret = dcpaud_read_remote_info(dcpaud);
+	if (ret < 0)
+		return ret;
+	if (runtime) {
+		snd_mask_set_format(hw_param_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT),
+				    runtime->format);
+		i = hw_param_interval(&params, SNDRV_PCM_HW_PARAM_CHANNELS);
+		i->min = i->max = runtime->channels;
+		i = hw_param_interval(&params, SNDRV_PCM_HW_PARAM_RATE);
+		i->min = i->max = runtime->rate;
+		ret = dcpaud_select_cookie(dcpaud, &params);
+		if (ret <= 0)
+			return ret ? ret : -EINVAL;
+	}
+	scoped_guard(mutex, &dcpaud->data_lock)
+		dcpaud->open_cookie = cookie;
+	WRITE_ONCE(dcpaud->kept, false);
+	dev_dbg(dcpaud->dev, "suspended stream goes on with the sink connected now\n");
+	return 0;
+}
+
 static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 			     struct snd_pcm_hw_params *params)
 {
@@ -356,6 +402,10 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct dma_slave_config slave_config;
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
 	int ret;
+
+	ret = dcpaud_take_kept(dcpaud, NULL);
+	if (ret)
+		return ret;
 
 	/* without the sink nothing to pick the element from (see open) */
 	if (dcpaud_connection_up(dcpaud)) {
@@ -397,6 +447,11 @@ static int dcp_pcm_hw_free(struct snd_pcm_substream *substream)
 static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	int ret;
+
+	ret = dcpaud_take_kept(dcpaud, substream->runtime);
+	if (ret)
+		return ret;
 
 	/* without the sink there is nothing to prepare (see open) */
 	if (!dcpaud_connection_up(dcpaud))
@@ -669,7 +724,14 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 
 	if (!connected) {
 		snd_pcm_stream_lock(substream);
-		if (substream->runtime)
+		/*
+		 * One suspended for a system sleep is kept: the display drops its sink for the
+		 * sleep, and the stream goes on with the sink connected after the wake, see
+		 * dcpaud_take_kept(). Only sleep_suspend_stream suspends a stream.
+		 */
+		if (substream->runtime && substream->runtime->state == SNDRV_PCM_STATE_SUSPENDED)
+			WRITE_ONCE(dcpaud->kept, true);
+		else if (substream->runtime)
 			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
 		snd_pcm_stream_unlock(substream);
 	}

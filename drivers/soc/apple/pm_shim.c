@@ -193,8 +193,8 @@ int sep_pm_dart_hold(void *ptr, bool hold)
 
 /*
  * Bench crumbs (PMU boot_stage, native EL2 with spmi_apple_controller.boot_crumb=1 only):
- * 0x5a .suspend entered, 0x5b SLEEP sent, 0x5c taken (param 0), 0x5d refused (param != 0),
- * 0x5e no answer, 0x5f DEV_DISABLE seen in .suspend_noirq, 0x59 its timeout.
+ * 0x4a .suspend entered, 0x4b SLEEP sent, 0x4c taken (param 0), 0x4d refused (param != 0),
+ * 0x4e no answer, 0x4f DEV_DISABLE seen in .suspend_noirq, 0x49 its timeout (off 0x5x: the entry crumb uses it).
  */
 void sep_pm_crumb(u8 stage)
 {
@@ -213,7 +213,7 @@ static int __maybe_unused sep_pm_suspend(struct device *dev)
 
 	if (!sep_pm_early_sleep() || !sleep)
 		return 0;
-	sep_pm_crumb(0x5a);
+	sep_pm_crumb(0x4a);
 	return sleep();
 }
 
@@ -237,7 +237,7 @@ static int __maybe_unused sep_pm_suspend_noirq(struct device *dev)
 		ret = -ETIMEDOUT;
 	if (ret == -ENOENT)
 		return 0;
-	sep_pm_crumb(ret ? 0x59 : 0x5f);
+	sep_pm_crumb(ret ? 0x49 : 0x4f);
 	if (ret)
 		dev_err(dev, "the enclave did not gate its power domain: %d\n", ret);
 	else

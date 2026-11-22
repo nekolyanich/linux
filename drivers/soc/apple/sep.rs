@@ -1315,14 +1315,14 @@ impl SepData {
             self.set_sleep_gate(pm::SleepGate::Open);
             return Err(e);
         }
-        pm::crumb(0x5b);
+        pm::crumb(0x4b);
         // From here the request may have been taken: a failure is not reversible.
         let reply = self.sleep_wait(&op, idx, tag);
         match reply {
-            Some(r) if r.param == 0 => pm::crumb(0x5c),
+            Some(r) if r.param == 0 => pm::crumb(0x4c),
             Some(r) => {
                 // Refused, and still running (rv-sepkey's (c)): its DART back, the sleep refused
-                pm::crumb(0x5d);
+                pm::crumb(0x4d);
                 let _ = pm::dart_hold(&self.dev, false);
                 self.set_sleep_gate(pm::SleepGate::Open);
                 pm::publish_refused();
@@ -1330,7 +1330,7 @@ impl SepData {
                 return Err(EBUSY);
             }
             None => {
-                pm::crumb(0x5e);
+                pm::crumb(0x4e);
                 // No answer. Not gated: it runs on, so its DART goes back (no TLB is skipped
                 // under a running enclave). Either way nothing is sent to it again.
                 if !pm::gated(&self.dev) {

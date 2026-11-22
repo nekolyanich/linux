@@ -4,6 +4,7 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/delay.h>
 #include "rtkit-internal.h"
 
 /* Default wait for each handshake reply, see apple_rtkit_set_handshake_timeout() (aurora) */

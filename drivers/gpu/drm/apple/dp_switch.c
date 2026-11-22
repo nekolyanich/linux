@@ -34,9 +34,8 @@ static struct {
 	struct dp_switch_dfp dfp[DP_SWITCH_DFPS];
 	struct apple_dcp *ufp[DP_SWITCH_UFPS];
 	bool kicked;
-	/* sleep_hold: every route released for the sleep, no pass until PM_POST_SUSPEND */
+	/* sleep_hold: every route released for the sleep, no pass until the resume work */
 	bool held;
-	bool resume_pass;
 } dp_switch = {
 	.lock = __MUTEX_INITIALIZER(dp_switch.lock),
 };
@@ -103,16 +102,17 @@ static struct apple_dcp *ufp_pick(bool tunnel)
 
 static void dp_switch_work(struct work_struct *work)
 {
-	bool freed = xchg(&dp_switch.kicked, false);
+	bool freed;
 	u32 die, atc, port;
 	int i;
 
 	mutex_lock(&dp_switch.lock);
-	/* sleep_hold: the events are recorded; PM_POST_SUSPEND runs the pass */
+	/* sleep_hold: the events, and a kick, are kept for the pass after the sleep */
 	if (dp_switch.held) {
 		mutex_unlock(&dp_switch.lock);
 		return;
 	}
+	freed = xchg(&dp_switch.kicked, false);
 
 	/* release first, so a DCP freed here can take a waiting sink */
 	for (i = 0; i < DP_SWITCH_DFPS; i++) {
@@ -191,8 +191,14 @@ static void dp_switch_resume_work(struct work_struct *work)
 		dfp->dcp = NULL;
 		released = true;
 	}
-	/* sleep_hold released them at the prepare already: route again */
-	released |= xchg(&dp_switch.resume_pass, false);
+	/*
+	 * sleep_hold released them at the prepare already (so the loop above found none): the
+	 * hold ends here, not at PM_POST_SUSPEND, so no pass routes before this pause (one blink).
+	 */
+	if (dp_switch.held) {
+		dp_switch.held = false;
+		released = true;
+	}
 	mutex_unlock(&dp_switch.lock);
 
 	if (released) {
@@ -225,15 +231,8 @@ static int dp_switch_pm_notify(struct notifier_block *nb, unsigned long action,
 		}
 		mutex_unlock(&dp_switch.lock);
 	}
-	if (action == PM_POST_SUSPEND) {
-		mutex_lock(&dp_switch.lock);
-		if (dp_switch.held) {
-			dp_switch.held = false;
-			dp_switch.resume_pass = true;
-		}
-		mutex_unlock(&dp_switch.lock);
+	if (action == PM_POST_SUSPEND)
 		schedule_work(&dp_switch_resume_work_item);
-	}
 	return NOTIFY_DONE;
 }
 

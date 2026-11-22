@@ -576,6 +576,9 @@ static void suspend_finish(void)
  * Fail if that's not the case.  Otherwise, prepare for system suspend, make the
  * system enter the given sleep state and clean up after wakeup.
  */
+/* Dark wakes taken back to sleep in a row before a normal resume */
+#define PM_DARK_WAKE_MAX 16
+
 static int enter_state(suspend_state_t state)
 {
 	int error;
@@ -623,7 +626,12 @@ static int enter_state(suspend_state_t state)
 	 * Every device has resumed, but nothing woke the system that user space
 	 * needs to see: go back to sleep with user space still frozen.
 	 */
-	while (!error && pm_dark_wake()) {
+	for (int dark = 0; !error && pm_dark_wake(); dark++) {
+		/* Bounded: a wake source that keeps firing must not keep the system dark. */
+		if (dark >= PM_DARK_WAKE_MAX) {
+			pr_warn("dark wake: %d in a row, resuming normally\n", dark);
+			break;
+		}
 		pr_info("dark wake: suspending again (%s)\n", mem_sleep_labels[state]);
 		pm_suspend_clear_flags();
 		error = suspend_devices_and_enter(state);

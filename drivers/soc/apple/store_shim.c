@@ -280,9 +280,8 @@ int sep_store_replace(const char *path, const void *buf, size_t len,
 	name++;
 
 	mutex_lock(&sep_store_replace_lock);
-	task_lock(&init_task);
-	get_fs_root(init_task.fs, &root);
-	task_unlock(&init_task);
+	/* as open_as_kernel(): userspace init's root, init_task stays in nullfs on 7.3 */
+	get_fs_root(userspace_init_fs, &root);
 	old = override_creds(kern);
 
 	dir = file_open_root(&root, dpath, O_RDONLY | O_DIRECTORY, 0);
@@ -374,9 +373,8 @@ int sep_store_unlink(const char *path)
 	name++;
 
 	mutex_lock(&sep_store_replace_lock);
-	task_lock(&init_task);
-	get_fs_root(init_task.fs, &root);
-	task_unlock(&init_task);
+	/* as open_as_kernel(): userspace init's root, init_task stays in nullfs on 7.3 */
+	get_fs_root(userspace_init_fs, &root);
 	old = override_creds(kern);
 
 	dir = file_open_root(&root, dpath, O_RDONLY | O_DIRECTORY, 0);

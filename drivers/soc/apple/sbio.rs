@@ -2924,10 +2924,12 @@ impl SepData {
             }
             // A reply wait sleeps uninterruptibly: with a signal pending an
             // interruptible wait returns at once with the time left unchanged,
-            // so this loop would spin until the reply came, or forever.
+            // so this loop would spin until the reply came, or forever. And
+            // freezably: the freezer must not wait out the reply (it gives up
+            // after 20 s). The slot stays this request's across a freeze.
             match self
                 .sbio_wq
-                .wait_timeout(&mut guard, remaining)
+                .wait_freezable_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,
@@ -3024,10 +3026,12 @@ impl SepData {
             }
             // A reply wait sleeps uninterruptibly: with a signal pending an
             // interruptible wait returns at once with the time left unchanged,
-            // so this loop would spin until the reply came, or forever.
+            // so this loop would spin until the reply came, or forever. And
+            // freezably: the freezer must not wait out the reply (it gives up
+            // after 20 s). The slot stays this request's across a freeze.
             match self
                 .sbio_wq
-                .wait_timeout(&mut guard, remaining)
+                .wait_freezable_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,

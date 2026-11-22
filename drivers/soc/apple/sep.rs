@@ -1351,7 +1351,7 @@ impl SepData {
             }
             // Uninterruptible (aurora 04b0045d): with a signal pending an interruptible wait
             // returns at once with the time left unchanged, and this loop would spin.
-            match self.control_wq.wait_timeout(&mut guard, remaining) {
+            match self.control_wq.wait_freezable_timeout(&mut guard, remaining) {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
@@ -1435,7 +1435,7 @@ impl SepData {
             }
             // Uninterruptible (aurora 04b0045d): with a signal pending an interruptible wait
             // returns at once with the time left unchanged, and this loop would spin.
-            match self.control_wq.wait_timeout(&mut guard, remaining) {
+            match self.control_wq.wait_freezable_timeout(&mut guard, remaining) {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
@@ -1527,10 +1527,12 @@ impl SepData {
 
             // A reply wait sleeps uninterruptibly: with a signal pending an
             // interruptible wait returns at once with the time left unchanged,
-            // so this loop would spin until the reply came, or forever.
+            // so this loop would spin until the reply came, or forever. And
+            // freezably: the freezer must not wait out the reply (it gives up
+            // after 20 s). The slot stays this request's across a freeze.
             match self
                 .control_wq
-                .wait_timeout(&mut guard, remaining)
+                .wait_freezable_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,
@@ -1569,10 +1571,12 @@ impl SepData {
             }
             // A reply wait sleeps uninterruptibly: with a signal pending an
             // interruptible wait returns at once with the time left unchanged,
-            // so this loop would spin until the reply came, or forever.
+            // so this loop would spin until the reply came, or forever. And
+            // freezably: the freezer must not wait out the reply (it gives up
+            // after 20 s). The slot stays this request's across a freeze.
             match self
                 .control_wq
-                .wait_timeout(&mut guard, remaining)
+                .wait_freezable_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,
@@ -2104,10 +2108,12 @@ impl SepData {
             }
             // A reply wait sleeps uninterruptibly: with a signal pending an
             // interruptible wait returns at once with the time left unchanged,
-            // so this loop would spin until the reply came, or forever.
+            // so this loop would spin until the reply came, or forever. And
+            // freezably: the freezer must not wait out the reply (it gives up
+            // after 20 s). The slot stays this request's across a freeze.
             match self
                 .scrd_wq
-                .wait_timeout(&mut guard, remaining)
+                .wait_freezable_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { .. } => remaining = 0,

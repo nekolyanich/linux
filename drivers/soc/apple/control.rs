@@ -251,8 +251,11 @@ impl ControlState {
     }
 
     /// Whether any request is waiting for its reply.
+    ///
+    /// An answered request isn't: its waiter may be frozen for the suspend
+    /// (a freezable reply wait) and take its reply only after the thaw.
     pub(crate) fn requests_in_flight(&self) -> bool {
-        self.slots.iter().any(|s| s.used)
+        self.slots.iter().any(|s| s.used && s.reply.is_none())
     }
 
     /// Forget the wake messages seen, before asking for them.

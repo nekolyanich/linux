@@ -369,12 +369,20 @@ static void aic_ic_write(struct aic_irq_chip *ic, u32 reg, u32 val)
  * A sleep that a firmware engine finishes waits for the CPUs to stop, and a raised
  * line ends WFI even with interrupts off. Every line is masked for that last step.
  */
+bool aic_sleep_ready(void)
+{
+	return aic_irqc && aic_irqc->sleep_masks;
+}
+
 void aic_sleep_mask_all(void)
 {
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 words = ic->max_irq >> 5, off = 0, reg, i;
 	u32 *saved = ic->sleep_masks;
 	int die;
+
+	if (WARN_ON_ONCE(!saved))
+		return;
 
 	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
 		for (i = 0; i < words; i++) {
@@ -391,6 +399,9 @@ void aic_sleep_restore(void)
 	u32 words = ic->max_irq >> 5, off = 0, i;
 	u32 *saved = ic->sleep_masks;
 	int die;
+
+	if (!saved)
+		return;
 
 	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
 		for (i = 0; i < words; i++, saved++) {
@@ -1092,10 +1103,13 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 
 	irqc->info.die_stride = off - start_off;
 
-	irqc->sleep_masks = kcalloc(irqc->nr_die * (irqc->max_irq >> 5),
-				    sizeof(*irqc->sleep_masks), GFP_KERNEL);
-	if (WARN_ON(!irqc->sleep_masks))
-		goto err_unmap;
+	/* Only apple-sleep masks every line; without the room it does not sleep. */
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)) {
+		irqc->sleep_masks = kcalloc(irqc->nr_die * (irqc->max_irq >> 5),
+					    sizeof(*irqc->sleep_masks), GFP_KERNEL);
+		if (!irqc->sleep_masks)
+			pr_warn("AIC: no room for the sleep masks, system sleep refused\n");
+	}
 
 	irqc->hw_domain = irq_domain_create_tree(of_fwnode_handle(node),
 						 &aic_irq_domain_ops, irqc);
@@ -1176,6 +1190,7 @@ err_unmap:
 	if (irqc->event && irqc->event != irqc->base)
 		iounmap(irqc->event);
 	iounmap(irqc->base);
+	kfree(irqc->sleep_masks);
 	kfree(irqc);
 	return -ENODEV;
 }

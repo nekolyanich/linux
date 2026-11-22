@@ -3452,6 +3452,10 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	if (!is_kernel_in_hyp_mode())
 		return -ENODEV;
 
+	/* The last step masks every interrupt line, which needs AIC's room for them. */
+	if (!aic_sleep_ready())
+		return dev_err_probe(dev, -ENOMEM, "AIC has no sleep masks; no system sleep\n");
+
 	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return -ENOMEM;

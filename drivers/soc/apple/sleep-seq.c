@@ -1768,16 +1768,21 @@ static void aseq_op_run(struct apple_sleep_seq *s, const struct apple_sleep_op *
 	case SEQ_W64:
 		/* dispext_off: macOS's report words carry the external DCPs' requests until n24 #4 */
 		if (s->dispext_done && op->blk == s->soc->report_blk && op->off == s->soc->report_write) {
-			/* Unbound, or stopped by its driver for this sleep: its request goes */
-			u8 keep = s->dispext_bound & ~READ_ONCE(aseq_dispext_down);
+			/* Not owned (its rows ran), or stopped by its driver for this sleep: its request goes */
+			u8 drop = (~s->dispext_bound | READ_ONCE(aseq_dispext_down)) & 3;
 
-			writeq(op->val & ~((keep & BIT(0) ? 0 :
-					    BIT_ULL(s->soc->dispext_report_bit[0])) |
-					   (keep & BIT(1) ? 0 :
-					    BIT_ULL(s->soc->dispext_report_bit[1]))), reg);
-		}
-		else
+			writeq(op->val & ~((drop & BIT(0) ? BIT_ULL(s->soc->dispext_report_bit[0]) : 0) |
+					   (drop & BIT(1) ? BIT_ULL(s->soc->dispext_report_bit[1]) : 0)), reg);
+		} else if (op->blk == s->soc->report_blk && op->off == s->soc->report_write &&
+			   (READ_ONCE(aseq_dispext_down) & s->dispext_bound)) {
+			/* Without the dispext run: only a driver's own stop (rv-usb4) */
+			u8 drop = READ_ONCE(aseq_dispext_down) & s->dispext_bound;
+
+			writeq(op->val & ~((drop & BIT(0) ? BIT_ULL(s->soc->dispext_report_bit[0]) : 0) |
+					   (drop & BIT(1) ? BIT_ULL(s->soc->dispext_report_bit[1]) : 0)), reg);
+		} else {
 			writeq(op->val, reg);
+		}
 		break;
 	case SEQ_CLR32:
 		writel((u32)found & ~(u32)op->val, reg);
@@ -2550,6 +2555,8 @@ static int aseq_begin(suspend_state_t state)
 	/* Whose external DCPs these are now: a driver may have bound one since boot */
 	if (state == PM_SUSPEND_MEM && s->dispext_rows)
 		aseq_dispext_owned(s);
+	/* No "down" left from an earlier sleep: their drivers set it again at their suspend */
+	WRITE_ONCE(aseq_dispext_down, 0);
 	if (state == PM_SUSPEND_MEM && bench && dispext_off == 2 && s->dispext_rows) {
 		aseq_dispext_print(s, "begin");
 		aseq_dispext_run(s, "begin");
@@ -2922,6 +2929,10 @@ static void aseq_ps_restore_walk(bool save)
 static int aseq_enter(suspend_state_t state)
 {
 	struct apple_sleep_seq *s = apple_sleep_seq;
+
+	/* rv-usb4: a dcpext its driver stopped goes down through genpd at noirq; its PS words show it */
+	if (READ_ONCE(aseq_dispext_down))
+		aseq_dispext_print(s, "entry, stopped by their driver");
 
 	/* No resume path yet: the full entry only where the bench's hypervisor catches the wake. */
 	if (!dry_run && (!s->mbox || !bench)) {

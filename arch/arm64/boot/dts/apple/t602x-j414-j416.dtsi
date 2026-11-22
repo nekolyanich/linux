@@ -19,6 +19,12 @@
 
 / {
 	aliases {
+		/*
+		 * m1n1 enables a dcpext node only through its alias; asahi 7.3.4
+		 * dropped t600x-j314-j316's dcpext1 alias (ENABLE_DCPEXT_TYPEC), and
+		 * the display switch hands both external DCPs out on the Type-C ports.
+		 */
+		dcpext1 = &dcpext1;
 		keyboard = &keyboard;
 		sep = &sep;
 	};

@@ -20,6 +20,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <sound/dmaengine_pcm.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -74,6 +75,16 @@ struct dcp_audio {
  * Leave room for both DCPs' streams at once.
  */
 #define DCPAUD_MAX_PERIODS	16
+
+/*
+ * System sleep with a stream open (aurora 327c774e's legacy part, by function): suspend the
+ * stream the ALSA way, so its SIO channel is idle when SIO's firmware stops for the sleep.
+ * Off by default: a daily sleep keeps today's behaviour (the stream runs on into the sleep, and
+ * the display's sink drop stops it DISCONNECTED).
+ */
+static bool sleep_suspend_stream;
+module_param(sleep_suspend_stream, bool, 0444);
+MODULE_PARM_DESC(sleep_suspend_stream, "Suspend an open DP audio stream for system sleep (SIO idle for the sleep)");
 
 static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.info	 = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
@@ -428,7 +439,13 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		return -EINVAL;
 	}
 
-	ret = snd_dmaengine_pcm_trigger(substream, cmd);
+	/*
+	 * A suspended stream's DMA ends, as on STOP: a paused SIO channel stays busy, and the SIO
+	 * firmware stops in the sleep. Only snd_pcm_suspend_all() sends SUSPEND here, and only
+	 * with sleep_suspend_stream.
+	 */
+	ret = snd_dmaengine_pcm_trigger(substream, cmd == SNDRV_PCM_TRIGGER_SUSPEND ?
+					SNDRV_PCM_TRIGGER_STOP : cmd);
 	if (ret < 0)
 		return ret;
 
@@ -920,7 +937,38 @@ static __maybe_unused int dcpaud_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(dcpaud_pm_ops, dcpaud_suspend, dcpaud_resume, NULL);
+/*
+ * With sleep_suspend_stream, a system sleep suspends an open stream: the PCM core triggers
+ * SUSPEND, which ends its DMA, then sync_stop, which drains it, stops the link and puts the
+ * runtime PM reference (the PM order of bd3ad17e holds). At the sleep's prepare, before any
+ * device suspends, and again at .suspend. The PCM doesn't claim SNDRV_PCM_INFO_RESUME (it never
+ * did here), so userspace prepares the stream again after the wake.
+ */
+static void dcpaud_sleep_quiesce(struct dcp_audio *dcpaud)
+{
+	if (!sleep_suspend_stream || !dcpaud || !dcpaud->substream)
+		return;
+	snd_pcm_suspend_all(dcpaud->substream->pcm);
+}
+
+static __maybe_unused int dcpaud_pm_prepare(struct device *dev)
+{
+	dcpaud_sleep_quiesce(dev_get_drvdata(dev));
+	return 0;
+}
+
+static __maybe_unused int dcpaud_system_suspend(struct device *dev)
+{
+	dcpaud_sleep_quiesce(dev_get_drvdata(dev));
+	return pm_runtime_force_suspend(dev);
+}
+
+/* As DEFINE_RUNTIME_DEV_PM_OPS, with the stream's suspend in front of the force suspend */
+static const struct dev_pm_ops dcpaud_pm_ops = {
+	.prepare = pm_sleep_ptr(dcpaud_pm_prepare),
+	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, pm_runtime_force_resume)
+	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
+};
 
 static const struct of_device_id dcpaud_of_match[] = {
 	{ .compatible = "apple,dpaudio" },

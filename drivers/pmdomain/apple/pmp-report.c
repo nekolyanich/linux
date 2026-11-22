@@ -27,6 +27,8 @@ struct apple_pmp_report {
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	spinlock_t lock;
+	/* the entries, for the resume (lock) */
+	struct list_head entries;
 };
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
@@ -41,6 +43,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spin_lock_init(&rep->lock);
+	INIT_LIST_HEAD(&rep->entries);
 	rep->dev = dev;
 	rep->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(rep->base))
@@ -53,6 +56,47 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 
 	return 0;
 }
+
+struct apple_pmp_report_entry {
+	struct device *dev;
+	struct generic_pm_domain genpd;
+	struct list_head node;
+	u32 id;
+};
+
+/*
+ * The requests are written only as genpd turns an entry on or off, and the always-on ones once
+ * at probe. A sleep that cut the SoC's power may come back with the request word reset while
+ * genpd still has the entries on (disp0's 0x2000, dispext0/1): write every entry's request from
+ * its genpd state again, before any consumer resumes. The PMP itself restarts later, in its
+ * resume_early, and reads the requests then, so this doesn't wait for its acks.
+ */
+static int apple_pmp_report_resume_noirq(struct device *dev)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+	struct apple_pmp_report_entry *ent;
+	unsigned long flags;
+	u64 val, set = 0, mask = 0;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	list_for_each_entry(ent, &rep->entries, node) {
+		mask |= BIT_ULL(ent->id);
+		if (ent->genpd.status == GENPD_STATE_ON)
+			set |= BIT_ULL(ent->id);
+	}
+	val = readq(rep->base + rep->offsets->tgt_read);
+	if ((val & mask) != set) {
+		dev_info(dev, "resume: requests %#llx, genpd has %#llx: written again\n",
+			 val & mask, set);
+		writeq((val & ~mask) | set, rep->base + rep->offsets->tgt_write);
+	}
+	spin_unlock_irqrestore(&rep->lock, flags);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_pmp_report_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmp_report_resume_noirq)
+};
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x = {
 	.tgt_read = 0xf80,
@@ -103,13 +147,8 @@ static struct platform_driver apple_pmp_report_driver = {
 	.driver = {
 		.name = "apple-pmp-report",
 		.of_match_table = apple_pmp_report_of_match,
+		.pm = pm_sleep_ptr(&apple_pmp_report_pm_ops),
 	},
-};
-
-struct apple_pmp_report_entry {
-	struct device *dev;
-	struct generic_pm_domain genpd;
-	u32 id;
 };
 
 #define genpd_to_apple_pmp_report_entry(_genpd) \
@@ -213,6 +252,15 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 
 	pm_genpd_remove_device(dev);
 
+	{
+		struct apple_pmp_report *rep = dev_get_drvdata(dev->parent);
+		unsigned long flags;
+
+		spin_lock_irqsave(&rep->lock, flags);
+		list_add_tail(&ent->node, &rep->entries);
+		spin_unlock_irqrestore(&rep->lock, flags);
+	}
+
 	return 0;
 err_remove:
 	of_genpd_del_provider(node);
@@ -230,6 +278,8 @@ static struct platform_driver apple_pmp_report_entry_driver = {
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
+		/* its entry stays on the report's list: no unbind */
+		.suppress_bind_attrs = true,
 	},
 };
 

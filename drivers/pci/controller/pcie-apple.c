@@ -1750,13 +1750,18 @@ static int apple_pcie_bench_t602x_resume(struct apple_pcie *pcie)
 		if (ret)
 			break;
 	}
-	/* The root complex is back: the DARTs their noirq resume gated restore now. */
-	if (!ret) {
+	/*
+	 * The root complex is back: the DARTs their noirq resume gated restore now. Also after a
+	 * port that didn't come back (rv-usb4, batch 5): the shared PHY and axi2af are on by here,
+	 * so the DART blocks answer, and left gated every internal DART would refuse all commands
+	 * until the next boot. Only a root complex that never came back (out:) leaves them gated.
+	 */
+	{
 		unsigned int nd = 0, nt = 0;
 		int dret = apple_pcie_bench_for_each_dart(pcie, apple_dart_host_resume, &nd, &nt);
 
-		dev_info(pcie->dev, "bench: resume: DARTs restored after the root complex: %u of %u, %d\n",
-			 nd, nt, dret);
+		dev_info(pcie->dev, "bench: resume: DARTs restored after the root complex%s: %u of %u, %d\n",
+			 ret ? " (a port failed)" : "", nd, nt, dret);
 	}
 out:
 	if (axi)

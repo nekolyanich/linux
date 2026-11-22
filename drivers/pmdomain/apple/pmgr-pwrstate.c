@@ -320,8 +320,13 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 						!(cur & APPLE_PMGR_BUSY), 1,
 						APPLE_PMGR_BUSY_SETTLE_US);
 
-	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
-	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && (!ps->system_sleep || ps->macos_lower) &&
+	/*
+	 * The evidence for the pulse is T8140's (macos_lower), where the settle
+	 * poll above runs first: elsewhere (t6020) a power-off that reads BUSY at
+	 * actual 0 is left as it is (rv-usb4, batch 3).
+	 */
+	if (!ret && ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
+	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) &&
 	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked) {
 		/* macOS never needs this: say so when it does. */
 		if (ps->macos_lower)

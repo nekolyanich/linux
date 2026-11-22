@@ -25,6 +25,8 @@
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
+#include <linux/soc/apple/boot-crumb.h>
+#include <asm/virt.h>
 
 /* SPMI Controller Registers */
 #define SPMI_STATUS_REG 0
@@ -432,6 +434,89 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	return 0;
 }
 
+/*
+ * Native bring-up crumbs (include/linux/soc/apple/boot-crumb.h): the PMU's boot_stage written through
+ * this controller, independent of the sleep driver. Native EL2 only, behind boot_crumb.
+ */
+#define APPLE_PMU_BOOT_STAGE	0x6001
+
+static bool boot_crumb;
+module_param(boot_crumb, bool, 0444);
+MODULE_PARM_DESC(boot_crumb, "native bring-up: PMU boot_stage crumbs 0x34 (this probe), 0x33 (sleep-seq probe), 0x35 (late_initcall)");
+
+static struct spmi_controller *crumb_ctrl;
+static u8 crumb_sid;
+
+int apple_spmi_boot_crumb(u8 stage)
+{
+	int ret;
+
+	if (!boot_crumb || !is_kernel_in_hyp_mode())
+		return 0;
+	if (!crumb_ctrl)
+		return -ENODEV;
+
+	ret = crumb_ctrl->write_cmd(crumb_ctrl, SPMI_CMD_EXT_WRITEL, crumb_sid,
+				    APPLE_PMU_BOOT_STAGE, &stage, 1);
+	pr_info("apple-spmi: boot crumb: PMU boot_stage <- %#x: %d\n", stage, ret);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_spmi_boot_crumb);
+
+/* Write-only, the test-initrd's witness: 0x31..0x3f only */
+static int apple_spmi_pmu_stage_set(const char *val, const struct kernel_param *kp)
+{
+	u8 stage;
+	int ret;
+
+	ret = kstrtou8(val, 0, &stage);
+	if (ret)
+		return ret;
+	if (stage < 0x31 || stage > 0x3f)
+		return -EINVAL;
+	if (!crumb_ctrl)
+		return -ENODEV;
+	ret = crumb_ctrl->write_cmd(crumb_ctrl, SPMI_CMD_EXT_WRITEL, crumb_sid,
+				    APPLE_PMU_BOOT_STAGE, &stage, 1);
+	pr_info("apple-spmi: pmu_stage: PMU boot_stage <- %#x: %d\n", stage, ret);
+
+	return ret;
+}
+
+static const struct kernel_param_ops apple_spmi_pmu_stage_ops = {
+	.set = apple_spmi_pmu_stage_set,
+};
+module_param_cb(pmu_stage, &apple_spmi_pmu_stage_ops, NULL, 0200);
+MODULE_PARM_DESC(pmu_stage, "bench: write 0x31..0x3f to the PMU boot_stage (native T2/T4 witness)");
+
+/* The PMU's slave id: the child that is the boot_stage's nvmem */
+static void apple_spmi_crumb_find(struct spmi_controller *ctrl, struct device_node *np)
+{
+	struct device_node *child;
+	u32 sid;
+
+	for_each_available_child_of_node(np, child) {
+		if (of_device_is_compatible(child, "apple,spmi-nvmem") &&
+		    !of_property_read_u32(child, "reg", &sid)) {
+			crumb_sid = sid;
+			crumb_ctrl = ctrl;
+			of_node_put(child);
+			return;
+		}
+	}
+}
+
+#ifndef MODULE
+static int __init apple_spmi_crumb_late(void)
+{
+	apple_spmi_boot_crumb(0x35);
+	return 0;
+}
+late_initcall(apple_spmi_crumb_late);
+#endif
+
+
 static int apple_spmi_probe(struct platform_device *pdev)
 {
 	struct apple_spmi *spmi;
@@ -470,6 +555,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "spmi_controller_add failed\n");
+
+	apple_spmi_crumb_find(ctrl, pdev->dev.of_node);
+	apple_spmi_boot_crumb(0x34);
 
 	return 0;
 }

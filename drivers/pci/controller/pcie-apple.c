@@ -30,12 +30,25 @@
 #include <linux/msi.h>
 #include <linux/of_irq.h>
 #include <linux/pci-ecam.h>
+#include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/pm_domain.h>
+#include <linux/suspend.h>
 
 #include "pci-host-common.h"
 
 static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
+
+/*
+ * System sleep (native5 = aurora + Tanabota, by function). Asahi's driver has
+ * no PM of its own, and a daily boot keeps it that way: every path below is
+ * behind a switch that is read-only after boot and off by default.
+ */
+static bool s2idle_hold_domains;
+module_param(s2idle_hold_domains, bool, 0444);
+MODULE_PARM_DESC(s2idle_hold_domains, "Hold the host's power domains on through suspend-to-idle (aurora's internal-link hold)");
 
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
@@ -184,10 +197,20 @@ static const struct hw_info t602x_hw = {
 	.max_rid2sid		= 512,
 };
 
+struct apple_pcie_pd {
+	struct device		*dev;
+	struct notifier_block	nb;
+	unsigned int		vetoed;
+};
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
 	void __iomem            *base;
+	struct pci_config_window *cfg;
+	struct apple_pcie_pd	*pds;
+	unsigned int		num_pds;
+	unsigned int		pd_held;
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
@@ -198,6 +221,7 @@ struct apple_pcie {
 
 struct apple_pcie_port {
 	raw_spinlock_t		lock;
+	raw_spinlock_t		irq_lock;
 	struct apple_pcie	*pcie;
 	struct device_node	*np;
 	void __iomem		*base;
@@ -205,7 +229,11 @@ struct apple_pcie_port {
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
+	u32			*saved_rid2sid;
+	u32			saved_intmask;
 	int			sid_map_sz;
+	unsigned int		irq;
+	bool			irq_disabled;
 	int			idx;
 };
 
@@ -392,11 +420,17 @@ static void apple_port_irq_handler(struct irq_desc *desc)
 
 	chained_irq_enter(chip, desc);
 
+	raw_spin_lock(&port->irq_lock);
+	if (port->irq_disabled)
+		goto out;
+
 	stat = readl_relaxed(port->base + PORT_INTSTAT);
 
 	for_each_set_bit(i, &stat, 32)
 		generic_handle_domain_irq(port->domain, i);
 
+out:
+	raw_spin_unlock(&port->irq_lock);
 	chained_irq_exit(chip, desc);
 }
 
@@ -412,6 +446,7 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 				   port->idx);
 	if (!irq)
 		return -ENXIO;
+	port->irq = irq;
 
 	port->domain = irq_domain_create_linear(fwnode, 32,
 						&apple_port_irq_domain_ops,
@@ -661,6 +696,12 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (!port->sid_map)
 		return -ENOMEM;
 
+	/* What a sleep that takes the port down puts back at resume. */
+	port->saved_rid2sid = devm_kcalloc(pcie->dev, pcie->hw->max_rid2sid,
+					   sizeof(*port->saved_rid2sid), GFP_KERNEL);
+	if (!port->saved_rid2sid)
+		return -ENOMEM;
+
 	ret = of_property_read_u32_index(np, "reg", 0, &idx);
 	if (ret)
 		return ret;
@@ -671,6 +712,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	port->np = np;
 
 	raw_spin_lock_init(&port->lock);
+	raw_spin_lock_init(&port->irq_lock);
 
 	snprintf(name, sizeof(name), "port%d", port->idx);
 	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
@@ -904,6 +946,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 	pcie = apple_pcie_lookup(dev);
 	if (WARN_ON(!pcie))
 		return -ENOENT;
+	pcie->cfg = cfg;
 
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
 		ret = apple_pcie_setup_port(pcie, of_port);
@@ -951,6 +994,49 @@ static int apple_pcie_probe_port(struct device_node *np)
 	return 0;
 }
 
+/*
+ * The host's power domains, for the suspend-to-idle hold (aurora): a single
+ * domain is already attached by the platform bus; more are attached here.
+ * Only with s2idle_hold_domains, so a daily boot attaches nothing new.
+ */
+static int apple_pcie_attach_domains(struct apple_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	struct dev_pm_domain_attach_data data = {
+		.pd_flags = PD_FLAG_DEV_LINK_ON,
+	};
+	struct dev_pm_domain_list *list = NULL;
+	int count, ret, i;
+
+	if (!IS_ENABLED(CONFIG_PM) || !s2idle_hold_domains)
+		return 0;
+	if (!of_property_present(dev->of_node, "power-domains"))
+		return 0;
+
+	count = of_count_phandle_with_args(dev->of_node, "power-domains",
+					   "#power-domain-cells");
+	if (count < 0)
+		return count;
+	if (count > 1) {
+		ret = devm_pm_domain_attach_list(dev, &data, &list);
+		if (ret < 0)
+			return ret;
+		if (ret != count)
+			return -ENODEV;
+	} else if (!dev->pm_domain) {
+		return 0;
+	}
+
+	pcie->pds = devm_kcalloc(dev, count, sizeof(*pcie->pds), GFP_KERNEL);
+	if (!pcie->pds)
+		return -ENOMEM;
+	pcie->num_pds = count;
+	for (i = 0; i < count; i++)
+		pcie->pds[i].dev = list ? list->pd_devs[i] : dev;
+
+	return 0;
+}
+
 static int apple_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -988,8 +1074,99 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = apple_pcie_attach_domains(pcie);
+	if (ret)
+		return dev_err_probe(dev, ret, "power domains not attached\n");
+
 	return pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
 }
+
+/*
+ * genpd powers a domain off for system sleep once every device in it is
+ * through its noirq suspend. A host that keeps its links refuses that for the
+ * sleep: the domain stays on, and its parents with it. IRQ-safe domains call
+ * this in atomic context, so it only counts.
+ */
+static int apple_pcie_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_pcie_pd *pd = container_of(nb, struct apple_pcie_pd, nb);
+
+	if (action != GENPD_NOTIFY_PRE_OFF)
+		return NOTIFY_OK;
+	pd->vetoed++;
+	return notifier_from_errno(-EBUSY);
+}
+
+static void apple_pcie_release_domains(struct apple_pcie *pcie)
+{
+	unsigned int vetoed = 0;
+	struct apple_pcie_pd *pd;
+
+	if (!pcie->pd_held)
+		return;
+	while (pcie->pd_held) {
+		pd = &pcie->pds[--pcie->pd_held];
+		dev_pm_genpd_remove_notifier(pd->dev);
+		vetoed += pd->vetoed;
+	}
+	dev_dbg(pcie->dev, "PCIe power domains released after suspend-to-idle (%u power-offs refused)\n",
+		vetoed);
+}
+
+/*
+ * Hold every attached domain through a suspend-to-idle (aurora): internal
+ * links are left running, and a domain cut under them loses the endpoints'
+ * state with nothing here to retrain them. A domain already off has no link
+ * to keep.
+ */
+static int apple_pcie_hold_domains(struct apple_pcie *pcie)
+{
+	struct apple_pcie_pd *pd;
+	int ret;
+
+	if (!pcie->num_pds)
+		return -ENODEV;
+	while (pcie->pd_held < pcie->num_pds) {
+		pd = &pcie->pds[pcie->pd_held];
+		pd->vetoed = 0;
+		pd->nb.notifier_call = apple_pcie_pd_notify;
+		ret = dev_pm_genpd_add_notifier(pd->dev, &pd->nb);
+		if (ret)
+			goto err_release;
+		pcie->pd_held++;
+		if (!dev_pm_genpd_is_on(pd->dev)) {
+			ret = -ENODEV;
+			goto err_release;
+		}
+	}
+	return 0;
+
+err_release:
+	apple_pcie_release_domains(pcie);
+	return ret;
+}
+
+static int apple_pcie_suspend_noirq(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (s2idle_hold_domains && pm_suspend_no_platform() && pcie->num_pds)
+		return apple_pcie_hold_domains(pcie);
+	return 0;
+}
+
+static int apple_pcie_resume_noirq(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	/* The domain's hold for the sleep ends first, whatever follows. */
+	apple_pcie_release_domains(pcie);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_pcie_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pcie_suspend_noirq, apple_pcie_resume_noirq)
+};
 
 static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
@@ -1004,6 +1181,7 @@ static struct platform_driver apple_pcie_driver = {
 		.name			= "pcie-apple",
 		.of_match_table		= apple_pcie_of_match,
 		.suppress_bind_attrs	= true,
+		.pm			= pm_sleep_ptr(&apple_pcie_pm_ops),
 	},
 };
 module_platform_driver(apple_pcie_driver);

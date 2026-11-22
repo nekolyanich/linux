@@ -207,7 +207,9 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 			APPLE_MBOX_MSG1_MSG,
 			readq_relaxed(mbox->regs + mbox->hw->i2a_recv1));
 
-		mbox->rx(mbox, msg, mbox->cookie);
+		/* Detached by a sleep stop (rtkit): the message is dropped, as aurora's */
+		if (mbox->rx)
+			mbox->rx(mbox, msg, mbox->cookie);
 		ret++;
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 	}

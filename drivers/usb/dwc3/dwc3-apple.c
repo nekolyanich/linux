@@ -11,6 +11,7 @@
 #include <linux/of.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/suspend.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 
@@ -99,6 +100,12 @@ struct dwc3_apple {
 	struct mutex lock;
 
 	enum dwc3_apple_state state;
+
+	/* sleep_stop: the controller stopped for a suspend to RAM, and what it was doing */
+	struct notifier_block pm_nb;
+	enum dwc3_apple_state sleep_state;
+	bool sleep_stopped;
+	bool sleep_wakeup;
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -425,6 +432,71 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
 	}
 }
 
+/*
+ * Suspend to RAM (aurora's dwc3-apple sleep, the path for a controller without a fixed hub, by
+ * function): the SoC's power cut resets the core and its PHY, and the PHY's resume_early sets
+ * the PHY up again with the controller in reset (phy-apple-atc s2r_assume_cut). So stop the
+ * controller before the sleep, while everything is powered, as an unplug does, and start it in
+ * the role it had once the system is back: the role switch skips a set to the current role, so
+ * nothing else would deassert its reset. Devices enumerate again after the wake. Runs before
+ * the freezer, so it goes by the state "mem" means now; PM_POST_SUSPEND follows an abandoned
+ * sleep as well. Off by default: a daily sleep keeps a connected controller out of system
+ * sleep (syscore), as before.
+ */
+static bool sleep_stop;
+module_param(sleep_stop, bool, 0444);
+MODULE_PARM_DESC(sleep_stop, "Stop the controller for a suspend to RAM and start it again after (with phy-apple-atc s2r_assume_cut)");
+
+static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct dwc3_apple *appledwc = container_of(nb, struct dwc3_apple, pm_nb);
+	struct device *dev = appledwc->dev;
+	int ret;
+
+	guard(mutex)(&appledwc->lock);
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		if (pm_suspend_default_s2idle())
+			break;
+		appledwc->sleep_state = appledwc->state;
+		if (appledwc->state != DWC3_APPLE_HOST && appledwc->state != DWC3_APPLE_DEVICE)
+			break;
+		ret = dwc3_apple_exit(appledwc);
+		if (ret) {
+			dev_err(dev, "refusing the sleep: the controller didn't stop: %d\n", ret);
+			return notifier_from_errno(ret);
+		}
+		/* A wakeup path would keep the domain on, and it's going away. */
+		appledwc->sleep_wakeup = device_may_wakeup(dev);
+		device_set_wakeup_enable(dev, false);
+		appledwc->sleep_stopped = true;
+		break;
+	case PM_POST_SUSPEND:
+		if (!appledwc->sleep_stopped)
+			break;
+		appledwc->sleep_stopped = false;
+		device_set_wakeup_enable(dev, appledwc->sleep_wakeup);
+		/* A role change during the sleep went through the role switch already. */
+		if (appledwc->state != DWC3_APPLE_NO_CABLE)
+			break;
+		ret = dwc3_apple_init(appledwc, appledwc->sleep_state);
+		if (ret)
+			dev_err(dev, "Failed to start after sleep, err=%d\n", ret);
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static void dwc3_apple_pm_notifier_remove(void *data)
+{
+	struct dwc3_apple *appledwc = data;
+
+	unregister_pm_notifier(&appledwc->pm_nb);
+}
+
 static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 {
 	struct usb_role_switch_desc dwc3_role_switch = { NULL };
@@ -483,6 +555,17 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+
+	if (sleep_stop) {
+		appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;
+		ret = register_pm_notifier(&appledwc->pm_nb);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to register the sleep notifier\n");
+		ret = devm_add_action_or_reset(dev, dwc3_apple_pm_notifier_remove, appledwc);
+		if (ret)
+			return ret;
+	}
+
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
@@ -494,6 +577,10 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 {
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+
+	/* No sleep restarts a core being removed (the devm action's second unregister is a no-op) */
+	if (sleep_stop)
+		unregister_pm_notifier(&appledwc->pm_nb);
 
 	guard(mutex)(&appledwc->lock);
 

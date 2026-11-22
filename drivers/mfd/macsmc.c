@@ -7,6 +7,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
@@ -56,6 +57,13 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
+static bool apple_smc_reply_arrived(struct apple_smc *smc)
+{
+	apple_rtkit_poll(smc->rtk);
+
+	return completion_done(&smc->cmd_done);
+}
+
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 				  u64 size, u64 wsize, u32 *ret_data)
 {
@@ -71,7 +79,7 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return -EIO;
 	/* Told the AP is idle: it answers nothing until told it's on again */
 	if (smc->ap_notified)
-		return -EIO;
+		return -EAGAIN;
 
 	reinit_completion(&smc->cmd_done);
 
@@ -89,20 +97,17 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 	}
 
 	if (smc->polled) {
-		/* The noirq phase: no interrupt completes it, poll the mailbox */
-		unsigned int us;
+		/* The noirq phase: no interrupt completes it, poll the mailbox (native5) */
+		bool done;
 
-		for (us = 0; us < SMC_TIMEOUT_MS * USEC_PER_MSEC; us += 10) {
-			if (try_wait_for_completion(&smc->cmd_done))
-				break;
-			apple_rtkit_poll(smc->rtk);
-			udelay(10);
-		}
-		if (us >= SMC_TIMEOUT_MS * USEC_PER_MSEC && !try_wait_for_completion(&smc->cmd_done)) {
-			dev_err(smc->dev, "Command timed out, polled (%llx)", msg);
-			return -ETIMEDOUT;
-		}
-	} else if (wait_for_completion_timeout(&smc->cmd_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) <= 0) {
+		ret = read_poll_timeout(apple_smc_reply_arrived, done, done, 100,
+					SMC_TIMEOUT_MS * USEC_PER_MSEC, false, smc);
+	} else {
+		ret = wait_for_completion_timeout(&smc->cmd_done,
+						  msecs_to_jiffies(SMC_TIMEOUT_MS)) > 0 ?
+		      0 : -ETIMEDOUT;
+	}
+	if (ret) {
 		dev_err(smc->dev, "Command timed out (%llx)", msg);
 		return -ETIMEDOUT;
 	}

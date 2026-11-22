@@ -18,6 +18,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 
 #include "dmaengine.h"
 #include "virt-dma.h"
@@ -127,6 +129,8 @@ struct sio_data {
 		void *cookie[SIO_NTAGS];
 	} tags;
 
+	/* Its firmware idled and its CPU stopped for a sleep (native5, by function from aurora) */
+	bool asleep;
 	int nchannels;
 	struct sio_chan channels[];
 };
@@ -924,7 +928,121 @@ static __maybe_unused int sio_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(sio_pm_ops, sio_suspend, sio_resume, NULL);
+static bool sio_chan_busy(struct sio_chan *siochan)
+{
+	unsigned long flags;
+	bool busy;
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	busy = siochan->current_tx;
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	return busy;
+}
+
+/*
+ * The t6020 bench's sleep doesn't set suspend_via_firmware, so SIO's firmware ran into the
+ * commit. macOS gives it AP/IOP 0x201 and leaves its CPU powered (SIO_CPU on at its edge).
+ */
+static unsigned int bench_sleep;
+module_param(bench_sleep, uint, 0444);
+MODULE_PARM_DESC(bench_sleep, "bench: at suspend_late without suspend_via_firmware, 1 idle the firmware (0x201), 2 idle and stop it");
+
+/*
+ * A system sleep (native5, by function from aurora's apple-sio): with
+ * suspend_via_firmware, or the bench switch, the firmware is idled and its
+ * CPU stopped at suspend_late, keeping its session; it is restarted warm at
+ * resume_early. An s2idle suspend does nothing, as before.
+ */
+static __maybe_unused int sio_suspend_late(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int i, ret;
+
+	if (sio->asleep)
+		return 0;
+	if (!pm_suspend_via_firmware() && !bench_sleep)
+		return 0;
+
+	for (i = 0; i < sio->nchannels; i++) {
+		if (sio_chan_busy(&sio->channels[i])) {
+			dev_err(dev, "channel %d is busy, refusing the sleep\n", i);
+			return -EBUSY;
+		}
+	}
+
+	if (!pm_suspend_via_firmware()) {
+		if (bench_sleep == 1)
+			ret = apple_rtkit_idle(sio->rtk);
+		else
+			ret = apple_rtkit_sleep_stop(sio->rtk, sio->base + REG_CPU_CONTROL);
+		dev_info(dev, "bench sleep %u: %d\n", bench_sleep, ret);
+		if (ret)
+			return ret;
+		sio->asleep = true;
+		return 0;
+	}
+
+	ret = apple_rtkit_sleep_stop(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (ret) {
+		dev_err(dev, "firmware did not stop for sleep: %d\n", ret);
+		if (apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL))
+			dev_err(dev, "firmware did not come back\n");
+		return ret;
+	}
+	sio->asleep = true;
+
+	return 0;
+}
+
+static __maybe_unused int sio_resume_early(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int ret;
+
+	if (!sio->asleep)
+		return 0;
+	/*
+	 * A refused sleep: an idled firmware doesn't wake with its power kept, and SIO_CPU shares
+	 * SIO's switch, so it can't be power-cycled alone. The sleep engine's own PMGR reset of it
+	 * restarts it; if that fails it stays stopped until the next real sleep.
+	 */
+	if (!pm_resume_via_firmware()) {
+		if (!apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL)) {
+			sio->asleep = false;
+			return 0;
+		}
+		ret = apple_sleep_engine_reset(dev);
+		if (!ret)
+			ret = apple_rtkit_power_cycled_return(sio->rtk,
+							      sio->base + REG_CPU_CONTROL);
+		if (ret) {
+			dev_warn(dev, "sleep refused: firmware not back after a reset (%d), stopped until a real sleep\n",
+				 ret);
+			return 0;
+		}
+		sio->asleep = false;
+		dev_info(dev, "sleep refused: firmware back after a reset\n");
+		return 0;
+	}
+	/* Endpoints and parameters stay with the firmware: nothing is sent again. */
+	ret = apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (ret) {
+		/* Still down: the next sleep restarts it, or resets it if refused. */
+		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
+		return 0;
+	}
+	sio->asleep = false;
+	dev_dbg(dev, "firmware back from sleep\n");
+
+	return 0;
+}
+
+static const struct dev_pm_ops sio_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(sio_suspend_late, sio_resume_early)
+	RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)
+};
 
 static struct platform_driver apple_sio_driver = {
 	.driver = {

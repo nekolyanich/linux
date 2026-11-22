@@ -29,6 +29,9 @@ struct apple_rtkit {
 
 	struct apple_mbox *mbox;
 
+	/* Each handshake step's wait, apple_rtkit_set_handshake_timeout() */
+	unsigned int handshake_timeout_ms;
+
 	struct completion epmap_completion;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;

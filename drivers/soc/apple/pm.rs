@@ -27,6 +27,101 @@ extern "C" {
     fn sep_pm_register(event: unsafe extern "C" fn(bool) -> c_int) -> c_int;
     fn sep_pm_unregister();
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
+    fn sep_pm_register_sleep(
+        dev: *mut c_void,
+        sleep: unsafe extern "C" fn() -> c_int,
+        wake: unsafe extern "C" fn(bool),
+        told: unsafe extern "C" fn() -> bool,
+    ) -> c_int;
+    fn sep_pm_unregister_sleep(dev: *mut c_void);
+    fn sep_pm_clear_dev_disable(dev: *mut c_void) -> c_int;
+    fn sep_pm_dart_restore(dev: *mut c_void);
+    fn sep_pm_dart_hold(dev: *mut c_void, hold: bool) -> c_int;
+    pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
+}
+
+/// Who may use the mailbox around the bench's early SLEEP (native5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SleepGate {
+    /// Anyone.
+    Open = 0,
+    /// Replies to what the enclave asked, and the sleep request itself.
+    Draining = 1,
+    /// Nobody until the wake: the enclave is gated or about to be.
+    Told = 2,
+    /// Nobody: a SLEEP or its wake failed. Stays so until a reboot.
+    Lost = 3,
+}
+
+impl SleepGate {
+    pub(crate) fn from_u32(v: u32) -> SleepGate {
+        match v {
+            0 => SleepGate::Open,
+            1 => SleepGate::Draining,
+            2 => SleepGate::Told,
+            _ => SleepGate::Lost,
+        }
+    }
+}
+
+/// Puts the enclave's DART back if it lost its state, before the doorbell.
+pub(crate) fn dart_restore(dev: &kernel::device::Device) {
+    // SAFETY: `dev` is the bound SEP device.
+    unsafe { sep_pm_dart_restore(dev.as_raw().cast()) };
+}
+
+/// The early SLEEP's DART: saved and left alone before the send (`hold`), or given back
+/// unchanged when the request did not go out. [`dart_restore`] undoes a hold at the wake.
+pub(crate) fn dart_hold(dev: &kernel::device::Device, hold: bool) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_dart_hold(dev.as_raw().cast(), hold) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+/// Lets a gated enclave start again. Writes only if the bit is set.
+pub(crate) fn clear_dev_disable(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_clear_dev_disable(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+/// Runs `f` on the registered instance. Only for callbacks that the bound device excludes.
+fn with_sep<R>(none: R, f: impl FnOnce(&SepData) -> R) -> R {
+    let ptr = SEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return none;
+    }
+    // SAFETY: as in `pm_event`: the device callbacks run only while bound, and
+    // `unregister` clears them before reclaiming the `Arc`.
+    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    f(&*sep)
+}
+
+/// # Safety
+/// Called by `pm_shim.c` from the device's suspend callback, with the early SLEEP on.
+unsafe extern "C" fn pm_sleep() -> c_int {
+    with_sep(0, |sep| match sep.sleep_enter_early() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    })
+}
+
+/// # Safety
+/// Called by `pm_shim.c` from the device's resume callback.
+unsafe extern "C" fn pm_wake(real: bool) {
+    with_sep((), |sep| sep.sleep_exit(real));
+}
+
+/// # Safety
+/// Called by `pm_shim.c`, whether or not the device suspended.
+unsafe extern "C" fn pm_told() -> bool {
+    with_sep(false, |sep| sep.sleep_gate() == SleepGate::Told)
 }
 
 /// Attaches every power domain of a multi-domain SEP node and keeps them on
@@ -117,6 +212,7 @@ unsafe extern "C" fn pm_event(entering: bool) -> c_int {
 }
 
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
+    let dev: *mut c_void = sep.dev.as_raw().cast();
     let ptr = sep.into_foreign();
 
     if SEP
@@ -144,6 +240,9 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
         }
         return Err(Error::from_errno(rc));
     }
+    // SAFETY: `dev` is the bound SEP device, unregistered in `unregister` before the
+    // `Arc` is reclaimed.
+    unsafe { sep_pm_register_sleep(dev, pm_sleep, pm_wake, pm_told) };
     Ok(())
 }
 
@@ -157,6 +256,12 @@ pub(crate) fn unregister() {
     unsafe { sep_pm_unregister() };
 
     let ptr = SEP.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if !ptr.is_null() {
+        // SAFETY: `ptr` is live until reclaimed below; only its device pointer is read.
+        let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+        // SAFETY: matched with `sep_pm_register_sleep` in `register`.
+        unsafe { sep_pm_unregister_sleep(sep.dev.as_raw().cast()) };
+    }
     if !ptr.is_null() {
         // SAFETY: `ptr` came from `into_foreign` in `register`, and the
         // notifier can no longer call `pm_event`.

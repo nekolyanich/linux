@@ -135,6 +135,43 @@ pub(crate) fn op_nop(param: u8) -> ControlOp {
     }
 }
 
+/*
+ * The enclave's SLEEP (native5, from aurora's and macOS's traces): asked to save its state
+ * and gate its own power domain, under a tag of its own; started again after the wake by a
+ * doorbell, and up once it has sent its two unasked control messages.
+ */
+
+/// The tag of the sleep request, kept out of the pool.
+pub(crate) const TAG_SLEEP: u8 = 0x08;
+
+static_assert!(TAG_SLEEP >= TAG_POOL_FIRST && TAG_SLEEP <= TAG_POOL_LAST);
+
+/// How long the enclave gets to answer the sleep request.
+pub(crate) const SLEEP_TIMEOUT_MS: u32 = 5000;
+
+/// The first message macOS sends a gated enclave after a sleep. The contents
+/// vary from sleep to sleep, so it is taken to be a doorbell. This is one of them.
+pub(crate) const WAKE_KICK: Message = Message {
+    msg0: 0xffff_ffff_a482_9303,
+    msg1: 0,
+};
+
+/// The control messages a woken enclave sends without being asked, in order.
+pub(crate) const WAKE_TYPES: [u8; 2] = [0x0d, 0x10];
+
+/// Asks the enclave to save its state and gate its own power domain (0x0000_0000_020c_0800).
+pub(crate) fn op_sleep() -> ControlOp {
+    ControlOp {
+        ty: 0x0c,
+        param: 0x02,
+        data: 0,
+        expect_reply: true,
+        timeout_ms: SLEEP_TIMEOUT_MS,
+        reserved_tag: false,
+        name: c"SLEEP",
+    }
+}
+
 pub(crate) fn op_security_mode() -> ControlOp {
     ControlOp {
         ty: 0x14,
@@ -251,6 +288,8 @@ impl<'a> FieldCursor<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct ControlReply {
     pub(crate) tag: u8,
+    /// Byte 3: a sleep request's result (0 = taken)
+    pub(crate) param: u8,
     pub(crate) data_lo: u32,
 }
 
@@ -259,6 +298,7 @@ impl ControlReply {
         let f = decode(msg);
         ControlReply {
             tag: f.tag,
+            param: f.param,
             data_lo: f.data_lo,
         }
     }

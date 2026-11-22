@@ -28,6 +28,13 @@ void sep_cancel_delayed_work_sync(void *work);
 int sep_pm_register(int (*event)(bool entering));
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
+/* The bench's early SLEEP (apple_sleep.sep_sleep_early): its callbacks, and its pieces */
+extern const struct dev_pm_ops sep_pm_ops;
+int sep_pm_register_sleep(void *dev, int (*sleep)(void), void (*wake)(bool real), bool (*told)(void));
+void sep_pm_unregister_sleep(void *dev);
+int sep_pm_clear_dev_disable(void *dev);
+void sep_pm_dart_restore(void *dev);
+int sep_pm_dart_hold(void *dev, bool hold);
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 

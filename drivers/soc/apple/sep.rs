@@ -774,6 +774,12 @@ struct SepData {
     sends_held: Atomic<bool>,
     sends_refused: Atomic<u32>,
 
+    // A `pm::SleepGate`: who may use the mailbox around the bench's early SLEEP.
+    // Changed under the mailbox lock.
+    sleep_gate: Atomic<u32>,
+    // The receive interrupt is held for the SLEEP (`Mailbox::hold_rx`).
+    sleep_rx_held: Atomic<bool>,
+
     // The sensor is up, registered and idle from a verify: the next verify
     // takes its image without bringing it up again (macOS registers it once
     // per boot). Cleared when it is powered down: before sleep, after an
@@ -988,6 +994,8 @@ impl SepData {
                 captures_running: Atomic::new(0),
                 sends_held: Atomic::new(false),
                 sends_refused: Atomic::new(0),
+                sleep_gate: Atomic::new(pm::SleepGate::Open as u32),
+                sleep_rx_held: Atomic::new(false),
                 sensor_online: Atomic::new(false),
                 worker_gone <- new_condvar!("SepData::worker_gone"),
                 rx_work <- new_work!("SepData::rx_work"),
@@ -1188,6 +1196,12 @@ impl SepData {
         }
         let mbox = self.mbox.lock();
         let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        // Told a SLEEP, or lost after one: nothing reaches the enclave until it is back.
+        match self.sleep_gate() {
+            pm::SleepGate::Told => return Err(EAGAIN),
+            pm::SleepGate::Lost => return Err(EIO),
+            _ => {}
+        }
         if self.sends_held.load(Relaxed) {
             // The first one of each sleep is named, so a reply the enclave
             // asked for in the window can be told from a request of ours.
@@ -1207,6 +1221,199 @@ impl SepData {
             return Err(EAGAIN);
         }
         Self::ring(mbox, msg)
+    }
+
+    pub(crate) fn sleep_gate(&self) -> pm::SleepGate {
+        pm::SleepGate::from_u32(self.sleep_gate.load(Relaxed))
+    }
+
+    /// Under the mailbox lock, so that a sender holding it finishes first.
+    fn set_sleep_gate(&self, gate: pm::SleepGate) {
+        let _mbox = self.mbox.lock();
+        self.sleep_gate.store(gate as u32, Relaxed);
+    }
+
+    /// The bench's early SLEEP (`apple_sleep.sep_sleep_early`; native5, as aurora #1664 on
+    /// T6041 and JJRPF's R18 on T6020 send it): at device suspend, in process context,
+    /// interrupts on and the SEP's DART live; its answer waited for; then the receive IRQ
+    /// held and the outbox's receive enable cleared. The domain's gating is waited for in
+    /// suspend_noirq (pm_shim). After a sent SLEEP nothing touches the mailbox again until
+    /// a real wake. Only this message: no keybag, xART or Touch ID state is touched.
+    pub(crate) fn sleep_enter_early(&self) -> Result<()> {
+        match self.sleep_gate() {
+            pm::SleepGate::Lost => return Err(EIO),
+            pm::SleepGate::Open => {}
+            _ => return Err(EBUSY),
+        }
+        if self.phase.load(Relaxed) != PHASE_READY {
+            dev_warn!(self.dev, "early sleep refused: the enclave did not finish coming up\n");
+            return Err(EBUSY);
+        }
+
+        self.set_sleep_gate(pm::SleepGate::Draining);
+        let idle = control::wait_idle(
+            proto::CONTROL_TIMEOUT_MS,
+            10,
+            || self.control.lock().requests_in_flight(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_err!(self.dev, "early sleep refused: a request is still waiting for its reply\n");
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(EBUSY);
+        }
+
+        let op = proto::op_sleep();
+        let tag = proto::TAG_SLEEP;
+        let idx = match self.control.lock().alloc_sleep() {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_sleep_gate(pm::SleepGate::Open);
+                return Err(e);
+            }
+        };
+        // The DART goes down with the enclave's domain: saved now and not touched again
+        // until the wake, as macOS's AppleSEPManager::_sleepSEPAsync sets the SEP's mapper
+        // inactive before cmsgSLEEP (Tanabota note 35).
+        if let Err(e) = pm::dart_hold(&self.dev, true) {
+            self.control.lock().abandon(idx);
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(e);
+        }
+        // Past the driver's own sends hold: this one is the sleep's.
+        let sent = match self.mbox.lock().as_ref() {
+            Some(mbox) => Self::ring(mbox, proto::encode_control(&op, tag)),
+            None => Err(ENODEV),
+        };
+        if let Err(e) = sent {
+            self.control.lock().abandon(idx);
+            let _ = pm::dart_hold(&self.dev, false);
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(e);
+        }
+        // From here the request may have been taken: a failure is not reversible.
+        let reply = self.sleep_wait(&op, idx, tag);
+        let taken = matches!(&reply, Some(r) if r.param == 0);
+        self.sleep_hold_rx();
+        if !taken {
+            dev_err!(
+                self.dev,
+                "early sleep: the enclave did not take the SLEEP ({:?}); it stays unused\n",
+                reply.map(|r| r.param)
+            );
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            return Err(EIO);
+        }
+        if let Some(mbox) = self.mbox.lock().as_ref() {
+            // OUTBOX_CTRL (I2A_CONTROL, +0x114) bit 0: nothing more is received from it
+            mbox.set_recv_enabled(false);
+        }
+        self.set_sleep_gate(pm::SleepGate::Told);
+        dev_info!(self.dev, "early sleep: the enclave took the SLEEP\n");
+        Ok(())
+    }
+
+    /// Waits for the sleep request's answer, `None` if none came in time.
+    fn sleep_wait(&self, op: &proto::ControlOp, idx: usize, tag: u8) -> Option<proto::ControlReply> {
+        let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
+        let mut guard = self.control.lock();
+        loop {
+            if let Some(reply) = guard.take_reply(idx) {
+                guard.release(idx);
+                return (reply.tag == tag).then_some(reply);
+            }
+            if remaining == 0 || self.shutting_down.load(Relaxed) {
+                guard.abandon(idx);
+                return None;
+            }
+            match self.control_wq.wait_interruptible_timeout(&mut guard, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Timeout => remaining = 0,
+            }
+        }
+    }
+
+    /// Holds off the receive interrupt, whose handler reads the mailbox.
+    fn sleep_hold_rx(&self) {
+        if !self.sleep_rx_held.xchg(true, Relaxed) {
+            if let Some(mbox) = self.mbox.lock().as_ref() {
+                mbox.hold_rx();
+            }
+        }
+    }
+
+    fn sleep_release_rx(&self) {
+        if self.sleep_rx_held.xchg(false, Relaxed) {
+            if let Some(mbox) = self.mbox.lock().as_ref() {
+                mbox.release_rx();
+            }
+        }
+    }
+
+    /// At the device's resume. Only an enclave that took a SLEEP is started again, and only
+    /// after a real sleep: without one it isn't gated, and stays unused (as native5).
+    pub(crate) fn sleep_exit(&self, real: bool) {
+        let gate = self.sleep_gate();
+        if gate == pm::SleepGate::Draining {
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return;
+        }
+        if gate != pm::SleepGate::Told {
+            return;
+        }
+        if !real {
+            dev_err!(self.dev, "the enclave took a SLEEP without a real sleep; it stays unused until a reboot\n");
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            return;
+        }
+        match self.sleep_kick() {
+            Ok(()) => {
+                self.set_sleep_gate(pm::SleepGate::Open);
+                // One line per sleep it was told of: nothing else says it came back.
+                dev_info!(self.dev, "the enclave is back from its sleep request\n");
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused until a reboot\n",
+                    e
+                );
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Lost);
+            }
+        }
+    }
+
+    /// Starts a gated enclave and waits for the messages that say it's up.
+    fn sleep_kick(&self) -> Result<()> {
+        pm::clear_dev_disable(&self.dev)?;
+        pm::dart_restore(&self.dev);
+        // Arm completion before the held receive IRQ can deliver an early wake.
+        self.control.lock().wake_reset();
+        self.sleep_release_rx();
+        match self.mbox.lock().as_ref() {
+            Some(mbox) => {
+                mbox.set_recv_enabled(true);
+                Self::ring(mbox, proto::WAKE_KICK)?;
+            }
+            None => return Err(ENODEV),
+        }
+        let mut remaining = time::msecs_to_jiffies(proto::CONTROL_TIMEOUT_MS);
+        let mut guard = self.control.lock();
+        loop {
+            if guard.wake_complete() {
+                return Ok(());
+            }
+            if remaining == 0 {
+                return Err(ETIMEDOUT);
+            }
+            match self.control_wq.wait_interruptible_timeout(&mut guard, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Timeout => remaining = 0,
+            }
+        }
     }
 
     /// Going to sleep, after the last message of the driver's own: refuse
@@ -2364,6 +2571,9 @@ impl SepData {
 
     fn on_control(&self, msg: Message, f: proto::Fields) {
         if f.ty != proto::CONTROL_REPLY_TYPE {
+            // A woken enclave's unasked messages (the early SLEEP's kick waits for them)
+            self.control.lock().wake_note(f.ty);
+            self.control_wq.notify_all();
             return;
         }
 
@@ -2649,6 +2859,11 @@ impl platform::Driver for SepDriver {
     type Data<'bound> = SepDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        // SAFETY: a static the shim defines and never changes.
+        Some(unsafe { &*core::ptr::addr_of!(pm::sep_pm_ops) })
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<device::Core<'_>>,

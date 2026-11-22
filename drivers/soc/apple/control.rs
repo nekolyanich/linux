@@ -164,6 +164,8 @@ pub(crate) struct ControlState {
     retired: [u64; 4],
     retired_count: u32,
     entropy: EntropySink,
+    /// The unasked control messages seen since [`Self::wake_reset`], one bit each.
+    wake_seen: u8,
 }
 
 impl ControlState {
@@ -181,6 +183,7 @@ impl ControlState {
                 retry_at: None,
                 retry_ms: ENTROPY_RETRY_MIN_MS,
             },
+            wake_seen: 0,
         }
     }
 
@@ -218,7 +221,7 @@ impl ControlState {
             } else {
                 tag + 1
             };
-            if !self.tag_in_flight(tag) && !self.is_retired(tag) {
+            if tag != proto::TAG_SLEEP && !self.tag_in_flight(tag) && !self.is_retired(tag) {
                 self.slots[idx] = Slot {
                     used: true,
                     tag,
@@ -228,6 +231,45 @@ impl ControlState {
             }
         }
         Err(EBUSY)
+    }
+
+    /// Claims the sleep request's own tag, which the pool never hands out. A
+    /// request still in flight under it means the last one was never answered.
+    pub(crate) fn alloc_sleep(&mut self) -> Result<usize> {
+        let tag = proto::TAG_SLEEP;
+        if self.tag_in_flight(tag) {
+            return Err(EBUSY);
+        }
+        let idx = self.slots.iter().position(|s| !s.used).ok_or(EBUSY)?;
+        self.reclaim_retired(tag);
+        self.slots[idx] = Slot {
+            used: true,
+            tag,
+            reply: None,
+        };
+        Ok(idx)
+    }
+
+    /// Whether any request is waiting for its reply.
+    pub(crate) fn requests_in_flight(&self) -> bool {
+        self.slots.iter().any(|s| s.used)
+    }
+
+    /// Forget the wake messages seen, before asking for them.
+    pub(crate) fn wake_reset(&mut self) {
+        self.wake_seen = 0;
+    }
+
+    /// A control message that isn't a reply: note it if it's a wake message.
+    pub(crate) fn wake_note(&mut self, ty: u8) {
+        if let Some(n) = proto::WAKE_TYPES.iter().position(|&t| t == ty) {
+            self.wake_seen |= 1 << n;
+        }
+    }
+
+    /// All the wake messages have come.
+    pub(crate) fn wake_complete(&self) -> bool {
+        self.wake_seen == (1 << proto::WAKE_TYPES.len()) - 1
     }
 
     pub(crate) fn take_reply(&mut self, idx: usize) -> Option<proto::ControlReply> {
@@ -395,6 +437,7 @@ mod tests {
     fn entropy(value: u32) -> proto::ControlReply {
         proto::ControlReply {
             tag: proto::TAG_ENTROPY,
+            param: 0,
             data_lo: value,
         }
     }

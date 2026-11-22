@@ -26,6 +26,9 @@
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/pinctrl/pinmux.h>
 
+#include <linux/suspend.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/bitmap.h>
 #include "pinctrl-utils.h"
 #include "core.h"
 #include "pinmux.h"
@@ -39,10 +42,25 @@ struct apple_gpio_pinctrl {
 
 	struct pinctrl_desc pinctrl_desc;
 	struct gpio_chip gpio_chip;
+
+	/*
+	 * apple,resume-restore-all (native5 ca3a441f): after a sleep with a power
+	 * cut every pin is put back as the hardware had it, the global word
+	 * first, but those in gpio-reserved-ranges (the ADT's
+	 * no-restore-gpio-pins), as macOS does.
+	 */
+	bool restore_all;
+	unsigned long *no_restore;
+	unsigned long *all_valid;
+	u32 *all_saved;
+	u32 global_saved;
+	bool global_valid;
+
 	u8 irqgrps[];
 };
 
 #define REG_GPIO(x)          (4 * (x))
+#define REG_INPUT_ENABLE     0xc48
 #define REG_GPIOx_DATA       BIT(0)
 #define REG_GPIOx_MODE       GENMASK(3, 1)
 #define REG_GPIOx_OUT        1
@@ -504,6 +522,25 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	pctl->pinctrl_desc.name = dev_name(pctl->dev);
 	pctl->pinctrl_desc.pins = pins;
 	pctl->pinctrl_desc.npins = npins;
+
+	pctl->restore_all = of_property_read_bool(pdev->dev.of_node, "apple,resume-restore-all");
+	if (pctl->restore_all) {
+		int n = of_property_count_u32_elems(pdev->dev.of_node, "gpio-reserved-ranges");
+		u32 start, count;
+
+		pctl->no_restore = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+		pctl->all_valid = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+		pctl->all_saved = devm_kcalloc(&pdev->dev, npins, sizeof(*pctl->all_saved), GFP_KERNEL);
+		if (!pctl->no_restore || !pctl->all_valid || !pctl->all_saved)
+			return -ENOMEM;
+		/* The pins the firmware lists as no-restore, as (first pin, count) pairs */
+		for (i = 0; n > 0 && i + 1 < (unsigned int)n; i += 2)
+			if (!of_property_read_u32_index(pdev->dev.of_node, "gpio-reserved-ranges", i, &start) &&
+			    !of_property_read_u32_index(pdev->dev.of_node, "gpio-reserved-ranges", i + 1,
+							&count) &&
+			    start < npins && count <= npins - start)
+				bitmap_set(pctl->no_restore, start, count);
+	}
 	pctl->pinctrl_desc.pctlops = &apple_gpio_pinctrl_ops;
 	pctl->pinctrl_desc.pmxops = &apple_gpio_pinmux_ops;
 
@@ -539,10 +576,101 @@ static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_gpio_pinctrl_of_match);
 
+/* Bench (note 77 §14.19): the bench's suspend isn't via firmware, its resume is (the hybrid). */
+static bool bench_hybrid;
+module_param(bench_hybrid, bool, 0444);
+
+static bool bench_hybrid_on(void)
+{
+	return bench_hybrid || (apple_sleep_bench_hybrid() & APPLE_SLEEP_HYBRID_PINCTRL);
+}
+
+static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int i;
+
+	pctl->global_valid = false;
+	if (!pctl->restore_all || pm_suspend_target_state != PM_SUSPEND_MEM ||
+	    (!pm_suspend_via_firmware() && !bench_hybrid_on()))
+		return 0;
+
+	pctl->global_saved = readl_relaxed(pctl->base + REG_INPUT_ENABLE);
+	pctl->global_valid = true;
+	bitmap_zero(pctl->all_valid, pctl->pinctrl_desc.npins);
+	for (i = 0; i < pctl->pinctrl_desc.npins; i++) {
+		if (test_bit(i, pctl->no_restore))
+			continue;
+		pctl->all_saved[i] = readl_relaxed(pctl->base + REG_GPIO(i));
+		set_bit(i, pctl->all_valid);
+	}
+	dev_info(dev, "suspend: global word %#x and %u pins saved\n", pctl->global_saved,
+		 bitmap_weight(pctl->all_valid, pctl->pinctrl_desc.npins));
+	return 0;
+}
+
+/*
+ * A pin's whole word written the way macOS writes it (_safeReconfigure): the
+ * configuration first with the input buffer as it is (off after a power loss),
+ * then the input enable in a write of its own, the lock last. A locked pin is
+ * left alone.
+ */
+static void apple_gpio_safe_reconfigure(struct apple_gpio_pinctrl *pctl, unsigned int pin,
+					u32 old, u32 cfg)
+{
+	u32 val = cfg & ~(REG_GPIOx_LOCK | REG_GPIOx_INPUT_ENABLE);
+
+	if (old & REG_GPIOx_LOCK)
+		return;
+	if (!(cfg & REG_GPIOx_INPUT_ENABLE)) {
+		regmap_write(pctl->map, REG_GPIO(pin), old & ~(REG_GPIOx_LOCK | REG_GPIOx_INPUT_ENABLE));
+		regmap_write(pctl->map, REG_GPIO(pin), val);
+	} else {
+		regmap_write(pctl->map, REG_GPIO(pin), (old & REG_GPIOx_INPUT_ENABLE) | val);
+		if (!(old & REG_GPIOx_INPUT_ENABLE))
+			regmap_write(pctl->map, REG_GPIO(pin), cfg & ~REG_GPIOx_LOCK);
+	}
+	if (cfg & REG_GPIOx_LOCK)
+		regmap_write(pctl->map, REG_GPIO(pin), cfg);
+}
+
+static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int i, restored = 0;
+	u32 val;
+
+	if (!pctl->restore_all || !pctl->global_valid || !pm_resume_via_firmware())
+		return 0;
+
+	val = readl_relaxed(pctl->base + REG_INPUT_ENABLE);
+	if (val != pctl->global_saved)
+		writel_relaxed(pctl->global_saved, pctl->base + REG_INPUT_ENABLE);
+	pctl->global_valid = false;
+	for_each_set_bit(i, pctl->all_valid, pctl->pinctrl_desc.npins) {
+		u32 hw = readl_relaxed(pctl->base + REG_GPIO(i));
+
+		if (hw == pctl->all_saved[i])
+			continue;
+		apple_gpio_safe_reconfigure(pctl, i, hw, pctl->all_saved[i]);
+		restored++;
+	}
+	bitmap_zero(pctl->all_valid, pctl->pinctrl_desc.npins);
+	dev_info(dev, "resume: global word %#x, put back to %#x; %u pins put back\n", val,
+		 pctl->global_saved, restored);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_gpio_pinctrl_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_gpio_pinctrl_suspend_noirq,
+				  apple_gpio_pinctrl_resume_noirq)
+};
+
 static struct platform_driver apple_gpio_pinctrl_driver = {
 	.driver = {
 		.name = "apple-gpio-pinctrl",
 		.of_match_table = apple_gpio_pinctrl_of_match,
+		.pm = pm_sleep_ptr(&apple_gpio_pinctrl_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 	.probe = apple_gpio_pinctrl_probe,

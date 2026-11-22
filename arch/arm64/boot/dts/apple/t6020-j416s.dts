@@ -9,12 +9,6 @@
 
 /dts-v1/;
 
-/*
- * Let m1n1 start the PMP, as macOS does at boot: it manages the fabric and
- * DCS power states and takes the AP sleep notice before the commit.
- */
-#define APPLE_USE_PMP
-
 #include "t6020.dtsi"
 #include "t602x-j414-j416.dtsi"
 

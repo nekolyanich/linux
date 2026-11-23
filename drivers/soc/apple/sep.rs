@@ -1403,10 +1403,16 @@ impl SepData {
         if gate != pm::SleepGate::Told {
             return;
         }
-        // A suspend aborted after the SLEEP (rv-sepkey's (b)): it gated itself with its power
-        // kept, and the same kick may start it; Lost only if that fails.
+        // A suspend aborted after the SLEEP (rv-sepkey's (b)): it gated itself, and its domain
+        // and DART aren't back to kick it through (the no-cut kick stalled resume, hvnix-b).
+        // Left as told and held until a reboot, as before b7dac78f.
         if !real {
-            dev_warn!(self.dev, "the enclave took a SLEEP without a real sleep: kicking it anyway\n");
+            dev_warn!(
+                self.dev,
+                "the enclave took a SLEEP but the system didn't sleep: not kicked, unused until a reboot (Touch ID, sep-key, hwrng)\n"
+            );
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            return;
         }
         match self.sleep_kick() {
             Ok(()) => {

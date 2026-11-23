@@ -2329,10 +2329,14 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_sleep_dispext_register);
 
-/* Whether a sleep an external DCP won't let cut is refused (dispext_refuse), for its driver's late check */
+/*
+ * Whether a sleep an external DCP won't let cut is refused (dispext_refuse), for its driver's
+ * late check: only with the S2R entry, as .begin's check; a sleep that doesn't cut (s2r=0) isn't
+ * held up by a dcpext kept on.
+ */
 bool apple_sleep_dispext_refuses(void)
 {
-	return dispext_refuse;
+	return dispext_refuse && aseq_s2r();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_dispext_refuses);
 

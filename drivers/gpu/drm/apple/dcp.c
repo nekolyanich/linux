@@ -2096,14 +2096,15 @@ static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
 	return true;
 }
 
-static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
+/* True if it was stopped and runs again (warm), its endpoints started */
+static bool dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
 	bool real = pm_resume_via_firmware();
 	int ret;
 
 	if (!dcp->dcpext_stopped)
-		return;
+		return false;
 	dcp->dcpext_stopped = false;
 	/* Before the restart, after a cut and after a refused sleep alike */
 	dcp_hdmi_power(dcp, true);
@@ -2133,7 +2134,7 @@ static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 			afk_bench_queue_op(eps[i], 0xa3);
 		dev_info(dcp->dev, "dcpext sleep: back after %s, %u AFK queues started\n",
 			 real ? "the sleep" : "a refused sleep", n);
-		return;
+		return true;
 	}
 	/* RTKit's own cold start, as at the bind: the firmware comes up, even if not all of it */
 	dev_err(dcp->dev, "dcpext sleep: warm restart failed (%d), starting it cold\n", ret);
@@ -2150,6 +2151,7 @@ static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	 */
 	WRITE_ONCE(dcp->crashed, true);
 	dev_crit(dcp->dev, "dcpext sleep: not usable for displays until it is bound again\n");
+	return false;
 }
 
 static int __dcp_platform_suspend(struct device *dev)
@@ -2199,7 +2201,7 @@ static int __dcp_platform_suspend(struct device *dev)
 				av_service_connect(dcp);
 			return -EBUSY;
 		}
-		dev_warn(dev, "dcpext sleep: not stopped, kept on (apple_sleep.dispext_refuse=0)\n");
+		dev_warn(dev, "dcpext sleep: not stopped, kept on (dispext_refuse=0, or no S2R entry)\n");
 	}
 	/*
 	 * Set the device as a wakeup device, which forces its power
@@ -2229,11 +2231,22 @@ static int dcp_platform_suspend(struct device *dev)
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	bool restarted;
 
 	/* First: nothing below may talk to a firmware the sleep's table stopped (bench only) */
 	dcp_bench_boot(dcp);
 	/* Or that its own suspend stopped (an idle external DCP) */
-	dcp_dcpext_sleep_return(dcp);
+	restarted = dcp_dcpext_sleep_return(dcp);
+
+	/*
+	 * Restarted, dcpext0 sees no HPD edge for a sink plugged in during the sleep (its
+	 * converter was off): its level is read as dcp_enable_dp2hdmi_hpd() does, before the irq.
+	 */
+	if (restarted && dcp->hdmi_hpd && !dcp->switch_active &&
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+		dev_info(dev, "dcpext sleep: HDMI sink found at the wake\n");
+		dcp_dptx_connect(dcp, 0);
+	}
 
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);

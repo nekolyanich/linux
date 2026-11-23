@@ -21,6 +21,11 @@
  * (-62). A DCP's .suspend (by apple,dcp-index: 0 disp0, 1 dcpext0, 2 dcpext1): 0x78 + index
  * entered, 0x7b + index left. An ATC PHY's suspend_late (atcN): 0x74 + N entered; left:
  * atc0 0x6e, atc1 0x6f, atc2 0x7e, atc3 0x7f.
+ * The resume side (pm_test=devices, a refused sleep, the wake): a DCP's .resume 0xd0 + index
+ * entered, 0xd3 + index left; a stopped dcpext's return: 0xd6 HDMI converter power on again,
+ * 0xd7 block cycle started (0xdc its DARTs read and held, before PS off; 0xdd its PS words
+ * back on, before the DART restore), 0xd8 cycle done, 0xd9 PMP request back, 0xda RTKit restart
+ * started, 0xdb restart returned (warm; a cold fallback follows it).
  * Not with sleep-seq's hybrid bit 30 alone: its crumb before cpu0's CYC_OVRD write is
  * 0x66 + N (0x66..0x71), which overlaps 0x68-0x71 here.
  */
@@ -34,6 +39,16 @@
 #define DCP_CRUMB_SUSPEND_IN	0x78	/* + apple,dcp-index (0-2) */
 #define DCP_CRUMB_SUSPEND_OUT	0x7b	/* + apple,dcp-index (0-2) */
 #define ATC_CRUMB_SUSPEND_IN	0x74	/* + atc (0-3) */
+#define DCP_CRUMB_RESUME_IN	0xd0	/* + apple,dcp-index (0-2) */
+#define DCP_CRUMB_RESUME_OUT	0xd3	/* + apple,dcp-index (0-2) */
+#define DCP_CRUMB_RET_PWREN	0xd6
+#define DCP_CRUMB_RET_CYCLE	0xd7
+#define DCP_CRUMB_RET_CYCLED	0xd8
+#define DCP_CRUMB_RET_PMP	0xd9
+#define DCP_CRUMB_RET_RTKIT	0xda
+#define DCP_CRUMB_RET_RTKIT_OUT	0xdb
+#define DCP_CRUMB_CYC_HELD	0xdc
+#define DCP_CRUMB_CYC_PS_ON	0xdd
 static inline u8 atc_crumb_suspend_out(unsigned int atc)
 {
 	static const u8 out[4] = { 0x6e, 0x6f, 0x7e, 0x7f };

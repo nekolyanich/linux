@@ -1877,6 +1877,7 @@ static void dcp_bench_disp0_cycle(struct apple_dcp *dcp)
 	}
 	dev_info(dcp->dev, "bench: disp0 cycle: before cpu0 %#x fe %#x sys %#x, darts held %d %d\n",
 		 readl(pc), readl(pf), readl(ps), held[0], held[1]);
+	apple_spmi_boot_crumb(DCP_CRUMB_CYC_HELD);
 
 	writel(0xf0400ff, pc);
 	r[0] = dcp_bench_ps_set(pc, 0xf0403f0, 0);
@@ -1891,6 +1892,7 @@ static void dcp_bench_disp0_cycle(struct apple_dcp *dcp)
 	writel(0xf040000, pc);
 	r[5] = dcp_bench_ps_set(pc, 0xf04000f, 0xf);
 	writel(0x1f04000f, pc);
+	apple_spmi_boot_crumb(DCP_CRUMB_CYC_PS_ON);
 
 	for (i = 0; i < 2; i++)
 		if (darts[i] && !held[i])
@@ -2110,11 +2112,15 @@ static bool dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	dcp->dcpext_stopped = false;
 	/* Before the restart, after a cut and after a refused sleep alike */
 	dcp_hdmi_power(dcp, true);
+	apple_spmi_boot_crumb(DCP_CRUMB_RET_PWREN);
 
 	/* The power cycle macOS gives the block between its boots, and the reset of a refused sleep */
+	apple_spmi_boot_crumb(DCP_CRUMB_RET_CYCLE);
 	dcp_bench_disp0_cycle(dcp);
+	apple_spmi_boot_crumb(DCP_CRUMB_RET_CYCLED);
 	/* After the cycle: its PMP request again */
 	apple_sleep_dispext_down(dcp->dev, false);
+	apple_spmi_boot_crumb(DCP_CRUMB_RET_PMP);
 	if (dcp->bench_call_lost) {
 		dcp->ch_cmd.depth = 0;
 		dcp->ch_oobcmd.depth = 0;
@@ -2126,8 +2132,10 @@ static bool dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	}
 	WRITE_ONCE(dcp->crashed, false);
 	apple_rtkit_set_oslog_echo(dcp->rtk, true);
+	apple_spmi_boot_crumb(DCP_CRUMB_RET_RTKIT);
 	ret = real ? apple_rtkit_sleep_return(dcp->rtk, control) :
 		     apple_rtkit_power_cycled_return(dcp->rtk, control);
+	apple_spmi_boot_crumb(DCP_CRUMB_RET_RTKIT_OUT);
 	if (!ret) {
 		struct apple_dcp_afkep *eps[8];
 		unsigned int n = dcp_bench_afk_eps(dcp, eps, ARRAY_SIZE(eps)), i;
@@ -2230,7 +2238,7 @@ static int dcp_platform_suspend(struct device *dev)
 	return ret;
 }
 
-static int dcp_platform_resume(struct device *dev)
+static int __dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	bool restarted;
@@ -2257,6 +2265,19 @@ static int dcp_platform_resume(struct device *dev)
 		av_service_connect(dcp);
 
 	return 0;
+}
+
+/* Bench crumbs around it (boot_crumb=1), by apple,dcp-index */
+static int dcp_platform_resume(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	u8 idx = dcp && dcp->index < 3 ? dcp->index : 0;
+	int ret;
+
+	apple_spmi_boot_crumb(DCP_CRUMB_RESUME_IN + idx);
+	ret = __dcp_platform_resume(dev);
+	apple_spmi_boot_crumb(DCP_CRUMB_RESUME_OUT + idx);
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(dcp_platform_pm_ops,

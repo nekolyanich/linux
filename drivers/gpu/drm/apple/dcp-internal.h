@@ -144,6 +144,8 @@ struct apple_dcp {
 	bool dcpext_stopped;
 	/* its sleep stop failed after the link sleep and the AFK queue stop */
 	bool dcpext_half;
+	/* its HDMI converter's pwren GPIOs driven low for this sleep */
+	bool hdmi_power_cut;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

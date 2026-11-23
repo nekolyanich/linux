@@ -2035,6 +2035,29 @@ static int dcp_dcpext_idle_stop(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * dcpext0's HDMI converter power (hdmi-pwren, dp2hdmi-pwren), high since probe for the HPD
+ * irq: low through the sleep of a stopped dcpext with no sink, high again (probe's order)
+ * before its restart. Kept high, it costs 0.126 W in the cut (nopwr-a/b, 2 of 2).
+ */
+static void dcp_hdmi_power(struct apple_dcp *dcp, bool on)
+{
+	if (!dcp->hdmi_pwren && !dcp->dp2hdmi_pwren)
+		return;
+	if (on) {
+		if (!dcp->hdmi_power_cut)
+			return;
+		gpiod_set_value_cansleep(dcp->hdmi_pwren, 1);
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+		dcp->hdmi_power_cut = false;
+	} else {
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+		gpiod_set_value_cansleep(dcp->hdmi_pwren, 0);
+		dcp->hdmi_power_cut = true;
+	}
+	dev_info(dcp->dev, "dcpext sleep: HDMI converter power %s\n", on ? "on again" : "off");
+}
+
 /* True if it stopped: then no wakeup path */
 static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
 {
@@ -2066,6 +2089,8 @@ static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
 	}
 	dcp->dcpext_stopped = true;
 	apple_sleep_dispext_down(dcp->dev, true);
+	/* stop_wanted saw no HDMI sink: nothing needs the converter until the wake */
+	dcp_hdmi_power(dcp, false);
 	dev_info(dcp->dev, "dcpext sleep: idle, firmware stopped, domains released\n");
 	return true;
 }
@@ -2079,6 +2104,8 @@ static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	if (!dcp->dcpext_stopped)
 		return;
 	dcp->dcpext_stopped = false;
+	/* Before the restart, after a cut and after a refused sleep alike */
+	dcp_hdmi_power(dcp, true);
 
 	/* The power cycle macOS gives the block between its boots, and the reset of a refused sleep */
 	dcp_bench_disp0_cycle(dcp);

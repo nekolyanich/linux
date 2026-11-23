@@ -1258,6 +1258,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	return DCP_FIRMWARE_UNKNOWN;
 }
 
+static void dcp_dcpext_sleep_register(struct apple_dcp *dcp, bool on);
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -1367,6 +1369,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to boot RTKit: %d\n", ret);
+	/* An external one: sleep-seq asks at each S2R's .begin whether it will stop */
+	dcp_dcpext_sleep_register(dcp, true);
 	return ret;
 }
 
@@ -1389,6 +1393,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (!dcp)
 		return;
 
+	dcp_dcpext_sleep_register(dcp, false);
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 	/* No stale "down" for sleep-seq (rv-usb4) */
@@ -1975,7 +1980,38 @@ static bool dcp_dcpext_stop_wanted(struct apple_dcp *dcp)
 	       (pm_suspend_via_firmware() || dcpext_sleep_stop) && dcp->coproc_reg &&
 	       !IS_ERR_OR_NULL(dcp->rtk) && apple_rtkit_is_running(dcp->rtk) &&
 	       !READ_ONCE(dcp->crashed) && apple_dp_switch_held() && !dcp->switch_active &&
-	       !(cs && cs->active);
+	       !(cs && cs->active) &&
+	       /* dcpext0's fixed HDMI route (atc3 DP-only, the pwren GPIOs) isn't released for it */
+	       !dcp_hdmi_connected(dcp);
+}
+
+/*
+ * sleep-seq's check at .begin (design review must-fix 3): why this external DCP won't stop for
+ * the coming S2R, or NULL. Its sleep would otherwise keep its domains on and end in a no-cut.
+ * dp-switch's hold is already set: PM_SUSPEND_PREPARE runs before the platform's .begin.
+ */
+static const char *dcp_dcpext_sleep_veto(struct device *dev, bool via_firmware)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (!dcp || !dcp->coproc_reg || IS_ERR_OR_NULL(dcp->rtk) || !apple_rtkit_is_running(dcp->rtk))
+		return "its firmware isn't running";
+	if (READ_ONCE(dcp->crashed))
+		return "its firmware crashed";
+	if (!via_firmware && !dcpext_sleep_stop)
+		return "not a suspend via firmware (apple_sleep.via_firmware), so it keeps its domains";
+	if (!apple_dp_switch_held())
+		return "appledrm.sleep_hold is off, so it keeps its domains";
+	/* dcpext0's fixed HDMI route (atc3, the pwren GPIOs) isn't released for a sleep */
+	if (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd))
+		return "an HDMI sink is attached";
+	return NULL;
+}
+
+static void dcp_dcpext_sleep_register(struct apple_dcp *dcp, bool on)
+{
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,dcpext"))
+		apple_sleep_dispext_register(dcp->dev, on ? dcp_dcpext_sleep_veto : NULL);
 }
 
 /* As batch 11's internal idle: AP idle, AFK queues stopped (0xa4), IOP idle, 5 s per ack */
@@ -2005,6 +2041,7 @@ static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
 	int ret;
 
+	dcp->dcpext_half = false;
 	if (!dcp_dcpext_stop_wanted(dcp))
 		return false;
 	ret = iomfb_s2r_link_sleep(dcp);
@@ -2013,8 +2050,11 @@ static bool dcp_dcpext_sleep_stop(struct apple_dcp *dcp)
 	if (ret) {
 		/* Not idle: it keeps running, with its domains, as today, if it still answers */
 		dev_warn(dcp->dev, "dcpext sleep: firmware did not stop (%d)\n", ret);
-		if (!apple_rtkit_sleep_return(dcp->rtk, control))
+		if (!apple_rtkit_sleep_return(dcp->rtk, control)) {
+			/* Its link asleep (A500) and its AFK queues stopped: the fallback undoes them */
+			dcp->dcpext_half = true;
 			return false;
+		}
 		/*
 		 * Half idle (AP took, IOP didn't): it won't run on as it is (rv-dpswitch item 3).
 		 * Stopped like an idled one, so the resume restarts it from the cycle.
@@ -2039,10 +2079,11 @@ static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	if (!dcp->dcpext_stopped)
 		return;
 	dcp->dcpext_stopped = false;
-	apple_sleep_dispext_down(dcp->dev, false);
 
 	/* The power cycle macOS gives the block between its boots, and the reset of a refused sleep */
 	dcp_bench_disp0_cycle(dcp);
+	/* After the cycle: its PMP request again */
+	apple_sleep_dispext_down(dcp->dev, false);
 	if (dcp->bench_call_lost) {
 		dcp->ch_cmd.depth = 0;
 		dcp->ch_oobcmd.depth = 0;
@@ -2098,6 +2139,40 @@ static int dcp_platform_suspend(struct device *dev)
 	/* An idle external DCP stopped for a real sleep: its domains may go */
 	if (dcp_dcpext_sleep_stop(dcp))
 		return 0;
+	/*
+	 * Late fallback (.begin's check passed): a stop that was expected didn't happen (a route or
+	 * a CRTC still on, or its firmware didn't idle). Its domains would hold the sleep in a
+	 * no-cut: refuse it, after undoing the steps above.
+	 */
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,dcpext") &&
+	    pm_suspend_via_firmware() && apple_dp_switch_held()) {
+		bool half = dcp->dcpext_half;
+
+		dcp->dcpext_half = false;
+		if (half) {
+			struct apple_dcp_afkep *eps[8];
+			unsigned int n = dcp_bench_afk_eps(dcp, eps, ARRAY_SIZE(eps)), i;
+
+			/*
+			 * Its stop got as far as the A500 link sleep and the AFK queue stop before the
+			 * idle failed: the queues start again, but nothing wakes the link (no call
+			 * for it): unusable for displays until a rebind, as after a cold start.
+			 */
+			for (i = 0; i < n; i++)
+				afk_bench_queue_op(eps[i], 0xa3);
+			WRITE_ONCE(dcp->crashed, true);
+			dev_crit(dev, "dcpext sleep: half stopped (its link asleep): not usable for displays until it is bound again\n");
+		}
+		if (apple_sleep_dispext_refuses()) {
+			dev_err(dev, "dcpext sleep: not stopped, the sleep is refused\n");
+			if (dcp->hdmi_hpd_irq)
+				enable_irq(dcp->hdmi_hpd_irq);
+			if (dcp->avep)
+				av_service_connect(dcp);
+			return -EBUSY;
+		}
+		dev_warn(dev, "dcpext sleep: not stopped, kept on (apple_sleep.dispext_refuse=0)\n");
+	}
 	/*
 	 * Set the device as a wakeup device, which forces its power
 	 * domains to stay on. We need this as we do not support full

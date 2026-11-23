@@ -142,6 +142,8 @@ struct apple_dcp {
 	bool bench_call_lost;
 	/* An idle external DCP stopped by its suspend, its domains released */
 	bool dcpext_stopped;
+	/* its sleep stop failed after the link sleep and the AFK queue stop */
+	bool dcpext_half;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

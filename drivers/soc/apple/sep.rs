@@ -1569,6 +1569,11 @@ impl SepData {
             return Err(EINVAL);
         }
 
+        // Lost until a reboot: a plain error, not EAGAIN, so a blocking reader doesn't retry
+        if self.sleep_gate() == pm::SleepGate::Lost {
+            return Err(EIO);
+        }
+
         self.control.lock().entropy_begin(boottime_ms())?;
 
         let msg = proto::encode_control(&op, proto::TAG_ENTROPY);
@@ -1661,6 +1666,13 @@ impl SepData {
         }
         let mbox = self.mbox.lock();
         let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        // As `send`: the hwrng reopens at PM_POST_SUSPEND (entropy_wake) whatever the
+        // enclave's gate, and a told or lost one must not be rung (round 13 must-fix)
+        match self.sleep_gate() {
+            pm::SleepGate::Told => return Err(EAGAIN),
+            pm::SleepGate::Lost => return Err(EIO),
+            _ => {}
+        }
         if !self.control.lock().entropy_may_send() {
             return Err(EAGAIN);
         }

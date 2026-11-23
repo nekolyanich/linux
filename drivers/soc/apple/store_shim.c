@@ -120,6 +120,12 @@ void *sep_store_open_block(const char *path, int writable)
  */
 #define SEP_PARTLABEL_DEFER_MS	(60 * MSEC_PER_SEC)
 
+/*
+ * block_class is not exported: only a built-in driver can walk it. A module
+ * (NixOS) finds no device here, as before this lookup; udev makes its link.
+ */
+#if IS_BUILTIN(CONFIG_APPLE_SEP)
+
 struct sep_partlabel_match {
 	const char *label;
 };
@@ -175,6 +181,12 @@ void *sep_store_open_partlabel(const char *label, int writable)
 		MAJOR(devt), MINOR(devt));
 	return f;
 }
+#else
+void *sep_store_open_partlabel(const char *label, int writable)
+{
+	return ERR_PTR(-ENOENT);
+}
+#endif
 
 /*
  * Removes the leftover tmp @tmpname from @dir by name: only a regular file,

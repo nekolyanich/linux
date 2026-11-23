@@ -26,6 +26,9 @@
  * 0xd7 block cycle started (0xdc its DARTs read and held, before PS off; 0xdd its PS words
  * back on, before the DART restore), 0xd8 cycle done, 0xd9 PMP request back, 0xda RTKit restart
  * started, 0xdb restart returned (warm; a cold fallback follows it).
+ * After the resumes: 0xde apple-drm's .resume entered (its modeset), 0xdf left; 0xe0
+ * PM_POST_SUSPEND's notifiers done (the device resume finished); after a stopped dcpext's
+ * return (one shot each): 0xe1 its first endpoint message, 0xe2 its first HDMI HPD irq.
  * Not with sleep-seq's hybrid bit 30 alone: its crumb before cpu0's CYC_OVRD write is
  * 0x66 + N (0x66..0x71), which overlaps 0x68-0x71 here.
  */
@@ -49,6 +52,11 @@
 #define DCP_CRUMB_RET_RTKIT_OUT	0xdb
 #define DCP_CRUMB_CYC_HELD	0xdc
 #define DCP_CRUMB_CYC_PS_ON	0xdd
+#define DRM_CRUMB_RESUME_IN	0xde
+#define DRM_CRUMB_RESUME_OUT	0xdf
+#define ASEQ_CRUMB_POST		0xe0
+#define DCP_CRUMB_RET_RX	0xe1
+#define DCP_CRUMB_RET_HPD	0xe2
 static inline u8 atc_crumb_suspend_out(unsigned int atc)
 {
 	static const u8 out[4] = { 0x6e, 0x6f, 0x7e, 0x7f };

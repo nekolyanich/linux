@@ -146,6 +146,9 @@ struct apple_dcp {
 	bool dcpext_half;
 	/* its HDMI converter's pwren GPIOs driven low for this sleep */
 	bool hdmi_power_cut;
+	/* bench crumbs, one shot after a dcpext's return: its first message, its first HPD irq */
+	bool crumb_rx;
+	bool crumb_hpd;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

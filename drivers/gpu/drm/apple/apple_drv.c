@@ -38,6 +38,8 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 
+#include <linux/soc/apple/boot-crumb.h>
+
 #include "dcp.h"
 #include "plane.h"
 
@@ -720,8 +722,10 @@ static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
+	apple_spmi_boot_crumb(DRM_CRUMB_RESUME_IN);
 	if (apple)
 		drm_mode_config_helper_resume(&apple->drm);
+	apple_spmi_boot_crumb(DRM_CRUMB_RESUME_OUT);
 
 	return 0;
 }

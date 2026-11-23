@@ -236,6 +236,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
 
+	if (unlikely(READ_ONCE(dcp->crumb_rx)) && xchg(&dcp->crumb_rx, false))
+		apple_spmi_boot_crumb(DCP_CRUMB_RET_RX);
+
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
 	switch (endpoint) {
@@ -670,6 +673,9 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 {
 	struct apple_dcp *dcp = data;
 	bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+
+	if (READ_ONCE(dcp->crumb_hpd) && xchg(&dcp->crumb_hpd, false))
+		apple_spmi_boot_crumb(DCP_CRUMB_RET_HPD);
 
 	/* do nothing on disconnect and trust that dcp detects it itself.
 	 * Parallel disconnect HPDs result drm disabling the CRTC even when it
@@ -2132,6 +2138,9 @@ static bool dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	}
 	WRITE_ONCE(dcp->crashed, false);
 	apple_rtkit_set_oslog_echo(dcp->rtk, true);
+	/* One shot each: the first message and the first HPD irq after this return */
+	WRITE_ONCE(dcp->crumb_rx, true);
+	WRITE_ONCE(dcp->crumb_hpd, true);
 	apple_spmi_boot_crumb(DCP_CRUMB_RET_RTKIT);
 	ret = real ? apple_rtkit_sleep_return(dcp->rtk, control) :
 		     apple_rtkit_power_cycled_return(dcp->rtk, control);

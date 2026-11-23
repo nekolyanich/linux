@@ -3506,11 +3506,13 @@ static struct notifier_block aseq_pm_nb = {
 	.notifier_call = aseq_pm_notify,
 };
 
-/* Bench crumb: PM_SUSPEND_PREPARE's notifiers done, dp-switch's (priority 0) included */
+/* Bench crumbs: PM_SUSPEND_PREPARE's and PM_POST_SUSPEND's notifiers done, dp-switch's (priority 0) included */
 static int aseq_crumb_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
 	if (action == PM_SUSPEND_PREPARE)
 		apple_spmi_boot_crumb(ASEQ_CRUMB_PREPARE);
+	else if (action == PM_POST_SUSPEND)
+		apple_spmi_boot_crumb(ASEQ_CRUMB_POST);
 	return NOTIFY_DONE;
 }
 

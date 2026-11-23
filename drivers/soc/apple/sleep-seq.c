@@ -48,6 +48,7 @@
 #include <linux/syscore_ops.h>
 #include <linux/irqchip/irq-apple-aic.h>
 #include <linux/mfd/macsmc.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/of_platform.h>
 #include <linux/unaligned.h>
@@ -415,6 +416,30 @@ struct apple_sleep_seq {
 static struct apple_sleep_seq *apple_sleep_seq;
 /* External DCPs their driver stopped for this sleep (apple_sleep_dispext_down) */
 static u8 aseq_dispext_down;
+/* Their PMP report requests that apple_sleep_dispext_down() withdrew, acknowledged, with the PMP up */
+static u8 aseq_dispext_withdrawn;
+
+/*
+ * The drivers of the external DCPs say at .begin whether theirs will stop for this sleep
+ * (apple_sleep_dispext_register): an owned one that won't keeps its words on, and the sleep
+ * would end in a no-cut and WD2's reset, so .begin refuses it (design review, must-fix 3).
+ */
+struct aseq_dispext_veto {
+	struct device *dev;
+	const char *(*veto)(struct device *dev, bool via_firmware);
+};
+static struct aseq_dispext_veto aseq_dispext_vetoes[2];
+static DEFINE_MUTEX(aseq_dispext_veto_lock);
+/* The reason each one was last refused for, logged again when it changes */
+static const char *aseq_dispext_refused_why[2];
+
+static bool dispext_withdraw = true;
+module_param(dispext_withdraw, bool, 0444);
+MODULE_PARM_DESC(dispext_withdraw, "bench: withdraw an external DCP's PMP request, acknowledged, at its driver's stop (0: left to genpd and the entry, x1e's shape)");
+
+static bool dispext_refuse = true;
+module_param(dispext_refuse, bool, 0444);
+MODULE_PARM_DESC(dispext_refuse, "Refuse a sleep an owned external DCP would keep from cutting (0: let it no-cut, the bench's control)");
 
 static bool dry_run;
 module_param(dry_run, bool, 0644);
@@ -2198,18 +2223,13 @@ static void aseq_dispext_owned(struct apple_sleep_seq *s)
 	s->dispext_bound = owned;
 }
 
-/*
- * An external DCP its driver stopped for this sleep (apple_sleep_dispext_down): owned and down,
- * so its request leaves the PMP report as an unbound one's does. Set at the device's suspend,
- * cleared at its resume; read at the entry's report write.
- */
-void apple_sleep_dispext_down(struct device *dev, bool down)
+/* Which of the table's external DCPs @dev is (by its coproc registers), or -ENODEV */
+static int aseq_dispext_index(struct apple_sleep_seq *s, struct device *dev)
 {
-	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);
 	struct resource r;
 
-	if (!s || of_address_to_resource(dev->of_node, 0, &r))
-		return;
+	if (!s || !dev || of_address_to_resource(dev->of_node, 0, &r))
+		return -ENODEV;
 	for (unsigned int d = 0; d < s->soc->ndispext && d < 2; d++) {
 		int index = of_property_match_string(s->dev->of_node, "reg-names",
 						     s->soc->blocks[s->soc->dispext_asc[d]]);
@@ -2218,14 +2238,127 @@ void apple_sleep_dispext_down(struct device *dev, bool down)
 		if (index < 0 || of_address_to_resource(s->dev->of_node, index, &asc) ||
 		    !resource_overlaps(&r, &asc))
 			continue;
-		if (down)
-			WRITE_ONCE(aseq_dispext_down, READ_ONCE(aseq_dispext_down) | BIT(d));
-		else
-			WRITE_ONCE(aseq_dispext_down, READ_ONCE(aseq_dispext_down) & ~BIT(d));
-		dev_info(s->dev, "dispext%u: %s by its driver\n", d, down ? "stopped" : "back");
+		return d;
 	}
+	return -ENODEV;
+}
+
+static void aseq_dispext_report(struct apple_sleep_seq *s, unsigned int d);
+
+static void aseq_dispext_report_set(struct apple_sleep_seq *s, unsigned int d, bool enable);
+
+/* Its request back in the PMP report, acknowledged: genpd's power_on does the same write */
+static void aseq_dispext_request(struct apple_sleep_seq *s, unsigned int d)
+{
+	aseq_dispext_report_set(s, d, true);
+}
+
+/*
+ * An external DCP its driver stopped for this sleep (apple_sleep_dispext_down): owned and down.
+ * Called at its .suspend, before suspend_late stops the PMP (x1e: a withdrawal after that is
+ * never acted on), so its request leaves the PMP report here and is acknowledged, as the boot
+ * rows withdraw it. At its return, after its block cycle, it is requested again: after a cut
+ * and after a refused sleep alike.
+ */
+void apple_sleep_dispext_down(struct device *dev, bool down)
+{
+	struct apple_sleep_seq *s = READ_ONCE(apple_sleep_seq);
+	int d = aseq_dispext_index(s, dev);
+	u64 bit;
+
+	if (d < 0)
+		return;
+	bit = BIT_ULL(s->soc->dispext_report_bit[d]);
+	if (down) {
+		WRITE_ONCE(aseq_dispext_down, READ_ONCE(aseq_dispext_down) | BIT(d));
+		if (dispext_withdraw &&
+		    (readq(s->base[s->soc->report_blk] + s->soc->report_read) & bit)) {
+			aseq_dispext_report(s, d);
+			aseq_dispext_withdrawn |= BIT(d);
+		}
+	} else {
+		if (aseq_dispext_withdrawn & BIT(d)) {
+			aseq_dispext_request(s, d);
+			aseq_dispext_withdrawn &= ~BIT(d);
+		}
+		WRITE_ONCE(aseq_dispext_down, READ_ONCE(aseq_dispext_down) & ~BIT(d));
+	}
+	dev_info(s->dev, "dispext%u: %s by its driver\n", d, down ? "stopped" : "back");
 }
 EXPORT_SYMBOL_GPL(apple_sleep_dispext_down);
+
+/*
+ * An external DCP's driver: @veto (NULL to unregister) says, at .begin, why its DCP won't stop
+ * for this sleep, or NULL if it will; @via_firmware is whether .begin will set suspend via
+ * firmware (apple_sleep.via_firmware). Process context; @veto may sleep.
+ */
+void apple_sleep_dispext_register(struct device *dev,
+				  const char *(*veto)(struct device *dev, bool via_firmware))
+{
+	struct aseq_dispext_veto *free = NULL;
+
+	mutex_lock(&aseq_dispext_veto_lock);
+	for (unsigned int i = 0; i < ARRAY_SIZE(aseq_dispext_vetoes); i++) {
+		struct aseq_dispext_veto *v = &aseq_dispext_vetoes[i];
+
+		if (v->dev == dev) {
+			v->veto = veto;
+			if (!veto)
+				v->dev = NULL;
+			free = NULL;
+			goto out;
+		}
+		if (!v->dev && !free)
+			free = v;
+	}
+	if (veto && free) {
+		free->dev = dev;
+		free->veto = veto;
+	} else if (veto) {
+		dev_warn(dev, "apple-sleep: no slot for this external DCP's sleep check\n");
+	}
+out:
+	mutex_unlock(&aseq_dispext_veto_lock);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_dispext_register);
+
+/* Whether a sleep an external DCP won't let cut is refused (dispext_refuse), for its driver's late check */
+bool apple_sleep_dispext_refuses(void)
+{
+	return dispext_refuse;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_dispext_refuses);
+
+/* .begin: each owned external DCP will stop for this sleep, or the sleep is refused */
+static int aseq_dispext_check(struct apple_sleep_seq *s)
+{
+	for (unsigned int d = 0; d < 2; d++) {
+		const char *why = "no driver bound to it";
+
+		if (!(s->dispext_bound & BIT(d)))
+			continue;
+		mutex_lock(&aseq_dispext_veto_lock);
+		for (unsigned int i = 0; i < ARRAY_SIZE(aseq_dispext_vetoes); i++) {
+			struct aseq_dispext_veto *v = &aseq_dispext_vetoes[i];
+
+			if (v->dev && aseq_dispext_index(s, v->dev) == d) {
+				why = v->veto(v->dev, via_firmware);
+				break;
+			}
+		}
+		mutex_unlock(&aseq_dispext_veto_lock);
+		if (!why)
+			continue;
+		if (why != aseq_dispext_refused_why[d]) {
+			aseq_dispext_refused_why[d] = why;
+			dev_warn(s->dev, "dispext%u won't stop for S2R: %s; %s (logged again only when this changes)\n",
+				 d, why, dispext_refuse ? "sleep refused" : "not refused (dispext_refuse=0)");
+		}
+		if (dispext_refuse)
+			return -EBUSY;
+	}
+	return 0;
+}
 
 /* Each external DCP's CPU control and status (only with its cpu0 word not off) and its PS words */
 static void aseq_dispext_print(struct apple_sleep_seq *s, const char *when)
@@ -2284,19 +2417,38 @@ static unsigned int aseq_dispext_on(struct apple_sleep_seq *s)
 	return on;
 }
 
-/* One external DCP's request withdrawn from the PMP report, the others left as they are */
-static void aseq_dispext_report(struct apple_sleep_seq *s, unsigned int d)
+/*
+ * One external DCP's request in the PMP report, withdrawn (or back), the others left as they
+ * are: through pmp-report's locked write and its wait for the PMP's acknowledgement, since
+ * genpd changes other entries under runtime PM meanwhile (design review round 2, must-fix 1).
+ * Without the report driver, the unlocked write as before.
+ */
+static void aseq_dispext_report_set(struct apple_sleep_seq *s, unsigned int d, bool enable)
 {
 	const struct apple_sleep_seq_soc *soc = s->soc;
+	unsigned int id = soc->dispext_report_bit[d];
 	void __iomem *rep = s->base[soc->report_blk];
-	u64 bit = BIT_ULL(soc->dispext_report_bit[d]), v;
-	int ret;
+	u64 bit = BIT_ULL(id), v;
+	int ret = apple_pmp_report_set(id, enable);
 
-	writeq(readq(rep + soc->report_read) & ~bit, rep + soc->report_write);
-	ret = readq_poll_timeout_atomic(rep + soc->report_actual, v, !(v & bit), 10, 50000);
-	if (ret)
-		dev_warn(s->dev, "bench: dispext%u: the PMP still acknowledges bit %u (ack %#llx)\n", d,
-			 soc->dispext_report_bit[d], v);
+	if (ret == -ENODEV) {
+		dev_warn_once(s->dev, "dispext: no PMP report driver, the report written unlocked\n");
+		v = readq(rep + soc->report_read) & ~bit;
+		writeq(enable ? v | bit : v, rep + soc->report_write);
+		ret = readq_poll_timeout_atomic(rep + soc->report_actual, v, !!(v & bit) == enable,
+						10, 50000);
+	}
+	if (ret == -EAGAIN)
+		dev_warn(s->dev, "dispext%u: bit %u %s, but the PMP isn't ready to acknowledge it\n", d, id,
+			 enable ? "requested" : "withdrawn");
+	else if (ret)
+		dev_warn(s->dev, "dispext%u: the PMP doesn't acknowledge bit %u %s (ack %#llx)\n", d, id,
+			 enable ? "on" : "off", readq(rep + soc->report_actual));
+}
+
+static void aseq_dispext_report(struct apple_sleep_seq *s, unsigned int d)
+{
+	aseq_dispext_report_set(s, d, false);
 }
 
 /* The rows as the entry runs them, each with interrupts off; once per boot and again after each wake */
@@ -2682,6 +2834,11 @@ static int aseq_begin(suspend_state_t state)
 	/* Nor the SEP's refusal of one: its gate is set again by its .suspend */
 	if (READ_ONCE(aseq_sep_gate) == 4)
 		WRITE_ONCE(aseq_sep_gate, 0);
+	if (state == PM_SUSPEND_MEM && aseq_s2r() && s->dispext_rows && s->dispext_bound) {
+		ret = aseq_dispext_check(s);
+		if (ret)
+			return ret;
+	}
 	if (state == PM_SUSPEND_MEM && aseq_s2r() && s->dispext_rows) {
 		aseq_dispext_print(s, "begin");
 		if (dispext_off == 2 || s->dispext_again)

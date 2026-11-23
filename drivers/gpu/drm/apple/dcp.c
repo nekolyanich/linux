@@ -20,6 +20,7 @@
 #include <linux/of_platform.h>
 #include <linux/phy/apple-atc.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/boot-crumb.h>
 #include <linux/soc/apple/dp-switch.h>
 #include <linux/iopoll.h>
 #include <linux/soc/apple/dart.h>
@@ -2151,7 +2152,7 @@ static void dcp_dcpext_sleep_return(struct apple_dcp *dcp)
 	dev_crit(dcp->dev, "dcpext sleep: not usable for displays until it is bound again\n");
 }
 
-static int dcp_platform_suspend(struct device *dev)
+static int __dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
@@ -2210,6 +2211,19 @@ static int dcp_platform_suspend(struct device *dev)
 	dcp_bench_idle_at_suspend(dcp);
 
 	return 0;
+}
+
+/* Bench crumbs around it (boot_crumb=1), by apple,dcp-index */
+static int dcp_platform_suspend(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	u8 idx = dcp && dcp->index < 3 ? dcp->index : 0;
+	int ret;
+
+	apple_spmi_boot_crumb(DCP_CRUMB_SUSPEND_IN + idx);
+	ret = __dcp_platform_suspend(dev);
+	apple_spmi_boot_crumb(DCP_CRUMB_SUSPEND_OUT + idx);
+	return ret;
 }
 
 static int dcp_platform_resume(struct device *dev)

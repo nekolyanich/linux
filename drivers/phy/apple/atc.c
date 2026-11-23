@@ -23,6 +23,7 @@
  */
 
 #include <dt-bindings/phy/phy.h>
+#include <linux/soc/apple/boot-crumb.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
@@ -2963,7 +2964,19 @@ MODULE_DEVICE_TABLE(of, atcphy_match);
  * skip the link training on resume altogether.
  */
 
-static int atcphy_suspend_late(struct device *dev)
+/* Bench crumbs only: atcN from the t602x die-0 base (0x703000000 + N * 0x400000000), or -1 */
+static int atcphy_crumb_index(struct device *dev)
+{
+	struct resource *r = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
+	u64 n;
+
+	if (!r || r->start < 0x400000000ULL)
+		return -1;
+	n = (r->start >> 34) - 1;
+	return n < 4 ? n : -1;
+}
+
+static int __atcphy_suspend_late(struct device *dev)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 
@@ -2988,6 +3001,18 @@ static int atcphy_suspend_late(struct device *dev)
  * the lanes up (aurora's atcphy_restore_after_pd_off, by function). A DP main
  * link or tunnel pixel clock does not survive; their users set them up again.
  */
+static int atcphy_suspend_late(struct device *dev)
+{
+	int n = atcphy_crumb_index(dev), ret;
+
+	if (n >= 0)
+		apple_spmi_boot_crumb(ATC_CRUMB_SUSPEND_IN + n);
+	ret = __atcphy_suspend_late(dev);
+	if (n >= 0)
+		apple_spmi_boot_crumb(atc_crumb_suspend_out(n));
+	return ret;
+}
+
 static int atcphy_resume_early(struct device *dev)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);

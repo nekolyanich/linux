@@ -437,6 +437,10 @@ static bool dispext_withdraw = true;
 module_param(dispext_withdraw, bool, 0444);
 MODULE_PARM_DESC(dispext_withdraw, "bench: withdraw an external DCP's PMP request, acknowledged, at its driver's stop (0: left to genpd and the entry, x1e's shape)");
 
+static bool dispext_crumb;
+module_param(dispext_crumb, bool, 0444);
+MODULE_PARM_DESC(dispext_crumb, "bench: the entry's crumb is 0x50 | dispext state: 1 a DXSUB word on, 2 a cpu0/fe/sys word on, 4 an owned one's report bit acknowledged, 8 an owned one not stopped");
+
 static bool dispext_refuse = true;
 module_param(dispext_refuse, bool, 0444);
 MODULE_PARM_DESC(dispext_refuse, "Refuse a sleep an owned external DCP would keep from cutting (0: let it no-cut, the bench's control)");
@@ -543,6 +547,7 @@ EXPORT_SYMBOL_GPL(apple_sleep_sep_early_wired);
 
 static u8 aseq_sep_gate;
 static unsigned int aseq_dispext_on(struct apple_sleep_seq *s);
+static u8 aseq_dispext_crumb(struct apple_sleep_seq *s);
 
 /*
  * Bench (apple_sleep.smc_crumb, with hybrid bit 28): crumb 0x62's spot, the last write before
@@ -1516,7 +1521,9 @@ static void aseq_pmu_run(struct apple_sleep_seq *s, const struct apple_sleep_op 
 		 */
 		if (op->off == PMU_BOOT_STAGE && op->val == PMU_BOOT_STAGE_SLEEP &&
 		    apple_spmi_boot_crumb_on())
-			buf[0] = PMU_BOOT_STAGE_SLEEP | (READ_ONCE(aseq_sep_gate) & 7) |
+			buf[0] = dispext_crumb && s->dispext_rows ?
+				 PMU_BOOT_STAGE_SLEEP | aseq_dispext_crumb(s) :
+				 PMU_BOOT_STAGE_SLEEP | (READ_ONCE(aseq_sep_gate) & 7) |
 				 (aseq_dispext_on(s) ? 0x08 : 0);
 		ret = aseq_spmi(s, op->off, buf, 1, NULL, 0);
 		break;
@@ -2418,6 +2425,42 @@ static unsigned int aseq_dispext_on(struct apple_sleep_seq *s)
 }
 
 /*
+ * dispext_crumb: the entry's crumb nibble. Bit 0 a DXSUB word on, bit 1 a cpu0/fe/sys word on (any
+ * dispext), bit 2 an owned one's report bit still acknowledged, bit 3 an owned one not stopped by
+ * its driver. Reads only the words aseq_dispext_on() and aseq_dispext_print() read.
+ */
+static u8 aseq_dispext_crumb(struct apple_sleep_seq *s)
+{
+	const struct apple_sleep_seq_soc *soc = s->soc;
+	u64 ack = readq(s->base[soc->report_blk] + soc->report_actual);
+	u8 owned = s->dispext_bound, mask = 0;
+	unsigned int i;
+
+	for_each_set_bit(i, s->dispext_rows, soc->nentry) {
+		const struct apple_sleep_op *op = &soc->entry[i];
+		u32 ps;
+
+		if (op->kind == SEQ_COPROC_STOP)
+			ps = readl(s->base[op->val >> 32] + (u32)op->val);
+		else if (op->kind == SEQ_PS_LOWER)
+			ps = readl(s->base[op->blk] + op->off);
+		else
+			continue;
+		if (FIELD_GET(PS_ACTUAL, ps))
+			mask |= op->kind == SEQ_PS_LOWER && (op->group & SEQ_G_DXSUB) ? BIT(0) : BIT(1);
+	}
+	for (unsigned int d = 0; d < soc->ndispext && d < 2; d++) {
+		if (!(owned & BIT(d)))
+			continue;
+		if (ack & BIT_ULL(soc->dispext_report_bit[d]))
+			mask |= BIT(2);
+		if (!(READ_ONCE(aseq_dispext_down) & BIT(d)))
+			mask |= BIT(3);
+	}
+	return mask;
+}
+
+/*
  * One external DCP's request in the PMP report, withdrawn (or back), the others left as they
  * are: through pmp-report's locked write and its wait for the PMP's acknowledgement, since
  * genpd changes other entries under runtime PM meanwhile (design review round 2, must-fix 1).
@@ -2645,6 +2688,7 @@ static int aseq_smc_warn(struct apple_sleep_seq *s)
 	if (ret)
 		return ret;
 	aseq_smc_bits |= BIT(0);
+	apple_spmi_boot_crumb(ASEQ_CRUMB_SLPW);
 	if (!(smc_notify & SEQ_SMC_PMVC))
 		aseq_smc_bits |= BIT(1);
 	if (!(smc_notify & SEQ_SMC_WKTP))
@@ -2657,6 +2701,7 @@ static int aseq_smc_warn(struct apple_sleep_seq *s)
 		if (ret)
 			return ret;
 		aseq_smc_bits |= BIT(1);
+		apple_spmi_boot_crumb(ASEQ_CRUMB_PMVC);
 	}
 	if (smc_notify & SEQ_SMC_WKTP) {
 		ret = apple_smc_write(smc, SMC_KEY(WKTP), &wake_type, sizeof(wake_type));
@@ -2664,6 +2709,7 @@ static int aseq_smc_warn(struct apple_sleep_seq *s)
 			dev_err(s->dev, "WKTP = 2: %d\n", ret);
 		else
 			aseq_smc_bits |= BIT(2);
+		apple_spmi_boot_crumb(ASEQ_CRUMB_WKTP);
 	}
 	dev_info(s->dev, "SMC: slpw%s\n", smc_notify & SEQ_SMC_WKTP ? ", WKTP = 2" : "");
 	if (READ_ONCE(hybrid) & APPLE_SLEEP_HYBRID_SMC_EDGE)
@@ -2820,6 +2866,8 @@ static int aseq_begin(suspend_state_t state)
 {
 	struct apple_sleep_seq *s = apple_sleep_seq;
 	int ret;
+
+	apple_spmi_boot_crumb(ASEQ_CRUMB_BEGIN);
 
 	s->resumed = false;
 	s->groups = aseq_groups();
@@ -2990,6 +3038,7 @@ static int aseq_begin(suspend_state_t state)
 	if (state == PM_SUSPEND_MEM)
 		work_on_cpu(0, aseq_report_plan_fn, s);
 
+	apple_spmi_boot_crumb(ASEQ_CRUMB_BEGIN_OUT);
 	return 0;
 }
 
@@ -3444,6 +3493,19 @@ static struct notifier_block aseq_pm_nb = {
 	.notifier_call = aseq_pm_notify,
 };
 
+/* Bench crumb: PM_SUSPEND_PREPARE's notifiers done, dp-switch's (priority 0) included */
+static int aseq_crumb_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	if (action == PM_SUSPEND_PREPARE)
+		apple_spmi_boot_crumb(ASEQ_CRUMB_PREPARE);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block aseq_crumb_nb = {
+	.notifier_call = aseq_crumb_notify,
+	.priority = INT_MIN,
+};
+
 static int aseq_map_mailbox(struct apple_sleep_seq *s)
 {
 	struct device_node *chosen = of_find_node_by_path("/chosen");
@@ -3623,6 +3685,7 @@ static int __apple_sleep_seq_probe(struct platform_device *pdev)
 	if (resume == 2) {
 		register_syscore(&aseq_syscore);
 		register_pm_notifier(&aseq_pm_nb);
+		register_pm_notifier(&aseq_crumb_nb);
 	}
 
 	dev_info(dev, "%s, %s; %u entry steps\n",

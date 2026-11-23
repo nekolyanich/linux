@@ -178,6 +178,8 @@ bool apple_sleep_bench_sep_sleep_early(void);
 void apple_sleep_sep_early_set(struct device *dev, bool wired);
 /* An external DCP's driver stopped it for this sleep, or brought it back */
 void apple_sleep_dispext_down(struct device *dev, bool down);
+/* The internal DCP's driver bound it (its RTKit up), or unbound it */
+void apple_sleep_disp0_bound(bool bound);
 /* Its driver's check at .begin: why it won't stop for this sleep, or NULL (NULL @veto unregisters) */
 void apple_sleep_dispext_register(struct device *dev,
 				  const char *(*veto)(struct device *dev, bool via_firmware));
@@ -377,6 +379,10 @@ static inline void apple_sleep_sep_early_set(struct device *dev, bool wired)
 }
 
 static inline void apple_sleep_dispext_down(struct device *dev, bool down)
+{
+}
+
+static inline void apple_sleep_disp0_bound(bool bound)
 {
 }
 

@@ -2013,6 +2013,8 @@ static void dcp_dcpext_sleep_register(struct apple_dcp *dcp, bool on)
 {
 	if (of_device_is_compatible(dcp->dev->of_node, "apple,dcpext"))
 		apple_sleep_dispext_register(dcp->dev, on ? dcp_dcpext_sleep_veto : NULL);
+	else
+		apple_sleep_disp0_bound(on);	/* for .begin's bench crumb */
 }
 
 /* As batch 11's internal idle: AP idle, AFK queues stopped (0xa4), IOP idle, 5 s per ack */

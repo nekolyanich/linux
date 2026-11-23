@@ -2329,6 +2329,15 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_sleep_dispext_register);
 
+/* Bench crumb only: .begin's is ASEQ_CRUMB_BEGIN_NODCP while the internal DCP isn't bound */
+static bool aseq_disp0_bound;
+
+void apple_sleep_disp0_bound(bool bound)
+{
+	WRITE_ONCE(aseq_disp0_bound, bound);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_disp0_bound);
+
 /*
  * Whether a sleep an external DCP won't let cut is refused (dispext_refuse), for its driver's
  * late check: only with the S2R entry, as .begin's check; a sleep that doesn't cut (s2r=0) isn't
@@ -2871,7 +2880,7 @@ static int aseq_begin(suspend_state_t state)
 	struct apple_sleep_seq *s = apple_sleep_seq;
 	int ret;
 
-	apple_spmi_boot_crumb(ASEQ_CRUMB_BEGIN);
+	apple_spmi_boot_crumb(READ_ONCE(aseq_disp0_bound) ? ASEQ_CRUMB_BEGIN : ASEQ_CRUMB_BEGIN_NODCP);
 
 	s->resumed = false;
 	s->groups = aseq_groups();

@@ -44,6 +44,19 @@
 	status = "okay";
 };
 
+/*
+ * m1n1 enables dcpext1 itself through its alias, but not its mailbox and DART:
+ * without them its bind defers and the aggregate unbinds the internal DCP,
+ * which can't boot RTKit twice (aurora fc4add99, 7.2's ENABLE_DCPEXT_TYPEC)
+ */
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
 /* HACK: keep dptx_phy_ps power-domain always-on
  *       it is unclear how to sequence with dcp for the integrated display
  */

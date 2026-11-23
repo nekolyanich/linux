@@ -12,6 +12,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/soc/apple/pmp-report.h>
 
 #define PMP_REPORT_READY 0x1
 
@@ -30,6 +31,9 @@ struct apple_pmp_report {
 	/* the entries, for the resume (lock) */
 	struct list_head entries;
 };
+
+/* The SoC's one report block, for apple_pmp_report_set() */
+static struct apple_pmp_report *apple_pmp_report_inst;
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -50,6 +54,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
 	dev_set_drvdata(dev, rep);
+	WRITE_ONCE(apple_pmp_report_inst, rep);
 	ret = of_platform_populate(np, NULL, NULL, dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to create child devices\n");
@@ -179,6 +184,32 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 		100,
 		50000);
 }
+
+/*
+ * Request @id on or off outside genpd (sleep-seq's external DCPs), under the same lock as the
+ * entries' own writes, then wait for the PMP's acknowledgement as they do. -ENODEV without the
+ * report block, -EAGAIN when the PMP isn't ready (written, not acknowledged), else the wait's.
+ */
+int apple_pmp_report_set(unsigned int id, bool enable)
+{
+	struct apple_pmp_report *rep = READ_ONCE(apple_pmp_report_inst);
+	u64 bit_val = BIT_ULL(id), val;
+	unsigned long flags;
+
+	if (!rep || id >= 64)
+		return -ENODEV;
+	spin_lock_irqsave(&rep->lock, flags);
+	val = readq(rep->base + rep->offsets->tgt_read) & ~bit_val;
+	if (enable)
+		val |= bit_val;
+	writeq(val, rep->base + rep->offsets->tgt_write);
+	spin_unlock_irqrestore(&rep->lock, flags);
+	if (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY))
+		return -EAGAIN;
+	return readq_poll_timeout_atomic(rep->base + rep->offsets->actual, val,
+					 !!(val & bit_val) == !!enable, 100, 50000);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_set);
 
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {

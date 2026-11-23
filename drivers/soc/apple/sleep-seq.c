@@ -2895,6 +2895,14 @@ static int aseq_begin(suspend_state_t state)
 	/* Nor the SEP's refusal of one: its gate is set again by its .suspend */
 	if (READ_ONCE(aseq_sep_gate) == 4)
 		WRITE_ONCE(aseq_sep_gate, 0);
+	/*
+	 * The SEP lost (3) after an earlier SLEEP: its .suspend would refuse every sleep with -EIO,
+	 * after the device round and slpw. Refused here, before either (round 13, P1).
+	 */
+	if (state == PM_SUSPEND_MEM && aseq_s2r() && READ_ONCE(aseq_sep_gate) == 3) {
+		dev_warn_ratelimited(s->dev, "S2R refused: the SEP is lost until a reboot (a sleep that didn't cut, or a failed SLEEP)\n");
+		return -EBUSY;
+	}
 	if (state == PM_SUSPEND_MEM && aseq_s2r() && s->dispext_rows && s->dispext_bound) {
 		ret = aseq_dispext_check(s);
 		if (ret)

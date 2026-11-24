@@ -442,7 +442,11 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	 * (its resume_noirq, before this). s2idle keeps the line and the
 	 * amps' registers and stays on the path below.
 	 */
-	bool power_on = tas2764->sdz_group && pm_resume_via_firmware();
+	/*
+	 * The same holds for amps on a shutdown GPIO (j416s: all six on one
+	 * line): the cut takes the line, so they are back from a power-on reset.
+	 */
+	bool power_on = (tas2764->sdz_group || tas2764->sdz_gpio) && pm_resume_via_firmware();
 	int ret;
 
 	if (!tas2764->sdz_group) {

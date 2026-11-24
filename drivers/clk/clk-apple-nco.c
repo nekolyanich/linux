@@ -16,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 
 #define NCO_CHANNEL_STRIDE	0x4000
 #define NCO_CHANNEL_REGSIZE	20
@@ -254,6 +255,61 @@ static const struct clk_ops applnco_ops = {
 	.is_enabled = applnco_is_enabled,
 };
 
+/*
+ * Suspend to RAM: the SoC's sleep sequence does not complete with the channels
+ * stopped; macOS has every channel enabled at the commit. Enable them at
+ * suspend_noirq of a firmware suspend and put the saved words back at resume.
+ */
+static bool s2r_enable = true;
+module_param(s2r_enable, bool, 0644);
+MODULE_PARM_DESC(s2r_enable, "enable every channel across a firmware suspend (default on)");
+
+#define NCO_MAX_CHANNELS 8
+
+struct applnco_data {
+	void __iomem *base;
+	unsigned int nchannels;
+	bool saved;
+	u32 ctrl[NCO_MAX_CHANNELS];
+};
+
+static int applnco_suspend_noirq(struct device *dev)
+{
+	struct applnco_data *data = dev_get_drvdata(dev);
+	unsigned int i;
+
+	data->saved = false;
+	if (!s2r_enable || !pm_suspend_via_firmware())
+		return 0;
+
+	for (i = 0; i < data->nchannels; i++) {
+		void __iomem *reg = data->base + NCO_CHANNEL_STRIDE * i + REG_CTRL;
+
+		data->ctrl[i] = readl_relaxed(reg);
+		writel_relaxed(data->ctrl[i] | CTRL_ENABLE, reg);
+	}
+	data->saved = true;
+	return 0;
+}
+
+static int applnco_resume_noirq(struct device *dev)
+{
+	struct applnco_data *data = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (!data->saved)
+		return 0;
+
+	for (i = 0; i < data->nchannels; i++)
+		writel_relaxed(data->ctrl[i], data->base + NCO_CHANNEL_STRIDE * i + REG_CTRL);
+	data->saved = false;
+	return 0;
+}
+
+static const struct dev_pm_ops applnco_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(applnco_suspend_noirq, applnco_resume_noirq)
+};
+
 static int applnco_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -263,6 +319,7 @@ static int applnco_probe(struct platform_device *pdev)
 	void __iomem *base;
 	struct resource *res;
 	struct applnco_tables *tbl;
+	struct applnco_data *data;
 	unsigned int nchannels;
 	int ret, i;
 
@@ -285,6 +342,13 @@ static int applnco_probe(struct platform_device *pdev)
 	if (!tbl)
 		return -ENOMEM;
 	applnco_compute_tables(tbl);
+
+	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	data->base = base;
+	data->nchannels = min(nchannels, NCO_MAX_CHANNELS);
+	platform_set_drvdata(pdev, data);
 
 	for (i = 0; i < nchannels; i++) {
 		struct applnco_channel *chan;
@@ -330,6 +394,7 @@ static struct platform_driver applnco_driver = {
 	.driver = {
 		.name = "apple-nco",
 		.of_match_table = applnco_ids,
+		.pm = pm_sleep_ptr(&applnco_pm_ops),
 	},
 	.probe = applnco_probe,
 };

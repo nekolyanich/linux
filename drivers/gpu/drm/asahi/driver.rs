@@ -42,9 +42,121 @@ pub(crate) struct AsahiPlatformDriver;
 
 // #[pin_data(PinnedDrop)]
 pub(crate) struct AsahiPlatformDriverData<'bound> {
+    // Dropped first: the sleep glue lets go of the GPU before the registration goes
+    _sleep: SleepReg,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
 }
+
+// The S2R glue (s2r.c, asahi.sleep_s2r): Tanabota notes/sleep/m2pro-73-gpu-s2r-design.md
+extern "C" {
+    fn asahi_s2r_register(
+        dev: *mut kernel::bindings::device,
+        rtk: *mut kernel::bindings::apple_rtkit,
+        flags: u32,
+    ) -> core::ffi::c_int;
+    fn asahi_s2r_unregister(dev: *mut kernel::bindings::device);
+    fn asahi_s2r_prepare(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
+    fn asahi_s2r_complete(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
+    fn asahi_s2r_kicked();
+}
+
+/// The GPU the sleep callbacks act on: one per system, set only with asahi.sleep_s2r.
+static SLEEP_GPU: core::sync::atomic::AtomicPtr<Arc<dyn gpu::GpuManager>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Holds the sleep registration for as long as the driver is bound.
+struct SleepReg {
+    dev: *mut kernel::bindings::device,
+}
+
+// SAFETY: Only a device pointer, used for the C calls, which lock as they need.
+unsafe impl Send for SleepReg {}
+// SAFETY: As above.
+unsafe impl Sync for SleepReg {}
+
+impl SleepReg {
+    fn new(pdev: &platform::Device<Core<'_>>, gpu: &Arc<dyn gpu::GpuManager>) -> Result<SleepReg> {
+        let flags = crate::module_parameters::sleep_s2r.value();
+        let dev = pdev.as_ref().as_raw();
+        if flags == 0 {
+            return Ok(SleepReg { dev: core::ptr::null_mut() });
+        }
+        let held = KBox::into_raw(KBox::new(gpu.clone(), GFP_KERNEL)?);
+        let old = SLEEP_GPU.swap(held, core::sync::atomic::Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: Came from `KBox::into_raw` above, on an earlier bind.
+            drop(unsafe { KBox::from_raw(old) });
+        }
+        // SAFETY: `dev` is the bound device, `rtkit_raw` its live RTKit handle.
+        kernel::error::to_result(unsafe { asahi_s2r_register(dev, gpu.rtkit_raw(), flags) })?;
+        Ok(SleepReg { dev })
+    }
+}
+
+impl Drop for SleepReg {
+    fn drop(&mut self) {
+        if self.dev.is_null() {
+            return;
+        }
+        // SAFETY: The device is still bound while its driver data drops.
+        unsafe { asahi_s2r_unregister(self.dev) };
+        let old = SLEEP_GPU.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: Came from `KBox::into_raw` in `SleepReg::new`.
+            drop(unsafe { KBox::from_raw(old) });
+        }
+    }
+}
+
+struct SleepOps(kernel::bindings::dev_pm_ops);
+
+// SAFETY: Immutable: the callbacks are plain functions.
+unsafe impl Sync for SleepOps {}
+
+/// Before any device suspends: a firmware-driven suspend arms the stop (s2r.c).
+unsafe extern "C" fn sleep_prepare(dev: *mut kernel::bindings::device) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core for a bound device.
+    unsafe { asahi_s2r_prepare(dev) }
+}
+
+/// After every device resumed: the warm restart if the stop ran, the kick, or the jobs failed.
+unsafe extern "C" fn sleep_complete(dev: *mut kernel::bindings::device) {
+    // SAFETY: Called by the PM core for a bound device.
+    let ret = unsafe { asahi_s2r_complete(dev) };
+    if ret == 0 {
+        return;
+    }
+    let gpu = SLEEP_GPU.load(core::sync::atomic::Ordering::Acquire);
+    if gpu.is_null() {
+        return;
+    }
+    // SAFETY: Set while bound (SleepReg), and the PM core keeps the device bound here.
+    let gpu = unsafe { &*gpu };
+    if ret < 0 {
+        gpu.mark_lost();
+        return;
+    }
+    if gpu.kick_firmware().is_err() {
+        gpu.mark_lost();
+        return;
+    }
+    // SAFETY: Only writes the kick's crumb.
+    unsafe { asahi_s2r_kicked() };
+    // A HELLO alone doesn't show the firmware reads its rings: one device-control round trip
+    // does (it consumes the command, or this times out), so a dead one fails jobs, not hangs.
+    if let Err(e) = gpu.flush_fw_cache() {
+        pr_err!("asahi: s2r: no device-control reply after the warm restart: {:?}\n", e);
+        gpu.mark_lost();
+    }
+}
+
+static SLEEP_OPS: SleepOps = SleepOps(kernel::bindings::dev_pm_ops {
+    prepare: Some(sleep_prepare),
+    complete: Some(sleep_complete),
+    // SAFETY: All-zero is the absence of every other callback.
+    ..unsafe { core::mem::zeroed() }
+});
 
 /// Holds a reference to the top-level `GpuManager` object.
 #[pin_data]
@@ -150,6 +262,10 @@ impl platform::Driver for AsahiPlatformDriver {
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     type Data<'bound> = AsahiPlatformDriverData<'bound>;
 
+    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+        Some(&SLEEP_OPS.0)
+    }
+
     /// Device probe function.
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -206,6 +322,7 @@ impl platform::Driver for AsahiPlatformDriver {
             }
         };
         gpu.init()?;
+        let sleep = SleepReg::new(pdev, &gpu)?;
 
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
@@ -214,6 +331,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
 
         let driver = AsahiPlatformDriverData {
+            _sleep: sleep,
             _device: reg.device().into(),
             _reg: reg,
         };

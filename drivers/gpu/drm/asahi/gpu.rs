@@ -326,6 +326,10 @@ pub(crate) trait GpuManager: Send + Sync {
     fn free_context(&self, data: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>);
     /// Check whether the GPU is crashed
     fn is_crashed(&self) -> bool;
+    /// The C RTKit handle, for the S2R glue (s2r.c)
+    fn rtkit_raw(&self) -> *mut kernel::bindings::apple_rtkit;
+    /// The firmware is gone (lost across a sleep): fail what is queued and every later job
+    fn mark_lost(&self);
     /// Map a BO as a timestamp buffer
     fn map_timestamp_buffer(
         &self,
@@ -1598,6 +1602,20 @@ impl GpuManager for GpuManager::ver {
 
     fn is_crashed(&self) -> bool {
         self.crashed.load(Ordering::Relaxed)
+    }
+
+    fn rtkit_raw(&self) -> *mut kernel::bindings::apple_rtkit {
+        let guard = self.rtkit.lock();
+        match (*guard).as_ref() {
+            Some(rtk) => rtk.as_raw(),
+            None => core::ptr::null_mut(),
+        }
+    }
+
+    fn mark_lost(&self) {
+        self.crashed.store(true, Ordering::Relaxed);
+        dev_err!(self.dev.as_ref(), "GPU firmware lost across a sleep, failing all jobs\n");
+        self.event_manager.fail_all(workqueue::WorkError::NoDevice);
     }
 
     fn map_timestamp_buffer(

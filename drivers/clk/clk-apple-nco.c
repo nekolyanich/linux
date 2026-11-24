@@ -258,7 +258,8 @@ static const struct clk_ops applnco_ops = {
 /*
  * Suspend to RAM: the SoC's sleep sequence does not complete with the channels
  * stopped; macOS has every channel enabled at the commit. Enable them at
- * suspend_noirq of a firmware suspend and put the saved words back at resume.
+ * suspend_noirq of a firmware suspend and put the saved words (rate and enable)
+ * back at resume.
  */
 static bool s2r_enable = true;
 module_param(s2r_enable, bool, 0644);
@@ -271,6 +272,9 @@ struct applnco_data {
 	unsigned int nchannels;
 	bool saved;
 	u32 ctrl[NCO_MAX_CHANNELS];
+	u32 div[NCO_MAX_CHANNELS];
+	u32 inc1[NCO_MAX_CHANNELS];
+	u32 inc2[NCO_MAX_CHANNELS];
 };
 
 static int applnco_suspend_noirq(struct device *dev)
@@ -285,6 +289,9 @@ static int applnco_suspend_noirq(struct device *dev)
 	for (i = 0; i < data->nchannels; i++) {
 		void __iomem *reg = data->base + NCO_CHANNEL_STRIDE * i + REG_CTRL;
 
+		data->div[i] = readl_relaxed(reg - REG_CTRL + REG_DIV);
+		data->inc1[i] = readl_relaxed(reg - REG_CTRL + REG_INC1);
+		data->inc2[i] = readl_relaxed(reg - REG_CTRL + REG_INC2);
 		data->ctrl[i] = readl_relaxed(reg);
 		writel_relaxed(data->ctrl[i] | CTRL_ENABLE, reg);
 	}
@@ -300,8 +307,20 @@ static int applnco_resume_noirq(struct device *dev)
 	if (!data->saved)
 		return 0;
 
-	for (i = 0; i < data->nchannels; i++)
-		writel_relaxed(data->ctrl[i], data->base + NCO_CHANNEL_STRIDE * i + REG_CTRL);
+	/*
+	 * A sleep that cuts the power may take the divider too: the rate first, as
+	 * applnco_set_rate() writes it, then the saved enable.
+	 */
+	for (i = 0; i < data->nchannels; i++) {
+		void __iomem *chan = data->base + NCO_CHANNEL_STRIDE * i;
+
+		writel_relaxed(data->ctrl[i] & ~CTRL_ENABLE, chan + REG_CTRL);
+		writel_relaxed(data->div[i], chan + REG_DIV);
+		writel_relaxed(data->inc1[i], chan + REG_INC1);
+		writel_relaxed(data->inc2[i], chan + REG_INC2);
+		writel_relaxed(1 << 31, chan + REG_ACCINIT);
+		writel_relaxed(data->ctrl[i], chan + REG_CTRL);
+	}
 	data->saved = false;
 	return 0;
 }

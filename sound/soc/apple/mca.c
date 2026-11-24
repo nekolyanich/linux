@@ -125,11 +125,16 @@
 #define MAX_NCLUSTERS	6
 
 /*
- * Bench switch for a sleep that cuts the power (suspend-to-RAM through the
- * firmware): save the clusters in use at suspend_late and write them back at
- * resume_early. Raw writes at resume hung a J316 at s2idle in aurora's KFIX
- * 11-07, so off by default.
+ * Bench switches for a sleep that cuts the power (suspend-to-RAM through the
+ * firmware). fmt_restore: write the DAI format (set_fmt) again at the next
+ * prepare of each cluster. s2r_restore: also save the clusters in use at
+ * suspend_late and write them back at resume_early (raw writes at resume,
+ * which hung a J316 at s2idle in aurora's KFIX 11-07: off by default).
  */
+static bool fmt_restore = true;
+module_param(fmt_restore, bool, 0644);
+MODULE_PARM_DESC(fmt_restore, "write the DAI format again after a firmware suspend (default on)");
+
 static bool s2r_restore;
 module_param(s2r_restore, bool, 0644);
 MODULE_PARM_DESC(s2r_restore, "save and restore the in-use clusters' registers across a firmware suspend (default off)");
@@ -165,6 +170,16 @@ struct mca_cluster {
 	unsigned int tdm_tx_mask;
 	unsigned int tdm_rx_mask;
 
+	/*
+	 * What set_fmt wrote (the serdes' BCLK_POL bit and bit start, both
+	 * directions). It runs once, at the card's bind, and nothing writes
+	 * these again: fmt_lost asks the next prepare to, after a sleep that
+	 * cut the power.
+	 */
+	bool fmt_set;
+	bool fmt_lost;
+	u32 fmt_serdes_conf;
+	u32 fmt_bitstart;
 
 	/* Its registers across a sleep that cuts the power: mca_saved_regs, mca_saved_status */
 	u32 saved[32];
@@ -407,14 +422,19 @@ static int mca_be_hw_free(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+static void mca_fe_restore_fmt(struct mca_cluster *cl);
+
 static int mca_fe_prepare(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
 	struct mca_data *mca = cl->host;
 
-	if (cl->clk_provider)
+	/* A provider's domain came up in its back end's prepare, before this */
+	if (cl->clk_provider) {
+		mca_fe_restore_fmt(cl);
 		return 0;
+	}
 
 	/* Turn on the cluster power domain if not already in use */
 	if (!cl->syncgen_in_use) {
@@ -436,6 +456,7 @@ static int mca_fe_prepare(struct snd_pcm_substream *substream,
 			   SYNCGEN_STATUS_EN);
 	}
 	cl->syncgen_in_use |= 1 << substream->stream;
+	mca_fe_restore_fmt(cl);
 
 	return 0;
 }
@@ -578,6 +599,39 @@ static int mca_fe_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
 	return 0;
 }
 
+static void mca_fe_write_fmt(struct mca_cluster *cl)
+{
+	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
+		   SERDES_CONF_BCLK_POL, cl->fmt_serdes_conf);
+	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
+		   SERDES_CONF_BCLK_POL, cl->fmt_serdes_conf);
+	writel_relaxed(cl->fmt_bitstart,
+		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
+	writel_relaxed(cl->fmt_bitstart,
+		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+}
+
+/*
+ * After a sleep that cut the power the serdes are back at their reset values,
+ * and set_fmt does not run again: hw_params rewrites the slots and widths but
+ * keeps the BCLK polarity and bit start the hardware has. On a J416s that left
+ * the speaker sense words a bit off after a wake (speakersafetyd: "Negative
+ * power, bad ivsense data?") and the speakers crackling. Write the format back
+ * here, in the prepare, once the cluster's power domain is up and before the
+ * trigger starts a serdes.
+ */
+static void mca_fe_restore_fmt(struct mca_cluster *cl)
+{
+	if (!cl->fmt_lost)
+		return;
+	cl->fmt_lost = false;
+	if (!cl->fmt_set)
+		return;
+	mca_fe_write_fmt(cl);
+	dev_info(cl->host->dev,
+		 "cluster %d: DAI format written again after a firmware suspend\n", cl->no);
+}
+
 static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
@@ -629,14 +683,11 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	if (!fpol_inv)
 		goto err;
 
-	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
-	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+	cl->fmt_serdes_conf = serdes_conf;
+	cl->fmt_bitstart = bitstart;
+	cl->fmt_set = true;
+	cl->fmt_lost = false;
+	mca_fe_write_fmt(cl);
 
 	return 0;
 
@@ -1452,6 +1503,10 @@ static int __maybe_unused apple_mca_resume_early(struct device *dev)
 
 	if (!pm_resume_via_firmware())
 		return 0;
+
+	/* No register access here: the next prepare writes the format */
+	for (i = 0; i < mca->nclusters && fmt_restore; i++)
+		mca->clusters[i].fmt_lost = true;
 
 	for (i = 0; i < mca->nclusters; i++) {
 		struct mca_cluster *cl = &mca->clusters[i];

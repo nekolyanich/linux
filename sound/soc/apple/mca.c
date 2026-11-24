@@ -124,6 +124,16 @@
 
 #define MAX_NCLUSTERS	6
 
+/*
+ * Bench switch for a sleep that cuts the power (suspend-to-RAM through the
+ * firmware): save the clusters in use at suspend_late and write them back at
+ * resume_early. Raw writes at resume hung a J316 at s2idle in aurora's KFIX
+ * 11-07, so off by default.
+ */
+static bool s2r_restore;
+module_param(s2r_restore, bool, 0644);
+MODULE_PARM_DESC(s2r_restore, "save and restore the in-use clusters' registers across a firmware suspend (default off)");
+
 #define APPLE_MCA_FMTBITS (SNDRV_PCM_FMTBIT_S16_LE | \
 			   SNDRV_PCM_FMTBIT_S24_LE | \
 			   SNDRV_PCM_FMTBIT_S32_LE)
@@ -1407,7 +1417,7 @@ static int __maybe_unused apple_mca_suspend_late(struct device *dev)
 	struct mca_data *mca = dev_get_drvdata(dev);
 	int i, j, n = 0;
 
-	if (!pm_suspend_via_firmware())
+	if (!pm_suspend_via_firmware() || !s2r_restore)
 		return 0;
 
 	for (i = 0; i < mca->nclusters; i++) {
@@ -1489,6 +1499,7 @@ static struct platform_driver apple_mca_driver = {
 	.driver = {
 		.name = "apple-mca",
 		.of_match_table = apple_mca_of_match,
+		.pm = pm_sleep_ptr(&apple_mca_pm_ops),
 	},
 	.probe = apple_mca_probe,
 	.remove = apple_mca_remove,

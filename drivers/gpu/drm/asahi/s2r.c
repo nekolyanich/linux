@@ -10,6 +10,10 @@
  * session restarts warm: the firmware's DRAM, rings and page tables are kept, so only the
  * RTKit handshake is repeated (aurora's G16/G17, our internal DCP). Whether the G14X 13.5
  * firmware takes that is the open question this tests.
+ *
+ * A sleep that doesn't happen after the idle (a device's refusal, an abort before the commit)
+ * finds the firmware idled with its power kept and its CPU still running: it is woken as RTKit's
+ * own idle/wake pair does, without a restart (Tanabota notes/sleep/m2pro-73-gpu-abort.md).
  */
 #include <linux/bitfield.h>
 #include <linux/device.h>
@@ -195,20 +199,69 @@ int asahi_s2r_prepare(struct device *dev)
 }
 
 /*
- * Returns 1 if the firmware was restarted (the caller kicks it), 0 if nothing was stopped,
- * a negative error if it is down: the caller fails its jobs.
+ * A sleep that didn't happen: the GPU kept its power. With the run bit set the CPU was only
+ * idled (arm B's .prepare idle; a commit idle whose row stop didn't follow), so it is woken
+ * the way RTKit wakes any idled coprocessor: IOP INIT 0x220, the IOP ON ack, AP ON, with the
+ * session (endpoints, buffers, rings) kept and no HELLO waited for. G16's failure after a
+ * refusal was a restart that waits for a discovery an idle never gives up; this isn't one.
+ * With the run bit clear the commit's row stopped it, and nothing after the commit goes back
+ * (sleep.c): it stays down until the next real sleep's warm restart, or a reboot.
+ * Returns 1 if the firmware is back (the caller kicks it and checks a round trip).
+ */
+static int asahi_s2r_abort(struct asahi_s2r *s, struct device *dev, bool row_stopped, bool run)
+{
+	int ret;
+
+	apple_spmi_boot_crumb(GPU_CRUMB_NO_RESUME);
+	if (!run) {
+		dev_err(dev, "s2r: stopped at the commit for a sleep that didn't happen: GPU down until reboot\n");
+		s->lost = true;
+		return -ENODEV;
+	}
+
+	/* The commit's PMP row withdrew AGX's report only if it ran */
+	if (row_stopped) {
+		ret = apple_pmp_report_set(PMP_REPORT_AGX, true);
+		if (ret && ret != -ENODEV)
+			dev_warn(dev, "s2r: PMP report AGX request: %d\n", ret);
+	}
+
+	/* AP ON alone if only the AP idle took (0 if neither did); -EAGAIN: both took */
+	ret = apple_rtkit_sleep_return(s->rtk, s->asc + ASC_CPU_CONTROL);
+	if (ret == -EAGAIN)
+		ret = apple_rtkit_wake(s->rtk);
+	s->idled = false;
+	if (ret) {
+		apple_spmi_boot_crumb(GPU_CRUMB_FAILED);
+		dev_err(dev, "s2r: no wake from the idle after a sleep that didn't happen: %d (GFX PS %#x, run bit %s): GPU down until reboot\n",
+			ret, asahi_s2r_ps(s),
+			readl(s->asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? "set" : "clear");
+		s->lost = true;
+		return ret;
+	}
+	apple_spmi_boot_crumb(GPU_CRUMB_HELLO);
+	dev_info(dev, "s2r: firmware woken from the idle after a sleep that didn't happen, GFX PS %#x\n",
+		 asahi_s2r_ps(s));
+
+	return 1;
+}
+
+/*
+ * Returns 1 if the firmware was restarted or woken (the caller kicks it), 0 if nothing was
+ * stopped, a negative error if it is down: the caller fails its jobs.
  */
 int asahi_s2r_complete(struct device *dev);
 int asahi_s2r_complete(struct device *dev)
 {
 	struct asahi_s2r *s = &asahi_s2r;
-	bool stopped;
+	bool row_stopped, stopped, run;
 	u32 ps;
 	int ret;
 
 	if (s->dev != dev)
 		return 0;
-	stopped = apple_sleep_coproc_stopped(dev) || (s->flags & ASAHI_S2R_PREPARE_IDLE && s->idled);
+	row_stopped = apple_sleep_coproc_stopped(dev);
+	stopped = row_stopped || (s->flags & ASAHI_S2R_PREPARE_IDLE && s->idled);
 	apple_sleep_coproc_set_ready(dev, false);
 	if (!stopped)
 		return 0;
@@ -217,17 +270,13 @@ int asahi_s2r_complete(struct device *dev)
 		return -ENODEV;
 	}
 
-	dev_info(dev, "s2r: stop %d after %u us, GFX PS %#x at the stop, run bit %s\n", s->stop_ret,
-		 s->stop_us, s->stop_ps,
-		 readl(s->asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN ? "set" : "clear");
+	run = readl(s->asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN;
+	dev_info(dev, "s2r: stop %d after %u us, GFX PS %#x at the stop, run bit %s, %s\n",
+		 s->stop_ret, s->stop_us, s->stop_ps, run ? "set" : "clear",
+		 pm_resume_via_firmware() ? "woke" : "no sleep");
 
-	if (!pm_resume_via_firmware()) {
-		/* Not cut: an idled firmware doesn't come back with its power kept (G16/G17) */
-		apple_spmi_boot_crumb(GPU_CRUMB_NO_RESUME);
-		dev_err(dev, "s2r: stopped for a sleep that didn't happen: GPU down until reboot\n");
-		s->lost = true;
-		return -ENODEV;
-	}
+	if (!pm_resume_via_firmware())
+		return asahi_s2r_abort(s, dev, row_stopped, run);
 
 	apple_spmi_boot_crumb(GPU_CRUMB_RESTART);
 	ps = asahi_s2r_ps(s);

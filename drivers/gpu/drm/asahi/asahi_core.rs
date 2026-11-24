@@ -58,7 +58,7 @@ kernel::module_platform_driver! {
         sleep_s2r: u32 {
             default: 0,
             // permissions: 0,
-            description: "S2R: 1 idle the firmware at sleep-seq's commit and restart it warm after a wake, 3 idle at .prepare instead (bench); 0 off",
+            description: "S2R: 1 idle the firmware at sleep-seq's commit and restart it warm after a wake (woken from the idle if the sleep did not happen), 3 idle at .prepare instead (bench); 0 off",
         },
     },
 }

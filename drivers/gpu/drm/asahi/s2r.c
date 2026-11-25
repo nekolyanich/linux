@@ -6,7 +6,9 @@
  *
  * On, the firmware is idled as macOS does (AP 0x201, IOP 0x201, acks polled) by sleep-seq's
  * GFX row through the stop registered here, with interrupts off and every refusal behind it
- * (bit 0), or by .prepare with interrupts on (bit 1, a bench arm). After a real wake the
+ * (bit 0), or by .prepare with interrupts on (bit 1, a bench arm), or by suspend_late with
+ * interrupts on (bit 2, sleep_s2r=4): a device that refuses the sleep in the device phase then
+ * aborts it before the idle, with the firmware untouched. After a real wake the
  * session restarts warm: the firmware's DRAM, rings and page tables are kept, so only the
  * RTKit handshake is repeated (aurora's G16/G17, our internal DCP). Whether the G14X 13.5
  * firmware takes that is the open question this tests.
@@ -17,6 +19,7 @@
  */
 #include <linux/bitfield.h>
 #include <linux/device.h>
+#include <linux/of_platform.h>
 #include <linux/io.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
@@ -30,6 +33,8 @@
 
 #define ASAHI_S2R_ON		BIT(0)
 #define ASAHI_S2R_PREPARE_IDLE	BIT(1)
+/* sleep_s2r=4: the idle at suspend_late, after every device's .suspend (implies bit 0) */
+#define ASAHI_S2R_LATE_IDLE	BIT(2)
 
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
@@ -63,6 +68,11 @@ struct asahi_s2r {
 	unsigned int stop_us;
 	u32 stop_ps;
 	bool idled;
+	/* bit 2: .prepare armed this sleep; suspend_late's idle result (-ENODATA: not reached) */
+	bool armed;
+	int late_ret;
+	/* bit 2: GPU -> PMP, so the GPU's suspend_late runs before the PMP's stop */
+	struct device_link *pmp_link;
 };
 
 static struct asahi_s2r asahi_s2r;
@@ -85,6 +95,11 @@ static int asahi_s2r_stop(void *data)
 	s->stop_ps = asahi_s2r_ps(s);
 	if (s->idled || s->skip)
 		return 0;
+	/* bit 2: the idle was suspend_late's; no commit idle of a firmware it didn't idle */
+	if (s->flags & ASAHI_S2R_LATE_IDLE) {
+		s->stop_ret = -ENOENT;
+		return 0;
+	}
 	/* An auto-gated ASC may not answer (pd385): its mailbox is left alone */
 	if (s->ps_map && !FIELD_GET(PS_ACTUAL, s->stop_ps)) {
 		s->stop_ret = -EAGAIN;
@@ -97,6 +112,32 @@ static int asahi_s2r_stop(void *data)
 	return 0;
 }
 
+/*
+ * The idle needs the PMP running: it powers GFX up for the acks. On sleep-seq's S2R the PMP
+ * stops in its own suspend_late (pmp-export.c), and suspend_late runs in reverse dpm_list
+ * order, which DT order and deferred probes set: a stateless link (ordering only) puts the GPU
+ * after the PMP in that list, so its suspend_late always comes first.
+ */
+static void asahi_s2r_link_pmp(struct asahi_s2r *s)
+{
+	struct device_node *np;
+	struct platform_device *pmp = NULL;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,t6000-pmp-v2");
+	if (np && of_device_is_available(np))
+		pmp = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pmp) {
+		dev_info(s->dev, "s2r: no PMP device: suspend_late order left to the dpm list\n");
+		return;
+	}
+	s->pmp_link = device_link_add(s->dev, &pmp->dev, DL_FLAG_STATELESS);
+	if (!s->pmp_link)
+		dev_warn(s->dev, "s2r: no link to %s: suspend_late order left to the dpm list\n",
+			 dev_name(&pmp->dev));
+	put_device(&pmp->dev);
+}
+
 int asahi_s2r_register(struct device *dev, struct apple_rtkit *rtk, u32 flags);
 int asahi_s2r_register(struct device *dev, struct apple_rtkit *rtk, u32 flags)
 {
@@ -106,6 +147,8 @@ int asahi_s2r_register(struct device *dev, struct apple_rtkit *rtk, u32 flags)
 	struct resource *res;
 	int ret;
 
+	if (flags & ASAHI_S2R_LATE_IDLE)
+		flags = (flags | ASAHI_S2R_ON) & ~ASAHI_S2R_PREPARE_IDLE;
 	if (!(flags & ASAHI_S2R_ON) || !rtk)
 		return 0;
 
@@ -151,7 +194,10 @@ int asahi_s2r_register(struct device *dev, struct apple_rtkit *rtk, u32 flags)
 		s->asc = NULL;
 		return 0;
 	}
+	if (flags & ASAHI_S2R_LATE_IDLE)
+		asahi_s2r_link_pmp(s);
 	dev_info(dev, "s2r: firmware idle at %s, warm restart after a real wake (flags %#x, PS %#x)\n",
+		 flags & ASAHI_S2R_LATE_IDLE ? "suspend_late" :
 		 flags & ASAHI_S2R_PREPARE_IDLE ? ".prepare" : "the commit", flags, asahi_s2r_ps(s));
 
 	return 0;
@@ -163,6 +209,10 @@ void asahi_s2r_unregister(struct device *dev)
 	if (asahi_s2r.dev != dev)
 		return;
 	apple_sleep_coproc_unregister(dev);
+	if (asahi_s2r.pmp_link) {
+		device_link_del(asahi_s2r.pmp_link);
+		asahi_s2r.pmp_link = NULL;
+	}
 	asahi_s2r.dev = NULL;
 	iounmap(asahi_s2r.asc);
 	asahi_s2r.asc = NULL;
@@ -179,6 +229,7 @@ int asahi_s2r_prepare(struct device *dev)
 
 	s->idled = false;
 	s->stop_ret = -ENODATA;
+	s->late_ret = -ENODATA;
 	/*
 	 * A crashed firmware has nothing to keep: the sleep goes on with the bare CPU stop, as
 	 * without the param, rather than being refused until a reboot. .complete leaves it crashed.
@@ -193,7 +244,37 @@ int asahi_s2r_prepare(struct device *dev)
 			return ret;
 		s->idled = true;
 	}
+	s->armed = !s->skip;
 	apple_sleep_coproc_set_ready(dev, true);
+
+	return 0;
+}
+
+/*
+ * Bit 2: the idle, after every device's .suspend, interrupts still on (arm 3's call). A
+ * refusal before this point leaves the firmware running; one after it loses the GPU as arm 3's
+ * does. Refused, the sleep is aborted and the firmware carries on (a failed idle is mode 3's
+ * refusal too).
+ */
+int asahi_s2r_suspend_late(struct device *dev);
+int asahi_s2r_suspend_late(struct device *dev)
+{
+	struct asahi_s2r *s = &asahi_s2r;
+	int ret;
+
+	if (s->dev != dev || !(s->flags & ASAHI_S2R_LATE_IDLE) || !s->armed ||
+	    !pm_suspend_via_firmware())
+		return 0;
+
+	ret = apple_rtkit_idle(s->rtk);
+	s->late_ret = ret;
+	if (ret) {
+		dev_err(dev, "s2r: idle at suspend_late failed: %d (GFX PS %#x): refusing the sleep\n",
+			ret, asahi_s2r_ps(s));
+		return ret;
+	}
+	s->idled = true;
+	dev_info(dev, "s2r: firmware idle at suspend_late, GFX PS %#x\n", asahi_s2r_ps(s));
 
 	return 0;
 }
@@ -261,8 +342,25 @@ int asahi_s2r_complete(struct device *dev)
 	if (s->dev != dev)
 		return 0;
 	row_stopped = apple_sleep_coproc_stopped(dev);
-	stopped = row_stopped || (s->flags & ASAHI_S2R_PREPARE_IDLE && s->idled);
+	stopped = row_stopped ||
+		  (s->flags & (ASAHI_S2R_PREPARE_IDLE | ASAHI_S2R_LATE_IDLE) && s->idled);
 	apple_sleep_coproc_set_ready(dev, false);
+	if (s->flags & ASAHI_S2R_LATE_IDLE && s->armed) {
+		s->armed = false;
+		if (!stopped && s->late_ret == -ENODATA) {
+			dev_info(dev, "s2r: the sleep didn't happen before the idle, firmware untouched\n");
+			return 0;
+		}
+		if (!stopped) {
+			/* A half-taken idle (AP only) is undone by the abort path's sleep_return */
+			dev_warn(dev, "s2r: idle at suspend_late refused (%d): undoing what took\n",
+				 s->late_ret);
+			stopped = true;
+		} else if (!pm_resume_via_firmware()) {
+			dev_err(dev, "s2r: the sleep didn't happen after the suspend_late idle (row %s): trying the idle's wake, else the GPU is lost\n",
+				row_stopped ? "stopped" : "not run");
+		}
+	}
 	if (!stopped)
 		return 0;
 	if (s->skip) {

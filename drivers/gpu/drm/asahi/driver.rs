@@ -57,6 +57,7 @@ extern "C" {
     ) -> core::ffi::c_int;
     fn asahi_s2r_unregister(dev: *mut kernel::bindings::device);
     fn asahi_s2r_prepare(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
+    fn asahi_s2r_suspend_late(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
     fn asahi_s2r_complete(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
     fn asahi_s2r_kicked();
 }
@@ -120,6 +121,12 @@ unsafe extern "C" fn sleep_prepare(dev: *mut kernel::bindings::device) -> core::
     unsafe { asahi_s2r_prepare(dev) }
 }
 
+/// After every device's .suspend, interrupts on: the idle with asahi.sleep_s2r=4 (s2r.c).
+unsafe extern "C" fn sleep_suspend_late(dev: *mut kernel::bindings::device) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core for a bound device.
+    unsafe { asahi_s2r_suspend_late(dev) }
+}
+
 /// After every device resumed: the warm restart if the stop ran (or the wake from the idle if
 /// the sleep didn't happen), the kick, or the jobs failed.
 unsafe extern "C" fn sleep_complete(dev: *mut kernel::bindings::device) {
@@ -155,6 +162,7 @@ unsafe extern "C" fn sleep_complete(dev: *mut kernel::bindings::device) {
 static SLEEP_OPS: SleepOps = SleepOps(kernel::bindings::dev_pm_ops {
     prepare: Some(sleep_prepare),
     complete: Some(sleep_complete),
+    suspend_late: Some(sleep_suspend_late),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
 });

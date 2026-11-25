@@ -18,6 +18,7 @@
 #include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/property.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #include <linux/unaligned.h>
@@ -2832,6 +2833,17 @@ static int bcm4377_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	int ret;
+
+	/*
+	 * A real sleep took the function's power: the firmware is gone, and every resume command
+	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
+	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 */
+	if (pm_resume_via_firmware()) {
+		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
+		return 0;
+	}
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);

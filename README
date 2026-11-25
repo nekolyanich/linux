@@ -1,3 +1,25 @@
+m2pro-s2r-wip: personal experiments, not for use
+================================================
+
+This branch is a personal experiment log, not a release and not a contribution. It is the kernel one MacBook Pro
+16" M2 Pro (t6020, J416s) runs under NixOS, on the Asahi 7.3.4 line, with native suspend to RAM (S2R) and other
+work in progress (DP over USB4, DP audio, the SEP and a SEP-backed key store). It is unreviewed, carries bench-only
+switches (bench_* parameters, hypervisor hooks), and is tested on that one machine only. Don't use it on a machine
+you care about, and don't report problems with it to Asahi Linux, aurora-silicon or upstream. The changes were
+written with AI assistance (Claude Code, https://claude.ai/code). Comments in it point to private notes
+(notes/sleep/...) that are not published.
+
+It needs its own m1n1 stage 2 for the wake path: https://github.com/nekolyanich/m1n1/tree/m2pro-s2r-wip. That
+branch's README lists the kernel command line the S2R runs with and what each word does. Discussion of the S2R
+work on t6020: https://github.com/JJRPF/Aurora-DeepIdle/issues/5.
+
+Where the S2R pieces are: drivers/soc/apple/sleep.c and sleep-seq.c (the entry, a table of rows modelled on
+macOS's), drivers/pci/controller/pcie-apple.c (macOS's port teardown and its way back), drivers/gpu/drm/apple/dcp.c
+(the DCP idle and warm restart), drivers/clk/clk-apple-nco.c and sound/soc/apple/mca.c (audio across the cut),
+drivers/gpu/drm/asahi/s2r.c (the GPU firmware idle and warm restart, being tested).
+
+------------------------------------------------------------------------------
+
 Linux kernel
 ============
 

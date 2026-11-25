@@ -56,7 +56,7 @@
 &sleep {
 	status = "okay";
 	/* The co-processors the bench's sleep idles and stops through their drivers (not on every t602x) */
-	apple,coprocs = <&dcp>, <&dcpext0>, <&dcpext1>, <&sio>, <&mtp>;
+	apple,coprocs = <&dcp>, <&dcpext0>, <&dcpext1>, <&sio>, <&mtp>, <&gpu>;
 };
 
 /*

@@ -376,8 +376,8 @@ struct apple_sleep_seq {
 	struct aseq_ps *ps;
 	unsigned int nps;
 	/* apple,coprocs: the devices whose drivers registered a sleep stop, and what each returned */
-	struct device *coproc[5];
-	int coproc_ret[5];
+	struct device *coproc[6];
+	int coproc_ret[6];
 	/* This entry's SEQ_COPROC_IDLE ran for apple,coprocs[n] (bit n): no CPU stop for it after */
 	u8 coproc_idled;
 	/* dispext_off: the entry rows of the external DCPs, and whether they already ran */
@@ -3972,7 +3972,12 @@ static const struct apple_sleep_op t6020_entry[] = {
 	 * writes none of the ADT pwrgate-regs words in that window (0 of 2).
 	 */
 	W64(PMS, T6020_PMP_REPORT, 0xe300, DCPREPORT, "PMP report: AGX withdrawn (macOS -538.4 ms)"),
-	T6020_ASC_STOP(GFX_ASC, AFR, 0x108, GFX, "n24 #7 GPU CPU stop"),
+	/*
+	 * GPUSTOP (m2pro-73-gpu-s2r-design): drm/asahi's stop if it registered one (apple,coprocs[5],
+	 * asahi.sleep_s2r): macOS's AP and IOP 0x201, acks polled; then the CPU stop as before.
+	 * Not registered: the bare CPU stop alone, as before.
+	 */
+	T6020_COPROC_STOP(5, GFX_ASC, AFR, 0x108, GFX, "n24 #7 GPU: RTKit idle, CPU stop"),
 	OP(PS_LOWER, AFR, 0x108, 0, GFX, "n24 #7 GFX PS off (macOS -534 ms)"),
 	/*
 	 * MTPSTOP (note 49): at the commit (pd583/584) macOS's mtp_cpu reads 0x1000030f (AUTO,

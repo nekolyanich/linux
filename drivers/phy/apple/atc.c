@@ -2580,9 +2580,21 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	return 0;
 }
 
+/* dwc3-apple's sleep_keep_hcd: a core this PHY's restore (or a power cut) put in reset */
+static int atcphy_dwc3_reset_status(struct reset_controller_dev *rcdev, unsigned long id)
+{
+	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+
+	guard(mutex)(&atcphy->lock);
+
+	return !(readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN) &
+		 PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+}
+
 static const struct reset_control_ops atcphy_dwc3_reset_ops = {
 	.assert = atcphy_dwc3_reset_assert,
 	.deassert = atcphy_dwc3_reset_deassert,
+	.status = atcphy_dwc3_reset_status,
 };
 
 static int atcphy_reset_xlate(struct reset_controller_dev *rcdev,
@@ -2848,13 +2860,16 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 /*
  * Paired with dwc3_apple.sleep_stop (rv-crossbar, batch 7): the restore asserts
  * the dwc3 reset, and dwc3-apple, which stopped the controller before the sleep,
- * starts it again in its role at PM_POST_SUSPEND, which sets the PIPE up. Set
- * both, or neither. With it on, a resume restores only after a real cut, told by
- * the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
+ * starts it again in its role at PM_POST_SUSPEND, which sets the PIPE up. Or
+ * with dwc3_apple.sleep_keep_hcd instead: the host stays registered, and
+ * dwc3-apple finds the reset asserted (the reset's status) before xHCI resumes,
+ * takes the core out of it and sets it up again, which sets the PIPE up. One of
+ * the two with it, or neither. With it on, a resume restores only after a real
+ * cut, told by the dummy-PHY bit park_dummy_phy keeps set having reset to 0.
  */
 static bool s2r_assume_cut;
 module_param(s2r_assume_cut, bool, 0444);
-MODULE_PARM_DESC(s2r_assume_cut, "Restore the PHY after a suspend to RAM whose power cut reset it (with dwc3_apple.sleep_stop)");
+MODULE_PARM_DESC(s2r_assume_cut, "Restore the PHY after a suspend to RAM whose power cut reset it (with dwc3_apple.sleep_stop or sleep_keep_hcd)");
 
 /*
  * Ahead of dwc3-apple's sleep notifier (priority): the mode is kept before dwc3 stops,

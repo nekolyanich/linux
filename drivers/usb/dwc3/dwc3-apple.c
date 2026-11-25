@@ -14,8 +14,11 @@
 #include <linux/suspend.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/phy/phy.h>
+#include <linux/version.h>
 
 #include "glue.h"
+#include "io.h"
 
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
@@ -175,6 +178,9 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 	dwc3_set_prtcap(&appledwc->dwc, mode, false);
 }
 
+static const struct dwc3_glue_ops dwc3_apple_keep_glue_ops;
+static bool sleep_keep_hcd;
+
 static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 {
 	struct dwc3_probe_data probe_data = {};
@@ -184,6 +190,8 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	WARN_ON_ONCE(appledwc->state != DWC3_APPLE_PROBE_PENDING);
 
 	appledwc->dwc.dev = appledwc->dev;
+	if (sleep_keep_hcd)
+		appledwc->dwc.glue_ops = &dwc3_apple_keep_glue_ops;
 	probe_data.dwc = &appledwc->dwc;
 	probe_data.res = appledwc->mmio_resource;
 	probe_data.ignore_clocks_and_resets = true;
@@ -491,6 +499,96 @@ static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action,
 
 	return NOTIFY_DONE;
 }
+
+/*
+ * Suspend to RAM with the host kept (sleep_keep_hcd, with sleep_stop off and phy-apple-atc's
+ * s2r_assume_cut on). The glue stays a syscore device, so the xHCI device under it suspends and
+ * resumes as on any platform: its suspend halts the controller and saves its state. A real
+ * power cut then resets the core, its Apple registers and the PHY; the PHY's resume_early sets
+ * the PHY up again in its tracked mode and leaves the core held in reset. Without this, xHCI's
+ * resume found its restore failed (SRE) and started the controller over on a core that was
+ * never set up again and a PIPE still on the dummy backend: running, but its next suspend
+ * could not halt it (the second sleep's "Clearing Run/Stop bit failed -110", bench and NixOS).
+ *
+ * Here, before xHCI touches the core: a core still in reset, or out of it without the GUID
+ * dwc3_core_init() wrote, lost its state; take it out of reset and set it up again the way
+ * dwc3_apple_init() does, without the host (the PHYs and the xHCI device stay), then tell
+ * xHCI it lost power (a positive return): xhci_resume() resets and starts the controller over,
+ * and usbcore's persist resets the devices back in place, so a mounted USB disk keeps its block
+ * device. A core that kept its state (s2idle, an aborted sleep) is left to xHCI's restore.
+ *
+ * No appledwc->lock: dpm holds the xHCI device's lock here, and a role change that takes the
+ * glue's lock waits for that one to remove the host (AB-BA). A role change can't touch the core
+ * before it has removed the host, which waits for this resume.
+ */
+module_param(sleep_keep_hcd, bool, 0444);
+MODULE_PARM_DESC(sleep_keep_hcd, "Keep the xHCI host over a suspend to RAM and set the core up again after a power cut (with phy-apple-atc s2r_assume_cut, without sleep_stop)");
+
+static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	int i, ret;
+
+	phy_set_mode(dwc->usb2_generic_phy[0], PHY_MODE_USB_HOST);
+	ret = reset_control_deassert(appledwc->reset);
+	if (ret)
+		return ret;
+	ret = dwc3_core_init(dwc);
+	if (ret)
+		return ret;
+	/* dwc3_core_init() took PHY references the core holds already (aurora's). */
+	for (i = 0; i < dwc->num_usb3_ports; i++) {
+		phy_power_off(dwc->usb3_generic_phy[i]);
+		phy_exit(dwc->usb3_generic_phy[i]);
+	}
+	for (i = 0; i < dwc->num_usb2_ports; i++) {
+		phy_power_off(dwc->usb2_generic_phy[i]);
+		phy_exit(dwc->usb2_generic_phy[i]);
+	}
+
+	dwc3_apple_setup_cio(appledwc);
+	dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_HOST);
+	dwc3_enable_susphy(dwc, true);
+	/* The PHY's restore left the PIPE parked: route it to USB3 before xHCI starts. */
+	ret = phy_set_mode(dwc->usb3_generic_phy[0], PHY_MODE_USB_HOST);
+	if (ret)
+		dev_warn(appledwc->dev, "USB3 PHY setup failed after the power cut, USB2 only: %d\n",
+			 ret);
+	return 0;
+}
+
+static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
+{
+	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+	int held, ret;
+	u32 guid = 0;
+
+	if (READ_ONCE(appledwc->state) != DWC3_APPLE_HOST)
+		return 0;
+	held = reset_control_status(appledwc->reset);
+	if (held < 0) {
+		dev_err(appledwc->dev, "keep_hcd: no reset status (%d): xHCI resumes as it is\n", held);
+		return 0;
+	}
+	if (!held) {
+		guid = dwc3_readl(dwc, DWC3_GUID);
+		if (guid == LINUX_VERSION_CODE)
+			return 0;
+	}
+	ret = dwc3_apple_core_reinit(appledwc);
+	if (ret) {
+		dev_err(appledwc->dev, "keep_hcd: the core didn't come back after the power cut: %d\n",
+			ret);
+		return ret;
+	}
+	dev_info(appledwc->dev, "keep_hcd: core set up again after the power cut (reset %s, GUID %#x, firmware resume %s), xHCI starts over\n",
+		 held ? "held" : "released", guid, pm_resume_via_firmware() ? "yes" : "no");
+	return 1;
+}
+
+static const struct dwc3_glue_ops dwc3_apple_keep_glue_ops = {
+	.pre_host_resume = dwc3_apple_pre_host_resume,
+};
 
 static void dwc3_apple_pm_notifier_remove(void *data)
 {

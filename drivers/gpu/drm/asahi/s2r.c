@@ -26,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/suspend.h>
+#include <linux/workqueue.h>
 #include <linux/soc/apple/boot-crumb.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/rtkit.h>
@@ -35,6 +36,13 @@
 #define ASAHI_S2R_PREPARE_IDLE	BIT(1)
 /* sleep_s2r=4: the idle at suspend_late, after every device's .suspend (implies bit 0) */
 #define ASAHI_S2R_LATE_IDLE	BIT(2)
+/*
+ * Bit 7: withdraw AGX's PMP report again 1 s after the warm restart, as macOS's wake does (0x700, then 0x300 with GFX
+ * off). Left raised through GPU work, the PMP doesn't answer its idle at the next sleep (Tanabota m2pro-73-port.md,
+ * blip-series 11-26). Bit 8: retry it every second until the PMP follows, up to 30 tries.
+ */
+#define ASAHI_S2R_AGX_BLIP	BIT(7)
+#define ASAHI_S2R_AGX_BLIP_RETRY	BIT(8)
 
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
@@ -84,6 +92,27 @@ static u32 asahi_s2r_ps(struct asahi_s2r *s)
 	if (s->ps_map)
 		regmap_read(s->ps_map, s->ps_off, &val);
 	return val;
+}
+
+static unsigned int asahi_s2r_blip_tries;
+static void asahi_s2r_blip_fn(struct work_struct *w);
+static DECLARE_DELAYED_WORK(asahi_s2r_blip, asahi_s2r_blip_fn);
+
+static void asahi_s2r_blip_fn(struct work_struct *w)
+{
+	struct asahi_s2r *s = &asahi_s2r;
+	int r;
+
+	if (!s->dev)
+		return;
+	r = apple_pmp_report_set(PMP_REPORT_AGX, false);
+	asahi_s2r_blip_tries++;
+	if (r && (s->flags & ASAHI_S2R_AGX_BLIP_RETRY) && asahi_s2r_blip_tries < 30) {
+		schedule_delayed_work(&asahi_s2r_blip, HZ);
+		return;
+	}
+	dev_info(s->dev, "s2r: AGX's PMP report withdrawn after the wake: %d (try %u, GFX PS %#x)\n", r,
+		 asahi_s2r_blip_tries, asahi_s2r_ps(s));
 }
 
 /* sleep-seq's GFX row (apple,coprocs[5]), interrupts off: the idle; the row stops the CPU */
@@ -208,6 +237,7 @@ void asahi_s2r_unregister(struct device *dev)
 {
 	if (asahi_s2r.dev != dev)
 		return;
+	cancel_delayed_work_sync(&asahi_s2r_blip);
 	apple_sleep_coproc_unregister(dev);
 	if (asahi_s2r.pmp_link) {
 		device_link_del(asahi_s2r.pmp_link);
@@ -227,6 +257,7 @@ int asahi_s2r_prepare(struct device *dev)
 	if (s->dev != dev || !pm_suspend_via_firmware())
 		return 0;
 
+	cancel_delayed_work_sync(&asahi_s2r_blip);
 	s->idled = false;
 	s->stop_ret = -ENODATA;
 	s->late_ret = -ENODATA;
@@ -398,6 +429,10 @@ int asahi_s2r_complete(struct device *dev)
 	apple_spmi_boot_crumb(GPU_CRUMB_HELLO);
 	/* The kick is the caller's (kick_firmware, under the driver's RTKit lock): one, not two */
 	dev_info(dev, "s2r: firmware restarted warm, GFX PS %#x\n", asahi_s2r_ps(s));
+	if (s->flags & ASAHI_S2R_AGX_BLIP) {
+		asahi_s2r_blip_tries = 0;
+		schedule_delayed_work(&asahi_s2r_blip, HZ);
+	}
 
 	return 1;
 }

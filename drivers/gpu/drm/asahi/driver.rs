@@ -59,6 +59,7 @@ extern "C" {
     fn asahi_s2r_prepare(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
     fn asahi_s2r_suspend_late(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
     fn asahi_s2r_complete(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
+    fn asahi_s2r_withdraw_now();
     fn asahi_s2r_kicked();
 }
 
@@ -156,7 +157,10 @@ unsafe extern "C" fn sleep_complete(dev: *mut kernel::bindings::device) {
     if let Err(e) = gpu.flush_fw_cache() {
         pr_err!("asahi: s2r: no device-control reply after the warm restart: {:?}\n", e);
         gpu.mark_lost();
+        return;
     }
+    // SAFETY: Plain C; acts only with sleep_s2r bit 9.
+    unsafe { asahi_s2r_withdraw_now() };
 }
 
 static SLEEP_OPS: SleepOps = SleepOps(kernel::bindings::dev_pm_ops {

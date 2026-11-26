@@ -18,6 +18,7 @@
  * own idle/wake pair does, without a restart (Tanabota notes/sleep/m2pro-73-gpu-abort.md).
  */
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/of_platform.h>
 #include <linux/io.h>
@@ -43,6 +44,12 @@
  */
 #define ASAHI_S2R_AGX_BLIP	BIT(7)
 #define ASAHI_S2R_AGX_BLIP_RETRY	BIT(8)
+/*
+ * Bit 9: the withdrawal in .complete itself, right after the kick and the device-control round trip, while every task
+ * is still frozen and the GPU has no work, polled up to 1 s. After the thaw a drawing client keeps the PMP's AGX bit on
+ * (bits 7/8 then fail); with it a held client kept all 4 sleeps in 3 of 3 bench runs (blip3, 11-26).
+ */
+#define ASAHI_S2R_AGX_SYNC	BIT(9)
 
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
@@ -442,4 +449,25 @@ void asahi_s2r_kicked(void);
 void asahi_s2r_kicked(void)
 {
 	apple_spmi_boot_crumb(GPU_CRUMB_KICKED);
+}
+
+/* Bit 9: from .complete after the kick and the device-control round trip, tasks still frozen */
+void asahi_s2r_withdraw_now(void);
+void asahi_s2r_withdraw_now(void)
+{
+	struct asahi_s2r *s = &asahi_s2r;
+	ktime_t t0 = ktime_get();
+	int r, tries = 0;
+
+	if (!s->dev || !(s->flags & ASAHI_S2R_AGX_SYNC))
+		return;
+	do {
+		r = apple_pmp_report_set(PMP_REPORT_AGX, false);
+		tries++;
+		if (!r)
+			break;
+		usleep_range(10000, 20000);
+	} while (ktime_ms_delta(ktime_get(), t0) < 1000);
+	dev_info(s->dev, "s2r: AGX's PMP report withdrawn in complete: %d (try %d, %lld ms, GFX PS %#x)\n", r, tries,
+		 ktime_ms_delta(ktime_get(), t0), asahi_s2r_ps(s));
 }

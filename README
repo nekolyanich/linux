@@ -16,7 +16,9 @@ work on t6020: https://github.com/JJRPF/Aurora-DeepIdle/issues/5.
 Where the S2R pieces are: drivers/soc/apple/sleep.c and sleep-seq.c (the entry, a table of rows modelled on
 macOS's), drivers/pci/controller/pcie-apple.c (macOS's port teardown and its way back), drivers/gpu/drm/apple/dcp.c
 (the DCP idle and warm restart), drivers/clk/clk-apple-nco.c and sound/soc/apple/mca.c (audio across the cut),
-drivers/gpu/drm/asahi/s2r.c (the GPU firmware idle and warm restart, being tested).
+drivers/gpu/drm/asahi/s2r.c (the GPU firmware idle and warm restart; asahi.sleep_s2r=516 also withdraws AGX's PMP
+report in .complete, without which a GPU client hangs the next sleep), drivers/bluetooth/hci_bcm4377.c (aurora's
+recovery series and a rebind after the power loss of a real sleep).
 
 ------------------------------------------------------------------------------
 
